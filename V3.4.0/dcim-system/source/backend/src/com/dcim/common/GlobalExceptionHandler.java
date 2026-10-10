@@ -113,15 +113,15 @@ public class GlobalExceptionHandler {
         String state = sqlState(e);
         String detail = pgDetail(e);
         if ("23505".equals(state) || e instanceof org.springframework.dao.DuplicateKeyException) {
-            log.info("[db] 唯一约束冲突：{}", detail);
+            log.info("[db] 唯一约束冲突：{}", sanitizeForLog(detail));
             return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResult.error(409, "数据已存在" + friendlyKey(detail) + "，请刷新后重试"));
         }
         if ("23503".equals(state)) {
-            log.info("[db] 外键约束冲突：{}", detail);
+            log.info("[db] 外键约束冲突：{}", sanitizeForLog(detail));
             return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResult.error(409, "存在关联数据或引用的数据不存在，操作未执行"));
         }
         if ("23514".equals(state) || "23502".equals(state) || "22001".equals(state) || "22P02".equals(state)) {
-            log.info("[db] 数据校验失败 {}：{}", state, detail);
+            log.info("[db] 数据校验失败 {}：{}", state, sanitizeForLog(detail));
             return ResponseEntity.badRequest().body(ApiResult.error(400, "数据不符合约束（取值越界、超长或必填项为空）"));
         }
         log.error("数据完整性异常 [{}]", requestId(), e);
@@ -137,7 +137,7 @@ public class GlobalExceptionHandler {
         org.springframework.transaction.CannotCreateTransactionException.class
     })
     public ResponseEntity<ApiResult<Void>> busy(Exception e) {
-        log.warn("[db] 并发冲突或超时 [{}]：{}", requestId(), e.getMessage());
+        log.warn("[db] 并发冲突或超时 [{}]：{}", requestId(), sanitizeForLog(e.getMessage()));
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
             .header("Retry-After", "3")
             .body(ApiResult.error(503, "系统繁忙（数据正被其他操作占用或查询超时），请稍后重试"));
@@ -151,13 +151,21 @@ public class GlobalExceptionHandler {
     @ExceptionHandler({Exception.class})
     public ResponseEntity<ApiResult<Void>> unknown(Exception e) {
         String rid = requestId();
-        log.error("未处理异常 [{}]", rid, e);
+        log.error("未处理异常 [{}]: {}", rid, sanitizeForLog(e.getMessage()), e);
         // 返回请求号，用户反馈时可据此在日志中精确定位
         return ResponseEntity.internalServerError().body(ApiResult.error(500, "服务器内部错误" + (rid == null ? "" : "（请求号 " + rid + "）")));
     }
 
     private static String requestId() {
         return org.slf4j.MDC.get("requestId");
+    }
+
+    private static String sanitizeForLog(String value) {
+        if (value == null) {
+            return "";
+        }
+        String s = value.replaceAll("(?i)(password|secret|token|authorization|cookie|session|jwt|api[_-]?key)", "[REDACTED]");
+        return s.length() > 512 ? s.substring(0, 512) + "..." : s;
     }
 
     private static String sqlState(Throwable e) {
