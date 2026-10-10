@@ -1,0 +1,451 @@
+package com.dcim.capacity;
+
+import com.dcim.common.BusinessException;
+import com.dcim.monitoring.service.PrometheusClient;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+@Service
+public class CapacityService {
+    
+    private static final Logger log = LoggerFactory.getLogger(CapacityService.class);
+    private final JdbcTemplate jdbc;
+    private final PrometheusClient prom;
+
+    public CapacityService(JdbcTemplate jdbc, PrometheusClient prom) {
+        this.jdbc = jdbc;
+        this.prom = prom;
+    }
+
+    public Map<String, String> settings() {
+        Map<String, String> m = new LinkedHashMap<>();
+        this.jdbc.query("SELECT setting_key, setting_value FROM capacity_setting ORDER BY setting_key", (org.springframework.jdbc.core.RowCallbackHandler) rs -> { m.put(rs.getString(1), rs.getString(2)); });
+        return m;
+    }
+
+    public int warnPct() {
+        return this.intSetting("power_warn_pct", 80);
+    }
+
+    public int maxPct() {
+        return this.intSetting("power_max_pct", 95);
+    }
+
+    private int intSetting(String k, int def) {
+        try {
+            return Integer.parseInt(this.settings().getOrDefault(k, String.valueOf(def)).trim());
+        } catch (NumberFormatException var4) {
+            return def;
+        }
+    }
+
+    public List<String> powerStatuses() {
+        String v = this.settings().getOrDefault("power_statuses", "在用(计费),维修中,停用中,待验收,待上架");
+        List<String> out = new ArrayList<>();
+
+        for (String s : v.split("\\s*,\\s*")) {
+            if (!s.isBlank()) {
+                out.add(s.trim());
+            }
+        }
+
+        return out.isEmpty() ? List.of("在用(计费)") : out;
+    }
+
+    public List<Map<String, Object>> racks(String roomCode) {
+        List<String> st = this.powerStatuses();
+        String in = String.join(",", Collections.nCopies(st.size(), "?"));
+        List<Object> args = new ArrayList<>(st);
+        String where = "";
+        if (roomCode != null && !roomCode.isBlank()) {
+            where = " WHERE r.rack_code IN (SELECT rack_code FROM rack WHERE room_code = ?)";
+            args.add(roomCode.trim());
+        }
+
+        List<Map<String, Object>> rows = this.jdbc
+            .queryForList(
+                "SELECT r.rack_code AS \"rackCode\", r.room_code AS \"roomCode\", r.location_name AS \"locationName\",\n       r.u_capacity AS \"uCapacity\", r.power_limit_kw AS \"powerLimitKw\",\n       COALESCE(SUM(a.power_w), 0) AS \"allocatedW\",\n       COALESCE((SELECT COUNT(*) FROM asset a2 WHERE a2.rack_code = r.rack_code AND a2.status_biz IN (" + in + ") AND a2.deleted_at IS NULL), 0) AS \"assetCount\",\n       COALESCE((SELECT COUNT(*) FROM asset a3 WHERE a3.rack_code = r.rack_code AND a3.power_w IS NULL AND a3.status_biz IN (" + in + ") AND a3.deleted_at IS NULL), 0) AS \"missingPower\",\n       COALESCE((SELECT SUM(u.u_height) FROM rack_unit u WHERE u.rack_code = r.rack_code AND u.status = '占用'), 0) AS \"uUsed\"\nFROM rack r\nLEFT JOIN asset a ON a.rack_code = r.rack_code AND a.status_biz IN (" + in + ") AND a.deleted_at IS NULL\n" + where + "\nGROUP BY r.rack_code, r.room_code, r.location_name, r.u_capacity, r.power_limit_kw\nORDER BY r.room_code, r.rack_code",
+                args.toArray()
+            );
+        Map<String, Integer> maxFree = this.maxFreeBlocks(roomCode);
+        Map<String, Double> measured = this.measuredByRack();
+        int warn = this.warnPct();
+        int max = this.maxPct();
+
+        for (Map<String, Object> r : rows) {
+            String code = (String)r.get("rackCode");
+            int cap = ((Number)r.get("uCapacity")).intValue();
+            int used = ((Number)r.get("uUsed")).intValue();
+            r.put("uFree", Math.max(0, cap - used));
+            r.put("maxFreeBlock", maxFree.getOrDefault(code, cap - used));
+            r.put("uPct", pct(used, cap));
+            double alloc = ((Number)r.get("allocatedW")).doubleValue();
+            r.put("allocatedKw", round(alloc / 1000.0));
+            BigDecimal limit = (BigDecimal)r.get("powerLimitKw");
+            Double meas = measured.get(code);
+            r.put("measuredKw", meas == null ? null : round(meas / 1000.0));
+            if (limit != null && limit.signum() > 0) {
+                double lw = limit.doubleValue() * 1000.0;
+                double ap = alloc * 100.0 / lw;
+                r.put("powerPct", round(ap));
+                r.put("measuredPct", meas == null ? null : round(meas * 100.0 / lw));
+                double worst = Math.max(ap, meas == null ? 0.0 : meas * 100.0 / lw);
+                r.put("level", worst >= (double)max ? "OVER" : (worst >= (double)warn ? "WARN" : "OK"));
+            } else {
+                r.put("powerPct", null);
+                r.put("measuredPct", null);
+                r.put("level", "UNKNOWN");
+            }
+        }
+
+        return rows;
+    }
+
+    public List<Map<String, Object>> rooms() {
+        Map<String, Map<String, Object>> out = new LinkedHashMap<>();
+
+        for (Map<String, Object> m : this.jdbc
+            .queryForList("SELECT room_code AS \"roomCode\", name, power_kw AS \"powerKw\" FROM machine_room ORDER BY room_code")) {
+            Map<String, Object> r = new LinkedHashMap<>(m);
+            r.put("rackCount", 0);
+            r.put("uCapacity", 0);
+            r.put("uUsed", 0);
+            r.put("rackLimitKw", 0.0);
+            r.put("allocatedKw", 0.0);
+            r.put("measuredKw", null);
+            r.put("warnRacks", 0);
+            r.put("overRacks", 0);
+            r.put("missingPower", 0);
+            out.put((String)m.get("roomCode"), r);
+        }
+
+        for (Map<String, Object> k : this.racks(null)) {
+            Map<String, Object> r = out.get((String)k.get("roomCode"));
+            if (r != null) {
+                inc(r, "rackCount", 1);
+                inc(r, "uCapacity", ((Number)k.get("uCapacity")).intValue());
+                inc(r, "uUsed", ((Number)k.get("uUsed")).intValue());
+                inc(r, "missingPower", ((Number)k.get("missingPower")).intValue());
+                if (k.get("powerLimitKw") != null) {
+                    r.put("rackLimitKw", round((Double)r.get("rackLimitKw") + ((BigDecimal)k.get("powerLimitKw")).doubleValue()));
+                }
+
+                r.put("allocatedKw", round((Double)r.get("allocatedKw") + (Double)k.get("allocatedKw")));
+                if (k.get("measuredKw") != null) {
+                    double prev = r.get("measuredKw") == null ? 0.0 : (Double)r.get("measuredKw");
+                    r.put("measuredKw", round(prev + (Double)k.get("measuredKw")));
+                }
+
+                if ("WARN".equals(k.get("level"))) {
+                    inc(r, "warnRacks", 1);
+                } else if ("OVER".equals(k.get("level"))) {
+                    inc(r, "overRacks", 1);
+                }
+            }
+        }
+
+        for (Map<String, Object> r : out.values()) {
+            r.put("uPct", pct(((Number)r.get("uUsed")).intValue(), ((Number)r.get("uCapacity")).intValue()));
+            double lim = (Double)r.get("rackLimitKw");
+            r.put("powerPct", lim > 0.0 ? round((Double)r.get("allocatedKw") * 100.0 / lim) : null);
+        }
+
+        return new ArrayList<>(out.values());
+    }
+
+    public List<Map<String, Object>> forecast(String roomCode) {
+        List<Map<String, Object>> rows = this.rooms();
+        if (roomCode != null && !roomCode.isBlank()) {
+            rows = rows.stream().filter(r -> roomCode.equals(r.get("roomCode"))).toList();
+        }
+        int warn = this.warnPct();
+        int max = this.maxPct();
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            Double currentPct = row.get("powerPct") instanceof Number n ? n.doubleValue() : 0.0;
+            double current = Math.max(0.0, Math.min(100.0, currentPct));
+            double rate = current > 0.0 ? Math.max(0.8, Math.min(8.0, current * 0.06 + 1.2)) : 1.0;
+            double p30 = Math.min(100.0, current + rate * 1.5);
+            double p60 = Math.min(100.0, current + rate * 3.2);
+            double p90 = Math.min(100.0, current + rate * 4.8);
+            String risk = p90 >= max ? "OVER" : (p90 >= warn ? "WARN" : "OK");
+            double daysToWarn = current >= warn ? 0.0 : Math.max(0.0, ((warn - current) / Math.max(0.1, rate)) * 30.0);
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("roomCode", row.get("roomCode"));
+            item.put("name", row.get("name"));
+            item.put("currentPct", round(current));
+            item.put("projectedPct30", round(p30));
+            item.put("projectedPct60", round(p60));
+            item.put("projectedPct90", round(p90));
+            item.put("riskLevel", risk);
+            item.put("daysToWarn", Math.round(daysToWarn));
+            item.put("allocatedKw", row.getOrDefault("allocatedKw", 0.0));
+            item.put("powerLimitKw", row.getOrDefault("rackLimitKw", 0.0));
+            out.add(item);
+        }
+        out.sort(Comparator.comparingDouble(item -> ((Number)item.get("currentPct")).doubleValue()).reversed());
+        return out;
+    }
+
+    public Map<String, Object> check(String rackCode, int uHeight, Integer powerW, String excludeAssetNo) {
+        if (uHeight >= 1 && uHeight <= 60) {
+            List<Map<String, Object>> rows = this.jdbc
+                .queryForList("SELECT rack_code, u_capacity, power_limit_kw FROM rack WHERE rack_code = ?", new Object[]{rackCode});
+            if (rows.isEmpty()) {
+                throw BusinessException.notFound("机柜不存在：" + rackCode);
+            } else {
+                Map<String, Object> rack = rows.get(0);
+                int cap = ((Number)rack.get("u_capacity")).intValue();
+                List<Integer> starts = this.freeStarts(rackCode, cap, uHeight, excludeAssetNo);
+                double alloc = this.allocatedW(rackCode, excludeAssetNo);
+                BigDecimal limit = (BigDecimal)rack.get("power_limit_kw");
+                List<String> problems = new ArrayList<>();
+                List<String> warnings = new ArrayList<>();
+                if (starts.isEmpty()) {
+                    problems.add("没有连续 " + uHeight + "U 的空闲位置");
+                }
+
+                Double after = null;
+                if (limit != null && limit.signum() > 0) {
+                    double add = powerW == null ? 0.0 : (double)powerW.intValue();
+                    after = round((alloc + add) * 100.0 / (limit.doubleValue() * 1000.0));
+                    if (after > (double)this.maxPct()) {
+                        problems.add("上架后功率分配率 " + after + "% 超过上限 " + this.maxPct() + "%");
+                    } else if (after >= (double)this.warnPct()) {
+                        warnings.add("上架后功率分配率 " + after + "%，已超过预警线 " + this.warnPct() + "%");
+                    }
+                } else {
+                    warnings.add("机柜未设置功率上限，无法校验功率");
+                }
+
+                if (powerW == null) {
+                    warnings.add("未提供设备功率，按 0 W 估算");
+                }
+
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("rackCode", rackCode);
+                out.put("ok", problems.isEmpty());
+                out.put("problems", problems);
+                out.put("warnings", warnings);
+                out.put("freeStarts", starts.size() > 20 ? starts.subList(0, 20) : starts);
+                out.put("allocatedKw", round(alloc / 1000.0));
+                out.put("powerLimitKw", limit);
+                out.put("powerPctAfter", after);
+                return out;
+            }
+        } else {
+            throw BusinessException.badRequest("U 高须在 1-60");
+        }
+    }
+
+    public List<Map<String, Object>> recommend(String roomCode, int uHeight, Integer powerW, int count, int limit) {
+        if (uHeight >= 1 && uHeight <= 60) {
+            int need = Math.max(1, Math.min(count, 500));
+            int w = powerW == null ? 0 : Math.max(0, powerW);
+            int max = this.maxPct();
+            List<Map<String, Object>> out = new ArrayList<>();
+            Map<String, List<int[]>> blocks = this.freeBlocks(roomCode);
+
+            for (Map<String, Object> r : this.racks(roomCode)) {
+                String code = (String)r.get("rackCode");
+                int fit = 0;
+                List<Integer> starts = new ArrayList<>();
+
+                for (int[] b : blocks.getOrDefault(code, List.of())) {
+                    int n = b[1] / uHeight;
+
+                    for (int i = 0; i < n; i++) {
+                        starts.add(b[0] + b[1] - (i + 1) * uHeight);
+                    }
+
+                    fit += n;
+                }
+
+                if (fit != 0) {
+                    int spaceFit = fit;
+                    BigDecimal lim = (BigDecimal)r.get("powerLimitKw");
+                    double alloc = ((Number)r.get("allocatedW")).doubleValue();
+                    Integer byPower = null;
+                    if (lim != null && lim.signum() > 0 && w > 0) {
+                        double headroom = lim.doubleValue() * 1000.0 * (double)max / 100.0 - alloc;
+                        byPower = (int)Math.max(0.0, Math.floor(headroom / (double)w));
+                        fit = Math.min(fit, byPower);
+                    }
+
+                    if (fit != 0) {
+                        int place = Math.min(fit, need);
+                        starts.sort(Comparator.reverseOrder());
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("rackCode", code);
+                        m.put("roomCode", r.get("roomCode"));
+                        m.put("locationName", r.get("locationName"));
+                        m.put("canPlace", fit);
+                        m.put("place", place);
+                        m.put("startUnits", starts.subList(0, Math.min(place, starts.size())));
+                        m.put("uFree", r.get("uFree"));
+                        m.put("powerLimitKw", lim);
+                        m.put("allocatedKw", r.get("allocatedKw"));
+                        m.put("powerPctNow", r.get("powerPct"));
+                        m.put(
+                            "powerPctAfter",
+                            lim != null && lim.signum() > 0 ? round((alloc + (double)place * (double)w) * 100.0 / (lim.doubleValue() * 1000.0)) : null
+                        );
+                        m.put("limitedBy", byPower != null && byPower < spaceFit ? "POWER" : "SPACE");
+                        out.add(m);
+                    }
+                }
+            }
+
+            int warn = this.warnPct();
+            out.sort(
+                Comparator.<Map<String, Object>>comparingInt(mx -> -(Integer)mx.get("place"))
+                    .thenComparingInt(mx -> mx.get("powerPctAfter") != null && (Double)mx.get("powerPctAfter") >= (double)warn ? 1 : 0)
+                    .thenComparing(mx -> mx.get("powerPctAfter") == null ? 1.0 : -(Double)mx.get("powerPctAfter"))
+            );
+            return out.size() > limit ? out.subList(0, limit) : out;
+        } else {
+            throw BusinessException.badRequest("U 高须在 1-60");
+        }
+    }
+
+    private double allocatedW(String rackCode, String excludeAssetNo) {
+        List<String> st = this.powerStatuses();
+        String in = String.join(",", Collections.nCopies(st.size(), "?"));
+        List<Object> args = new ArrayList<>();
+        args.add(rackCode);
+        args.addAll(st);
+        String ex = "";
+        if (excludeAssetNo != null && !excludeAssetNo.isBlank()) {
+            ex = " AND asset_no <> ?";
+            args.add(excludeAssetNo);
+        }
+
+        Double v = (Double)this.jdbc
+            .queryForObject(
+                "SELECT COALESCE(SUM(power_w), 0)::float8 FROM v_asset_power WHERE rack_code = ? AND status_biz IN (" + in + ")" + ex,
+                Double.class,
+                args.toArray()
+            );
+        return v == null ? 0.0 : v;
+    }
+
+    private List<Integer> freeStarts(String rackCode, int cap, int h, String excludeAssetNo) {
+        boolean[] usable = new boolean[cap + 2];
+        this.jdbc.query("SELECT unit_no, status, occupied_by FROM rack_unit WHERE rack_code = ?", rs -> {
+            int u = rs.getInt(1);
+            if (u >= 1 && u <= cap) {
+                String sx = rs.getString(2);
+                usable[u] = "空闲".equals(sx) || excludeAssetNo != null && excludeAssetNo.equals(rs.getString(3));
+            }
+        }, new Object[]{rackCode});
+        List<Integer> starts = new ArrayList<>();
+
+        for (int s = cap - h + 1; s >= 1; s--) {
+            boolean all = true;
+
+            for (int i = s; i < s + h; i++) {
+                if (!usable[i]) {
+                    all = false;
+                    break;
+                }
+            }
+
+            if (all) {
+                starts.add(s);
+            }
+        }
+
+        return starts;
+    }
+
+    private Map<String, List<int[]>> freeBlocks(String roomCode) {
+        Map<String, List<int[]>> out = new HashMap<>();
+        String sql = "SELECT ru.rack_code, ru.unit_no, ru.status FROM rack_unit ru JOIN rack r ON r.rack_code = ru.rack_code WHERE ru.unit_no BETWEEN 1 AND r.u_capacity"
+            + (roomCode != null && !roomCode.isBlank() ? " AND r.room_code = ?" : "")
+            + " ORDER BY ru.rack_code, ru.unit_no";
+        Object[] args = roomCode != null && !roomCode.isBlank() ? new Object[]{roomCode.trim()} : new Object[0];
+        String[] cur = new String[]{null};
+        int[] start = new int[]{-1};
+        int[] prev = new int[]{-1};
+        this.jdbc.query(sql, rs -> {
+            String rack = rs.getString(1);
+            int u = rs.getInt(2);
+            boolean free = "空闲".equals(rs.getString(3));
+            if (!rack.equals(cur[0])) {
+                close(out, cur[0], start, prev);
+                cur[0] = rack;
+            }
+
+            if (free) {
+                if (start[0] < 0 || u != prev[0] + 1) {
+                    close(out, cur[0], start, prev);
+                    start[0] = u;
+                }
+
+                prev[0] = u;
+            } else {
+                close(out, cur[0], start, prev);
+            }
+        }, args);
+        close(out, cur[0], start, prev);
+        return out;
+    }
+
+    private static void close(Map<String, List<int[]>> out, String rack, int[] start, int[] prev) {
+        if (rack != null && start[0] > 0) {
+            out.computeIfAbsent(rack, k -> new ArrayList<>()).add(new int[]{start[0], prev[0] - start[0] + 1});
+        }
+
+        start[0] = -1;
+        prev[0] = -1;
+    }
+
+    private Map<String, Integer> maxFreeBlocks(String roomCode) {
+        Map<String, Integer> out = new HashMap<>();
+        this.freeBlocks(roomCode).forEach((k, v) -> out.put(k, v.stream().mapToInt(b -> b[1]).max().orElse(0)));
+        return out;
+    }
+
+    private Map<String, Double> measuredByRack() {
+        Map<String, Double> out = new HashMap<>();
+        if (!this.prom.configured()) {
+            return out;
+        } else {
+            try {
+                for (Map<String, Object> r : this.prom.instant("sum by (rack) (ipmi_dcmi_power_consumption_watts{rack!=\"\"})")) {
+                    Map<String, String> metric = (Map<String, String>)r.get("metric");
+                    if (metric != null && metric.get("rack") != null && r.get("value") instanceof Number n) {
+                        out.put(metric.get("rack"), n.doubleValue());
+                    }
+                }
+            } catch (RuntimeException var7) {
+                log.debug("[capacity] 实测功率查询失败：{}", var7.getMessage());
+            }
+
+            return out;
+        }
+    }
+
+    private static void inc(Map<String, Object> m, String k, int d) {
+        m.put(k, ((Number)m.get(k)).intValue() + d);
+    }
+
+    private static Double pct(int a, int b) {
+        return b <= 0 ? null : round((double)a * 100.0 / (double)b);
+    }
+
+    private static double round(double v) {
+        return BigDecimal.valueOf(v).setScale(1, RoundingMode.HALF_UP).doubleValue();
+    }
+}

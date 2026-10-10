@@ -1,0 +1,284 @@
+import http from './client'
+
+export interface RackCapacity {
+  rackCode: string
+  roomCode: string
+  locationName?: string
+  uCapacity: number
+  uUsed: number
+  uFree: number
+  maxFreeBlock: number
+  uPct: number | null
+  powerLimitKw: number | null
+  allocatedW: number
+  allocatedKw: number
+  measuredKw: number | null
+  powerPct: number | null
+  measuredPct: number | null
+  assetCount: number
+  missingPower: number
+  level: 'OK' | 'WARN' | 'OVER' | 'UNKNOWN'
+}
+
+export interface RoomCapacity {
+  roomCode: string
+  name: string
+  powerKw: number | null
+  rackCount: number
+  uCapacity: number
+  uUsed: number
+  uPct: number | null
+  rackLimitKw: number
+  allocatedKw: number
+  measuredKw: number | null
+  powerPct: number | null
+  warnRacks: number
+  overRacks: number
+  missingPower: number
+}
+
+export interface Recommendation {
+  rackCode: string
+  roomCode: string
+  locationName?: string
+  canPlace: number
+  place: number
+  startUnits: number[]
+  uFree: number
+  powerLimitKw: number | null
+  allocatedKw: number
+  powerPctNow: number | null
+  powerPctAfter: number | null
+  limitedBy: 'POWER' | 'SPACE'
+}
+
+export interface PowerProfile {
+  id: number
+  matchType: 'MODEL' | 'CATEGORY'
+  matchValue: string
+  ratedW: number
+  remark?: string
+  assetCount?: number
+}
+
+export interface CapacityForecastItem {
+  roomCode: string
+  name: string
+  currentPct: number
+  projectedPct30: number
+  projectedPct60: number
+  projectedPct90: number
+  riskLevel: 'OK' | 'WARN' | 'OVER'
+  daysToWarn: number
+  allocatedKw: number
+  powerLimitKw: number | null
+}
+
+export const fetchCapacityRooms = () =>
+  http.get<any, { rooms: RoomCapacity[]; warnPct: number; maxPct: number; assetsWithoutPower: number }>('/capacity/rooms')
+export const fetchCapacityForecast = (roomCode?: string) =>
+  http.get<any, { generatedAt: string; items: CapacityForecastItem[] }>('/capacity/forecast', { params: { roomCode: roomCode || undefined } })
+export const fetchCapacityRacks = (roomCode?: string) =>
+  http.get<any, RackCapacity[]>('/capacity/racks', { params: { roomCode: roomCode || undefined } })
+export const fetchRackPowerAssets = (rackCode: string) =>
+  http.get<any, any[]>(`/capacity/racks/${encodeURIComponent(rackCode)}/assets`)
+export const checkPlacement = (p: { rackCode: string; uHeight: number; powerW?: number; excludeAssetNo?: string }) =>
+  http.get<any, { ok: boolean; problems: string[]; warnings: string[]; freeStarts: number[]; powerPctAfter: number | null }>(
+    '/capacity/check',
+    { params: p },
+  )
+export const recommendPlacement = (p: { roomCode?: string; uHeight: number; powerW?: number; count: number }) =>
+  http.get<any, Recommendation[]>('/capacity/recommend', { params: p })
+
+export const fetchPowerProfiles = () => http.get<any, PowerProfile[]>('/capacity/power-profiles')
+export const fetchMissingModels = () =>
+  http.get<any, { modelCode: string; assetCount: number }[]>('/capacity/power-profiles/missing-models')
+export const createPowerProfile = (p: Omit<PowerProfile, 'id'>) => http.post('/capacity/power-profiles', p)
+export const updatePowerProfile = (id: number, p: Omit<PowerProfile, 'id'>) => http.put(`/capacity/power-profiles/${id}`, p)
+export const deletePowerProfile = (id: number) => http.delete(`/capacity/power-profiles/${id}`)
+
+export const fetchCapacitySettings = () =>
+  http.get<any, { key: string; value: string; remark?: string }[]>('/capacity/settings')
+export const saveCapacitySettings = (v: Record<string, string>) => http.put('/capacity/settings', v)
+
+/* ---------------- 到期提醒 ---------------- */
+export interface ExpirySummary {
+  outOfWarrantyInUse: number
+  warranty30: number
+  warranty90: number
+  warrantyUnknown: number
+  contract30: number
+  contract90: number
+  contractExpiredActive: number
+}
+export const fetchExpiry = (days: number, kind?: string) =>
+  http.get<any, { warranty?: any[]; contract?: any[]; summary: ExpirySummary }>('/expiry', { params: { days, kind } })
+export const runExpiry = () => http.post<any, { warranty: number; contract: number }>('/expiry/run')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
