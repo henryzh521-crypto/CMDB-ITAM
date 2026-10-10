@@ -1,0 +1,561 @@
+<script setup lang="ts">
+/**
+ * 容量管理：机房 / 机柜的 U 位与功率（分配 vs 上限 vs 实测）、上架推荐、功率模板、容量参数。
+ */
+import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useAuthStore } from '@/stores/auth'
+import {
+  createPowerProfile,
+  deletePowerProfile,
+  fetchCapacityRacks,
+  fetchCapacityRooms,
+  fetchCapacitySettings,
+  fetchMissingModels,
+  fetchPowerProfiles,
+  fetchRackPowerAssets,
+  recommendPlacement,
+  saveCapacitySettings,
+  updatePowerProfile,
+} from '@/api/capacity'
+import type { PowerProfile, RackCapacity, Recommendation, RoomCapacity } from '@/api/capacity'
+
+const auth = useAuthStore()
+/** v3.4：删除需角色显式授予（后端同样校验） */
+const canDelete = computed(() => auth.canDelete('racks'))
+const canWrite = computed(() => auth.canWrite('racks'))
+const isAdmin = computed(() => !!auth.user?.isAdmin)
+const tab = ref('racks')
+
+/* ---------------- 总览 ---------------- */
+const rooms = ref<RoomCapacity[]>([])
+const warnPct = ref(80)
+const maxPct = ref(95)
+const missingTotal = ref(0)
+const roomCode = ref('')
+const racks = ref<RackCapacity[]>([])
+const loading = ref(false)
+const levelFilter = ref('')
+
+const LEVEL: Record<string, { label: string; type: 'success' | 'warning' | 'danger' | 'info' }> = {
+  OK: { label: '正常', type: 'success' },
+  WARN: { label: '预警', type: 'warning' },
+  OVER: { label: '超限', type: 'danger' },
+  UNKNOWN: { label: '未设上限', type: 'info' },
+}
+
+const shownRacks = computed(() => (levelFilter.value ? racks.value.filter((r) => r.level === levelFilter.value) : racks.value))
+const roomTotal = computed(() => {
+  const list = roomCode.value ? rooms.value.filter((r) => r.roomCode === roomCode.value) : rooms.value
+  const t = { racks: 0, uCap: 0, uUsed: 0, limit: 0, alloc: 0, measured: 0, hasMeasured: false, warn: 0, over: 0 }
+  for (const r of list) {
+    t.racks += r.rackCount
+    t.uCap += r.uCapacity
+    t.uUsed += r.uUsed
+    t.limit += r.rackLimitKw
+    t.alloc += r.allocatedKw
+    if (r.measuredKw != null) {
+      t.measured += r.measuredKw
+      t.hasMeasured = true
+    }
+    t.warn += r.warnRacks
+    t.over += r.overRacks
+  }
+  return t
+})
+
+function pctColor(p: number | null | undefined) {
+  if (p == null) return '#c0c4cc'
+  if (p >= maxPct.value) return '#f56c6c'
+  if (p >= warnPct.value) return '#e6a23c'
+  return '#67c23a'
+}
+
+async function loadRooms() {
+  try {
+    const r = await fetchCapacityRooms()
+    rooms.value = r.rooms
+    warnPct.value = r.warnPct
+    maxPct.value = r.maxPct
+    missingTotal.value = r.assetsWithoutPower
+  } catch {
+    // ignore
+  }
+}
+
+async function loadRacks() {
+  loading.value = true
+  try {
+    racks.value = await fetchCapacityRacks(roomCode.value || undefined)
+  } catch {
+    // ignore
+  } finally {
+    loading.value = false
+  }
+}
+
+function refresh() {
+  void loadRooms()
+  void loadRacks()
+}
+
+/* 机柜明细 */
+const drawer = ref(false)
+const drawerRack = ref<RackCapacity | null>(null)
+const rackAssets = ref<any[]>([])
+const SOURCE: Record<string, string> = { ASSET: '资产填写', MODEL: '型号模板', CATEGORY: '分类模板' }
+async function openRack(r: RackCapacity) {
+  drawerRack.value = r
+  drawer.value = true
+  try {
+    rackAssets.value = await fetchRackPowerAssets(r.rackCode)
+  } catch {
+    rackAssets.value = []
+  }
+}
+
+/* ---------------- 上架推荐 ---------------- */
+const rec = reactive({ roomCode: '', uHeight: 2, powerW: 800, count: 1 })
+const recResult = ref<Recommendation[] | null>(null)
+const recLoading = ref(false)
+const recTotal = computed(() => (recResult.value || []).reduce((s, r) => s + r.place, 0))
+async function doRecommend() {
+  recLoading.value = true
+  try {
+    recResult.value = await recommendPlacement({
+      roomCode: rec.roomCode || undefined,
+      uHeight: rec.uHeight,
+      powerW: rec.powerW || undefined,
+      count: rec.count,
+    })
+  } catch {
+    // ignore
+  } finally {
+    recLoading.value = false
+  }
+}
+
+/* ---------------- 功率模板 ---------------- */
+const profiles = ref<PowerProfile[]>([])
+const missing = ref<{ modelCode: string; assetCount: number }[]>([])
+const pDialog = ref(false)
+const pEditing = ref<number | null>(null)
+const pForm = reactive({ matchType: 'MODEL' as 'MODEL' | 'CATEGORY', matchValue: '', ratedW: 500, remark: '' })
+async function loadProfiles() {
+  try {
+    ;[profiles.value, missing.value] = await Promise.all([fetchPowerProfiles(), fetchMissingModels()])
+  } catch {
+    // ignore
+  }
+}
+function openProfile(p?: PowerProfile, model?: string) {
+  pEditing.value = p?.id ?? null
+  Object.assign(pForm, p
+    ? { matchType: p.matchType, matchValue: p.matchValue, ratedW: p.ratedW, remark: p.remark || '' }
+    : { matchType: 'MODEL', matchValue: model || '', ratedW: 500, remark: '' })
+  pDialog.value = true
+}
+async function saveProfile() {
+  try {
+    if (pEditing.value) await updatePowerProfile(pEditing.value, { ...pForm })
+    else await createPowerProfile({ ...pForm })
+    ElMessage.success('已保存')
+    pDialog.value = false
+    void loadProfiles()
+    refresh()
+  } catch {
+    // ignore
+  }
+}
+async function removeProfile(p: PowerProfile) {
+  try {
+    await ElMessageBox.confirm(`删除 ${p.matchValue} 的功率模板？`, '删除', { type: 'warning' })
+    await deletePowerProfile(p.id)
+    void loadProfiles()
+    refresh()
+  } catch {
+    // 取消
+  }
+}
+
+/* ---------------- 参数 ---------------- */
+const settings = reactive<Record<string, string>>({})
+const settingRemarks = ref<Record<string, string>>({})
+async function loadSettings() {
+  try {
+    for (const s of await fetchCapacitySettings()) {
+      settings[s.key] = s.value
+      settingRemarks.value[s.key] = s.remark || ''
+    }
+  } catch {
+    // ignore
+  }
+}
+async function saveSettings() {
+  try {
+    await saveCapacitySettings({ ...settings })
+    ElMessage.success('已保存')
+    refresh()
+  } catch {
+    // ignore
+  }
+}
+
+onMounted(() => {
+  refresh()
+  void loadProfiles()
+  void loadSettings()
+})
+</script>
+
+<template>
+  <div class="page-card">
+    <div class="page-title">容量管理</div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="num">{{ roomTotal.racks }}</div>
+        <div class="lbl">机柜数</div>
+      </div>
+      <div class="card">
+        <div class="num">{{ roomTotal.uCap ? Math.round((roomTotal.uUsed * 1000) / roomTotal.uCap) / 10 : 0 }}<small>%</small></div>
+        <div class="lbl">U 位使用率（{{ roomTotal.uUsed }} / {{ roomTotal.uCap }} U）</div>
+      </div>
+      <div class="card">
+        <div class="num" :style="{ color: pctColor(roomTotal.limit ? (roomTotal.alloc * 100) / roomTotal.limit : null) }">
+          {{ roomTotal.limit ? Math.round((roomTotal.alloc * 1000) / roomTotal.limit) / 10 : '-' }}<small>%</small>
+        </div>
+        <div class="lbl">功率分配率（{{ roomTotal.alloc.toFixed(1) }} / {{ roomTotal.limit.toFixed(1) }} kW）</div>
+      </div>
+      <div class="card">
+        <div class="num">{{ roomTotal.hasMeasured ? roomTotal.measured.toFixed(1) : '-' }}<small v-if="roomTotal.hasMeasured"> kW</small></div>
+        <div class="lbl">实测功率（IPMI）</div>
+      </div>
+      <div class="card link" @click="(levelFilter = 'WARN'), (tab = 'racks')">
+        <div class="num c-warning">{{ roomTotal.warn }}</div>
+        <div class="lbl">预警机柜（≥ {{ warnPct }}%）</div>
+      </div>
+      <div class="card link" @click="(levelFilter = 'OVER'), (tab = 'racks')">
+        <div class="num c-danger">{{ roomTotal.over }}</div>
+        <div class="lbl">超限机柜（≥ {{ maxPct }}%）</div>
+      </div>
+    </div>
+    <el-alert
+      v-if="missingTotal > 0"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-bottom: 12px"
+      :title="`有 ${missingTotal} 台已上架资产没有功率数据，功率分配率偏低。可在「功率模板」中按型号/分类批量补齐。`"
+    />
+
+    <el-tabs v-model="tab">
+      <el-tab-pane label="机柜容量" name="racks">
+        <div class="page-toolbar">
+          <el-select v-model="roomCode" placeholder="全部机房" clearable filterable style="width: 200px" @change="loadRacks">
+            <el-option v-for="r in rooms" :key="r.roomCode" :label="`${r.name}（${r.roomCode}）`" :value="r.roomCode" />
+          </el-select>
+          <el-radio-group v-model="levelFilter">
+            <el-radio-button value="">全部</el-radio-button>
+            <el-radio-button value="WARN">预警</el-radio-button>
+            <el-radio-button value="OVER">超限</el-radio-button>
+            <el-radio-button value="UNKNOWN">未设上限</el-radio-button>
+          </el-radio-group>
+          <div style="flex: 1"></div>
+          <el-button :icon="'Refresh'" @click="refresh">刷新</el-button>
+        </div>
+        <el-table v-loading="loading" :data="shownRacks" border stripe size="small" max-height="620">
+          <el-table-column label="机柜" min-width="150" fixed>
+            <template #default="{ row }">
+              <el-link type="primary" @click="openRack(row)">{{ row.rackCode }}</el-link>
+              <div class="sub">{{ row.roomCode }} {{ row.locationName || '' }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="U 位" min-width="190">
+            <template #default="{ row }">
+              <el-progress :percentage="row.uPct ?? 0" :stroke-width="10" :color="pctColor(row.uPct)" :format="() => `${row.uUsed}/${row.uCapacity}U`" />
+            </template>
+          </el-table-column>
+          <el-table-column label="最大连续空位" width="110" align="right">
+            <template #default="{ row }">{{ row.maxFreeBlock }} U</template>
+          </el-table-column>
+          <el-table-column label="功率分配" min-width="210">
+            <template #default="{ row }">
+              <template v-if="row.powerPct != null">
+                <el-progress
+                  :percentage="Math.min(100, row.powerPct)"
+                  :stroke-width="10"
+                  :color="pctColor(row.powerPct)"
+                  :format="() => `${row.allocatedKw}/${row.powerLimitKw} kW`"
+                />
+              </template>
+              <span v-else class="sub">{{ row.allocatedKw }} kW（未设上限）</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="实测" width="110" align="right">
+            <template #default="{ row }">
+              <span v-if="row.measuredKw != null" :style="{ color: pctColor(row.measuredPct) }">{{ row.measuredKw }} kW</span>
+              <span v-else class="sub">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="设备" width="90" align="right">
+            <template #default="{ row }">
+              {{ row.assetCount }}
+              <el-tooltip v-if="row.missingPower" :content="`${row.missingPower} 台缺功率数据`">
+                <el-tag type="warning" size="small">{{ row.missingPower }}</el-tag>
+              </el-tooltip>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <el-tag :type="LEVEL[row.level].type" size="small">{{ LEVEL[row.level].label }}</el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="机房汇总" name="rooms">
+        <el-table :data="rooms" border size="small">
+          <el-table-column label="机房" min-width="160">
+            <template #default="{ row }">{{ row.name }} <span class="sub">{{ row.roomCode }}</span></template>
+          </el-table-column>
+          <el-table-column prop="rackCount" label="机柜" width="70" align="right" />
+          <el-table-column label="U 位" min-width="170">
+            <template #default="{ row }">
+              <el-progress :percentage="row.uPct ?? 0" :stroke-width="10" :color="pctColor(row.uPct)" :format="() => `${row.uUsed}/${row.uCapacity}`" />
+            </template>
+          </el-table-column>
+          <el-table-column label="功率分配 / 机柜上限合计" min-width="220">
+            <template #default="{ row }">
+              <el-progress
+                v-if="row.powerPct != null"
+                :percentage="Math.min(100, row.powerPct)"
+                :stroke-width="10"
+                :color="pctColor(row.powerPct)"
+                :format="() => `${row.allocatedKw}/${row.rackLimitKw} kW`"
+              />
+              <span v-else class="sub">{{ row.allocatedKw }} kW</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="机房供电容量" width="120" align="right">
+            <template #default="{ row }">
+              <span v-if="row.powerKw" :class="{ 'c-danger': row.rackLimitKw > row.powerKw }">{{ row.powerKw }} kW</span>
+              <span v-else class="sub">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="实测" width="100" align="right">
+            <template #default="{ row }">{{ row.measuredKw != null ? row.measuredKw + ' kW' : '-' }}</template>
+          </el-table-column>
+          <el-table-column label="预警/超限" width="100" align="center">
+            <template #default="{ row }">
+              <span class="c-warning">{{ row.warnRacks }}</span> / <span class="c-danger">{{ row.overRacks }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <div class="sub" style="margin-top: 6px">机柜上限合计超过机房供电容量时标红（存在超配风险）。</div>
+      </el-tab-pane>
+
+      <el-tab-pane label="上架推荐" name="recommend">
+        <el-form inline>
+          <el-form-item label="机房">
+            <el-select v-model="rec.roomCode" placeholder="全部机房" clearable filterable style="width: 200px">
+              <el-option v-for="r in rooms" :key="r.roomCode" :label="`${r.name}（${r.roomCode}）`" :value="r.roomCode" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="设备高度">
+            <el-input-number v-model="rec.uHeight" :min="1" :max="60" style="width: 110px" /> <span class="sub">&nbsp;U</span>
+          </el-form-item>
+          <el-form-item label="单台功率">
+            <el-input-number v-model="rec.powerW" :min="0" :max="200000" :step="100" style="width: 140px" /> <span class="sub">&nbsp;W</span>
+          </el-form-item>
+          <el-form-item label="台数">
+            <el-input-number v-model="rec.count" :min="1" :max="500" style="width: 110px" />
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="recLoading" @click="doRecommend">推荐机柜</el-button>
+          </el-form-item>
+        </el-form>
+        <template v-if="recResult">
+          <el-alert
+            :type="recTotal >= rec.count ? 'success' : 'warning'"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 10px"
+            :title="recTotal >= rec.count
+              ? `可以放下全部 ${rec.count} 台（按下表顺序优先集中上架）`
+              : `只能放下 ${recTotal} / ${rec.count} 台，请扩容或调整机房`"
+          />
+          <el-table :data="recResult" border size="small">
+            <el-table-column type="index" width="50" />
+            <el-table-column label="机柜" min-width="150">
+              <template #default="{ row }">{{ row.rackCode }} <span class="sub">{{ row.roomCode }}</span></template>
+            </el-table-column>
+            <el-table-column label="可放台数" width="90" align="right" prop="canPlace" />
+            <el-table-column label="建议放" width="80" align="right" prop="place" />
+            <el-table-column label="建议起始 U" min-width="160">
+              <template #default="{ row }">{{ row.startUnits.join('、') }}</template>
+            </el-table-column>
+            <el-table-column label="功率率（当前 → 上架后）" min-width="190">
+              <template #default="{ row }">
+                <template v-if="row.powerPctAfter != null">
+                  {{ row.powerPctNow }}% → <b :style="{ color: pctColor(row.powerPctAfter) }">{{ row.powerPctAfter }}%</b>
+                </template>
+                <span v-else class="sub">未设功率上限</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="受限于" width="80">
+              <template #default="{ row }">{{ row.limitedBy === 'POWER' ? '功率' : '空间' }}</template>
+            </el-table-column>
+          </el-table>
+        </template>
+      </el-tab-pane>
+
+      <el-tab-pane label="功率模板" name="profiles">
+        <el-alert type="info" :closable="false" style="margin-bottom: 12px">
+          资产功率取值顺序：资产上填写的额定功率 → 型号模板 → 分类模板（子分类优先）。10 万台规模下按型号维护即可覆盖绝大部分设备。
+        </el-alert>
+        <el-row :gutter="16">
+          <el-col :xs="24" :lg="16">
+            <div class="page-toolbar">
+              <div style="flex: 1"></div>
+              <el-button v-if="canWrite" type="primary" :icon="'Plus'" @click="openProfile()">新增模板</el-button>
+            </div>
+            <el-table :data="profiles" border size="small">
+              <el-table-column label="匹配" width="80">
+                <template #default="{ row }">{{ row.matchType === 'MODEL' ? '型号' : '分类' }}</template>
+              </el-table-column>
+              <el-table-column prop="matchValue" label="型号 / 分类编码" min-width="160" />
+              <el-table-column label="功率" width="100" align="right">
+                <template #default="{ row }">{{ row.ratedW }} W</template>
+              </el-table-column>
+              <el-table-column prop="assetCount" label="覆盖资产" width="90" align="right" />
+              <el-table-column prop="remark" label="说明" min-width="140" show-overflow-tooltip />
+              <el-table-column v-if="canWrite" label="操作" width="120">
+                <template #default="{ row }">
+                  <el-button link type="primary" @click="openProfile(row)">编辑</el-button>
+                  <el-button v-if="canDelete" link type="danger" @click="removeProfile(row)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </el-col>
+          <el-col :xs="24" :lg="8">
+            <h4 class="sec">缺少功率数据的型号（按资产数）</h4>
+            <el-table :data="missing" size="small" border max-height="460">
+              <el-table-column prop="modelCode" label="型号" />
+              <el-table-column prop="assetCount" label="资产" width="70" align="right" />
+              <el-table-column v-if="canWrite" width="70">
+                <template #default="{ row }">
+                  <el-button link type="primary" @click="openProfile(undefined, row.modelCode)">补齐</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </el-col>
+        </el-row>
+      </el-tab-pane>
+
+      <el-tab-pane label="参数" name="settings">
+        <el-form label-width="170px" style="max-width: 720px" :disabled="!isAdmin">
+          <el-form-item v-for="(v, k) in settings" :key="k" :label="settingRemarks[k] || String(k)">
+            <el-input v-model="settings[k]" />
+          </el-form-item>
+          <el-form-item v-if="isAdmin">
+            <el-button type="primary" @click="saveSettings">保存</el-button>
+          </el-form-item>
+          <el-form-item v-else><span class="sub">仅管理员可修改</span></el-form-item>
+        </el-form>
+      </el-tab-pane>
+    </el-tabs>
+
+    <el-drawer v-model="drawer" size="640px" :title="`机柜 ${drawerRack?.rackCode} 功率明细`">
+      <el-descriptions v-if="drawerRack" :column="2" border size="small" style="margin-bottom: 12px">
+        <el-descriptions-item label="U 位">{{ drawerRack.uUsed }} / {{ drawerRack.uCapacity }} U（最大连续空位 {{ drawerRack.maxFreeBlock }} U）</el-descriptions-item>
+        <el-descriptions-item label="功率上限">{{ drawerRack.powerLimitKw ?? '未设置' }} kW</el-descriptions-item>
+        <el-descriptions-item label="已分配">{{ drawerRack.allocatedKw }} kW（{{ drawerRack.powerPct ?? '-' }}%）</el-descriptions-item>
+        <el-descriptions-item label="实测">{{ drawerRack.measuredKw != null ? drawerRack.measuredKw + ' kW' : '未接入' }}</el-descriptions-item>
+      </el-descriptions>
+      <el-table :data="rackAssets" size="small" border>
+        <el-table-column label="U" width="60">
+          <template #default="{ row }">{{ row.unitNo ?? '-' }}</template>
+        </el-table-column>
+        <el-table-column label="资产" min-width="180">
+          <template #default="{ row }">{{ row.assetNo }}<div class="sub">{{ row.name }}</div></template>
+        </el-table-column>
+        <el-table-column prop="modelCode" label="型号" width="120" show-overflow-tooltip />
+        <el-table-column prop="statusBiz" label="状态" width="90" />
+        <el-table-column label="功率" width="120" align="right">
+          <template #default="{ row }">
+            <template v-if="row.powerW != null">{{ row.powerW }} W<div class="sub">{{ SOURCE[row.powerSource] }}</div></template>
+            <el-tag v-else type="warning" size="small">缺失</el-tag>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-drawer>
+
+    <el-dialog v-model="pDialog" :title="pEditing ? '编辑功率模板' : '新增功率模板'" width="460px">
+      <el-form label-width="90px">
+        <el-form-item label="匹配方式">
+          <el-radio-group v-model="pForm.matchType">
+            <el-radio value="MODEL">按型号</el-radio>
+            <el-radio value="CATEGORY">按分类</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item :label="pForm.matchType === 'MODEL' ? '型号编码' : '分类编码'">
+          <el-input v-model="pForm.matchValue" :placeholder="pForm.matchType === 'MODEL' ? '与资产的型号编码一致' : '如 SRV / GPU / NET'" />
+        </el-form-item>
+        <el-form-item label="功率（W）">
+          <el-input-number v-model="pForm.ratedW" :min="0" :max="200000" :step="50" />
+          <span class="sub" style="margin-left: 8px">建议填典型运行功率，而非电源铭牌最大值</span>
+        </el-form-item>
+        <el-form-item label="说明"><el-input v-model="pForm.remark" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pDialog = false">取消</el-button>
+        <el-button type="primary" @click="saveProfile">保存</el-button>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<style scoped>
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.card {
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+.card.link {
+  cursor: pointer;
+}
+.card.link:hover {
+  border-color: var(--el-color-primary);
+}
+.num {
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.num small {
+  font-size: 12px;
+  font-weight: 400;
+}
+.lbl,
+.sub {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.c-danger {
+  color: var(--el-color-danger);
+}
+.c-warning {
+  color: var(--el-color-warning);
+}
+.sec {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+</style>

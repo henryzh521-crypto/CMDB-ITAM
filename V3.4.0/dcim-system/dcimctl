@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# ============================================================
+# dcimctl —— 智算资产管理平台运维命令（Docker 模式）
+#
+#   ./dcimctl start | stop | restart [服务]     启停（不带服务名 = 全部）
+#   ./dcimctl status                           容器状态 + 健康检查摘要
+#   ./dcimctl logs [服务] [-f]                 查看日志（默认 platform-be）
+#   ./dcimctl health                           端到端健康检查（入口 → 后端 → DB/Redis）
+#   ./dcimctl backup                           立即全量备份（data/pg-backups/manual）
+#   ./dcimctl verify-backup                    对最新备份做恢复演练
+#   ./dcimctl restore <备份文件>               从备份恢复 platform 库（危险操作，需确认）
+#   ./dcimctl admin-password                   查看首次安装的管理员初始密码
+#   ./dcimctl rotate-secrets [--all]           轮换外泄密钥（JWT / 加密密钥自动重加密 / 采集器 / 监控令牌 / Redis / PG）
+#   ./dcimctl psql                             进入数据库命令行
+#   ./dcimctl monitoring reload                修改 deploy/monitoring/*.yml 或 rules 后热加载（先做语法校验）
+#   ./dcimctl monitoring check                 校验 Prometheus / Alertmanager 配置与告警规则
+#   ./dcimctl monitoring targets               采集目标健康摘要（按任务统计 up/down）
+#   ./dcimctl monitoring token-sync            把 .env 中 MONITORING_TOKEN 同步到令牌文件并重启相关容器
+#   ./dcimctl monitoring enable|disable [组件] 启用/停用可选组件（monitoring、ipmi、snmp、grafana）
+#   ./dcimctl save-images [文件]               导出全部镜像（离线安装用）
+#   ./dcimctl load-images <文件>               导入镜像
+#   ./dcimctl upgrade <新安装包目录>           升级到新版本（自动备份 → 构建 → 滚动重启）
+#   ./dcimctl uninstall [--purge]             卸载（--purge 同时删除数据目录，不可恢复）
+#   ./dcimctl version
+# ============================================================
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+ENV_FILE="$ROOT/deploy/.env"
+[ -f "$ENV_FILE" ] || { echo "未找到 deploy/.env，请先执行 ./install.sh" >&2; exit 1; }
+DC=(docker compose --env-file "$ENV_FILE" -f "$ROOT/deploy/docker-compose.yml")
+get_env() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+set_env() {
+  local k="$1" v="$2"
+  if grep -qE "^${k}=" "$ENV_FILE"; then
+    # 值中的 / & | 必须转义（v3.2 未转义：base64 密钥里的 / 会让 sed 报错或写坏 .env）
+    local esc; esc="$(printf '%s' "$v" | sed -e 's/[\/&|]/\\&/g')"
+    sed -i "s|^${k}=.*|${k}=${esc}|" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"
+  fi
+}
+# shellcheck source=scripts/lib-secrets.sh
+. "$ROOT/scripts/lib-secrets.sh"
+ALL_PROFILES=(--profile collector --profile monitoring --profile ipmi --profile snmp --profile grafana)
+running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
+data_dir() { local d; d="$(get_env DATA_DIR)"; [[ "$d" = /* ]] || d="$ROOT/deploy/${d:-../data}"; (cd "$d" && pwd); }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  start)   "${DC[@]}" up -d "$@" ;;
+  stop)    if [ $# -gt 0 ]; then "${DC[@]}" stop "$@"; else "${DC[@]}" down; fi ;;
+  restart) "${DC[@]}" restart "$@" ;;
+  status|ps)
+    "${DC[@]}" ps
+    echo
+    docker exec dcim-platform-be /app/healthcheck.sh >/dev/null 2>&1 && echo "后端：健康" || echo "后端：不健康 / 未启动"
+    ;;
+  logs)
+    svc="${1:-platform-be}"; shift || true
+    "${DC[@]}" logs --tail 200 "$@" "$svc" ;;
+  health)
+    port="$(get_env HTTP_PORT)"; port="${port:-80}"
+    echo "→ 入口 http://127.0.0.1:${port}/api/healthz"
+    out="$(curl -s -m 10 "http://127.0.0.1:${port}/api/healthz" || true)"
+    echo "$out"
+    if echo "$out" | grep -q '"status":"degraded"'; then echo "! 降级运行（Redis 或数据库连接池异常，核心功能仍可用）"; fi
+    echo "$out" | grep -q '"db":"up"' && echo "✓ 健康" || { echo "✗ 不健康"; exit 1; } ;;
+  backup)
+    docker exec dcim-backup /bin/bash /usr/local/bin/backup.sh manual
+    echo "备份目录：$(data_dir)/pg-backups/manual" ;;
+  verify-backup)
+    docker exec dcim-backup /bin/sh /usr/local/bin/restore-verify.sh "$@" ;;
+  restore)
+    [ $# -ge 1 ] || { echo "用法: ./dcimctl restore <data/pg-backups/.../platform_xxx.dump>"; exit 2; }
+    COMPOSE="${DC[*]}" bash "$ROOT/scripts/restore.sh" "$1" ;;
+  admin-password)
+    pw="$(get_env DCIM_ADMIN_INITIAL_PASSWORD)"
+    if [ -n "$pw" ]; then echo "admin 初始密码：$pw（首次登录后已强制修改则此值失效）"
+    else docker logs dcim-platform-be 2>&1 | grep -E '随机生成初始口令|initial' | tail -n 3 || echo "未在日志中找到"; fi ;;
+  psql) docker exec -it dcim-postgres psql -U dcim -d platform ;;
+  rotate-secrets)
+    if [ "${1:-}" = "--all" ]; then
+      # 强制轮换：把当前值都视为需更换
+      for k in JWT_SECRET DCIM_AGENT_KEY MONITORING_TOKEN DCIM_CRYPTO_KEY REDIS_PASSWORD PG_PASSWORD; do
+        v="$(get_env "$k")"; [ -n "$v" ] && DCIM_LEAKED_FP[$k]="$(printf '%s' "$v" | sha256sum | cut -c1-64)"
+      done
+    elif [ -z "$(leaked_keys)" ]; then
+      echo "未发现与 v3.2.0 安装包外泄值相同的密钥。强制全部轮换应用密钥：./dcimctl rotate-secrets --all"; exit 0
+    fi
+    cp -p "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    rotate_secrets docker
+    f="$ROOT/deploy/monitoring/secrets/monitoring_token"
+    ( umask 077; printf '%s' "$(get_env MONITORING_TOKEN)" > "$f" )
+    chown 65534:65534 "$f" 2>/dev/null && chmod 400 "$f" || chmod 644 "$f"
+    echo "重建受影响的容器..."
+    "${DC[@]}" up -d redis platform-be
+    for c in prometheus alertmanager collector-agent backup; do
+      if running "dcim-$c"; then "${DC[@]}" up -d --force-recreate "$c"; fi
+    done
+    echo "✓ 完成。.env 已备份为 $ENV_FILE.bak.*；后端日志出现「密钥轮换：已重加密」且失败为 0 后可清空 DCIM_CRYPTO_KEY_OLD" ;;
+  save-images)
+    f="${1:-dcim-images-$(get_env DCIM_VERSION).tar.gz}"
+    imgs="$("${DC[@]}" "${ALL_PROFILES[@]}" config --images | sort -u | tr '\n' ' ')"
+    echo "导出镜像：$imgs"
+    # shellcheck disable=SC2086
+    docker save $imgs | gzip > "$f"
+    echo "已导出 $f（目标机执行 ./dcimctl load-images $f 后再 ./install.sh）" ;;
+  load-images)
+    [ -f "${1:-}" ] || { echo "用法: ./dcimctl load-images <文件>"; exit 2; }
+    gunzip -c "$1" | docker load ;;
+  upgrade)
+    new="${1:?用法: ./dcimctl upgrade <新安装包目录>}"
+    [ -x "$new/install.sh" ] || { echo "不是有效的安装包目录：$new"; exit 2; }
+    echo "将从 $ROOT 升级到 $new（沿用本目录的 deploy/.env 与数据目录）"
+    if [ -f "$ROOT/deploy/docker-compose.yml" ]; then
+      # 同为 v3.1+：直接复制配置与证书到新目录后由新包启动
+      mkdir -p "$new/deploy/tls"
+      cp -p "$ENV_FILE" "$new/deploy/.env"
+      sed -i "s|^DATA_DIR=.*|DATA_DIR=$(data_dir)|" "$new/deploy/.env"
+      cp -p "$ROOT"/deploy/tls/* "$new/deploy/tls/" 2>/dev/null || true
+      # 新安装包未附带采集器源码时沿用本目录的版本
+      if [ ! -f "$new/collector-agent/Dockerfile" ] && [ -f "$ROOT/collector-agent/Dockerfile" ]; then
+        cp -a "$ROOT/collector-agent" "$new/collector-agent"
+      fi
+      # 外泄的 TLS 私钥不带入新目录（install.sh 会重新生成自签证书）
+      if [ -f "$new/deploy/tls/server.key" ] && [ "$(sha256sum "$new/deploy/tls/server.key" | cut -c1-64)" = "$DCIM_LEAKED_TLS_KEY_FP" ]; then
+        echo "! 本环境 TLS 私钥随 v3.2.0 安装包外泄，新目录中已移除，将重新生成自签证书"
+        rm -f "$new/deploy/tls/server.key" "$new/deploy/tls/server.crt"
+      fi
+      docker exec dcim-backup /bin/bash /usr/local/bin/backup.sh manual
+      (cd "$new" && ./install.sh --yes)
+    else
+      (cd "$new" && ./install.sh --upgrade-from "$ROOT")
+    fi ;;
+  uninstall)
+    purge=0; [ "${1:-}" = "--purge" ] && purge=1
+    read -r -p "确认卸载（停止并删除容器$( [ $purge = 1 ] && echo '，并【永久删除】数据目录')）？输入 YES: " a
+    [ "$a" = "YES" ] || { echo "已取消"; exit 1; }
+    "${DC[@]}" "${ALL_PROFILES[@]}" down --remove-orphans
+    if [ $purge = 1 ]; then d="$(data_dir)"; echo "删除 $d"; rm -rf "$d"; fi
+    echo "已卸载。配置 deploy/.env 保留在原处（含密钥，请自行妥善处理）。" ;;
+  monitoring|mon)
+    sub="${1:-help}"; shift || true
+    case "$sub" in
+      check)
+        rc=0
+        if running dcim-prometheus; then
+          docker exec dcim-prometheus promtool check config /etc/prometheus/prometheus.yml || rc=1
+        else echo "dcim-prometheus 未运行，跳过 Prometheus 校验"; fi
+        if running dcim-alertmanager; then
+          docker exec dcim-alertmanager amtool check-config /etc/alertmanager/alertmanager.yml || rc=1
+        fi
+        exit $rc ;;
+      reload)
+        "$0" monitoring check || { echo "✗ 配置校验未通过，未执行热加载"; exit 1; }
+        # v3.4：Prometheus 不再开放 /-/reload、/-/quit（--web.enable-lifecycle 已关闭），改为发送 SIGHUP 热加载
+        running dcim-prometheus && docker kill -s HUP dcim-prometheus >/dev/null && echo "✓ Prometheus 已热加载（SIGHUP）"
+        running dcim-alertmanager && docker kill -s HUP dcim-alertmanager >/dev/null && echo "✓ Alertmanager 已热加载（SIGHUP）"
+        running dcim-blackbox && docker restart dcim-blackbox >/dev/null && echo "✓ Blackbox 已重启"
+        true ;;
+      targets)
+        running dcim-prometheus || { echo "dcim-prometheus 未运行"; exit 1; }
+        docker exec dcim-prometheus wget -qO- 'http://127.0.0.1:9090/api/v1/targets?state=active' \
+          | python3 -c '
+import json, sys, collections
+d = json.load(sys.stdin)["data"]["activeTargets"]
+s = collections.OrderedDict()
+for t in d:
+    j = t["labels"].get("job", t.get("scrapePool"))
+    s.setdefault(j, [0, 0, []])
+    if t["health"] == "up": s[j][0] += 1
+    else:
+        s[j][1] += 1
+        if len(s[j][2]) < 3: s[j][2].append(t["labels"].get("instance", "") + " " + t.get("lastError", "")[:80])
+print("%-20s %8s %8s" % ("任务", "在线", "离线"))
+for j, (u, dn, e) in s.items():
+    print("%-20s %8d %8d" % (j, u, dn))
+    for x in e: print("    ✗ " + x)
+' 2>/dev/null || echo "（宿主机缺少 python3，改用：docker exec dcim-prometheus wget -qO- http://127.0.0.1:9090/api/v1/targets）" ;;
+      token-sync)
+        tok="$(get_env MONITORING_TOKEN)"
+        [ -n "$tok" ] && [ "$tok" != CHANGEME ] || { echo ".env 中 MONITORING_TOKEN 为空"; exit 1; }
+        f="$ROOT/deploy/monitoring/secrets/monitoring_token"
+        ( umask 077; printf '%s' "$tok" > "$f" )
+        chown 65534:65534 "$f" 2>/dev/null && chmod 400 "$f" || chmod 644 "$f"
+        "${DC[@]}" up -d platform-be
+        for c in prometheus alertmanager; do running "dcim-$c" && "${DC[@]}" restart "$c"; done
+        echo "✓ 令牌已同步" ;;
+      enable|disable)
+        comp="${1:-monitoring}"
+        case "$comp" in monitoring|ipmi|snmp|grafana) ;; *) echo "组件须为 monitoring / ipmi / snmp / grafana"; exit 2 ;; esac
+        if [ "$comp" = ipmi ] && [ "$sub" = enable ] && grep -q CHANGEME "$ROOT/deploy/monitoring/ipmi_remote.yml" 2>/dev/null; then
+          echo "请先在 deploy/monitoring/ipmi_remote.yml 填写 BMC 只读账号口令"; exit 1
+        fi
+        IFS=',' read -r -a cur <<< "$(get_env COMPOSE_PROFILES)"
+        out=()
+        for p in "${cur[@]:-}"; do [ -n "$p" ] && [ "$p" != "$comp" ] && out+=("$p"); done
+        [ "$sub" = enable ] && out+=("$comp")
+        set_env COMPOSE_PROFILES "$(IFS=,; echo "${out[*]:-}")"
+        if [ "$sub" = enable ]; then
+          "${DC[@]}" up -d
+          [ "$comp" = ipmi ] || [ "$comp" = snmp ] && echo "提示：同时在平台「监控设置 → 监控模板」启用对应的 $comp 模板"
+        else
+          case "$comp" in
+            monitoring) "${DC[@]}" --profile monitoring stop prometheus alertmanager blackbox-exporter ;;
+            ipmi) "${DC[@]}" --profile ipmi stop ipmi-exporter ;;
+            snmp) "${DC[@]}" --profile snmp stop snmp-exporter ;;
+            grafana) "${DC[@]}" --profile grafana stop grafana ;;
+          esac
+        fi
+        echo "COMPOSE_PROFILES=$(get_env COMPOSE_PROFILES)" ;;
+      *) sed -n '2,26p' "$0" | grep 'dcimctl monitoring' ;;
+    esac ;;
+  version) echo "DCIM Platform $(cat "$ROOT/VERSION" 2>/dev/null || get_env DCIM_VERSION)" ;;
+  help|-h|--help|*) sed -n '2,26p' "$0" ;;
+esac

@@ -1,0 +1,36 @@
+# 带外硬件告警（ipmi_exporter 指标）
+groups:
+  - name: hardware
+    rules:
+      - alert: IpmiCollectFailed
+        expr: ipmi_up == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 带外传感器采集失败"
+          description: "{{ $labels.instance }} IPMI 无法登录或无响应（凭据错误 / BMC 挂死）。"
+      - alert: HardwareSensorCritical
+        expr: ipmi_sensor_state == 2
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.asset_name }} 硬件传感器 {{ $labels.name }} 严重"
+          description: "传感器类型 {{ $labels.type }}，请检查电源 / 风扇 / 内存 / 磁盘等部件。"
+      - alert: HardwareSensorWarning
+        expr: ipmi_sensor_state == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 硬件传感器 {{ $labels.name }} 告警"
+          description: "传感器类型 {{ $labels.type }}。"
+      - alert: InletTemperatureHigh
+        expr: ipmi_temperature_celsius{name=~"(?i).*(inlet|ambient).*"} > 35
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 进风温度 {{ $value }}℃"
+          description: "机柜 {{ $labels.rack }} 进风过热，检查空调 / 冷通道封闭。"

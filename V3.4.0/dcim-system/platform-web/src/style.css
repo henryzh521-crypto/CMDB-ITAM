@@ -1,0 +1,100 @@
+/* 主色覆盖（简洁企业后台风格） */
+:root {
+  --el-color-primary: #2563eb;
+  --el-color-primary-light-3: #648fe9;
+  --el-color-primary-light-5: #92adf0;
+  --el-color-primary-light-7: #c1cff6;
+  --el-color-primary-light-8: #dae2fb;
+  --el-color-primary-light-9: #ecf1fe;
+  --el-color-primary-dark-2: #1e4fbc;
+
+  /* Light theme (default) */
+  --bg-primary: #f5f7fa;
+  --bg-secondary: #fff;
+  --bg-tertiary: #f5f7fa;
+  --text-primary: #303133;
+  --text-secondary: #606266;
+  --text-placeholder: #c0c4cc;
+  --border-color: #e4e7ed;
+  --border-color-lighter: #ebeef5;
+  --header-bg: #fff;
+  --tabbar-bg: #fff;
+  --avatar-bg: rgba(255, 255, 255, 0.25);
+  --panel-border: #f5f7fa;
+  --card-bg: #fff;
+  --input-bg: #fff;
+  --hover-bg: #f5f7fa;
+  --active-bg: var(--el-color-primary-light-9);
+  --user-card-bg: var(--el-color-primary);
+}
+
+/* Dark theme */
+.dark {
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-tertiary: #0f3460;
+  --text-primary: #e4e7ed;
+  --text-secondary: #a6adb4;
+  --text-placeholder: #6a6e78;
+  --border-color: #2d3a5c;
+  --border-color-lighter: #1e2d4a;
+  --header-bg: #16213e;
+  --tabbar-bg: #16213e;
+  --avatar-bg: rgba(255, 255, 255, 0.1);
+  --panel-border: #2d3a5c;
+  --card-bg: #16213e;
+  --input-bg: #16213e;
+  --hover-bg: #1e2d4a;
+  --active-bg: #1e3a5f;
+  --user-card-bg: #1a1a2e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+  font-size: 14px;
+  color: var(--text-primary);
+  background-color: var(--bg-primary);
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* 通用页面元素 */
+.page-card {
+  background: var(--card-bg);
+  border-radius: 6px;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+}
+
+.page-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 14px;
+  color: var(--text-primary);
+}
+
+.page-toolbar {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.page-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}

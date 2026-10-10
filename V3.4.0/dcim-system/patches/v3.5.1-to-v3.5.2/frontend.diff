@@ -1,0 +1,32 @@
+diff --git a/a/platform-web/package-lock.json b/b/platform-web/package-lock.json
+index 5188508..639a8bb 100644
+--- a/a/platform-web/package-lock.json
++++ b/b/platform-web/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "platform-web",
+-  "version": "3.5.1",
++  "version": "3.5.2",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "platform-web",
+-      "version": "3.5.1",
++      "version": "3.5.2",
+       "dependencies": {
+         "@element-plus/icons-vue": "^2.3.1",
+         "axios": "^1.7.7",
+diff --git a/a/platform-web/package.json b/b/platform-web/package.json
+index 37665a7..4b21364 100644
+--- a/a/platform-web/package.json
++++ b/b/platform-web/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "platform-web",
+   "private": true,
+-  "version": "3.5.1",
++  "version": "3.5.2",
+   "type": "module",
+   "scripts": {
+     "dev": "vite",

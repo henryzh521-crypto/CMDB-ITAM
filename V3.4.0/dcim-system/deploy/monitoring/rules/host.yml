@@ -1,0 +1,92 @@
+# 主机与操作系统告警（icmp + node_exporter）
+groups:
+  - name: host
+    rules:
+      - alert: HostDown
+        expr: probe_success{job="icmp", ip_role="biz"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.asset_name }}（{{ $labels.instance }}）业务网 Ping 不通"
+          description: "资产 {{ $labels.asset_no }} 位于 {{ $labels.room }}/{{ $labels.rack }}，业务网连续 3 分钟无响应。"
+      - alert: BmcUnreachable
+        expr: probe_success{job="icmp", ip_role="mgmt"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }}（{{ $labels.instance }}）带外/管理网 Ping 不通"
+          description: "资产 {{ $labels.asset_no }} 管理口连续 10 分钟无响应，可能为 BMC 故障、管理网断开或设备断电。"
+      - alert: HighPingLatency
+        expr: probe_success{job="icmp"} == 1 and probe_duration_seconds{job="icmp"} > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }}（{{ $labels.instance }}）Ping 延迟偏高"
+          description: "持续 10 分钟 RTT > 200ms，当前 {{ $value | humanizeDuration }}。"
+      - alert: NodeExporterDown
+        expr: up{job="node"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 指标采集失败（node_exporter）"
+          description: "{{ $labels.instance }} 的 node_exporter 无法访问：代理未安装/未启动，或防火墙未放行 9100。"
+      - alert: HighCpuUsage
+        expr: 100 - avg by (asset_no, asset_name, instance, rack, room) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100 > 90
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} CPU 使用率持续 > 90%"
+          description: "当前 {{ $value | printf \"%.1f\" }}%（15 分钟）。"
+      - alert: HighMemoryUsage
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 内存使用率 > 95%"
+          description: "当前 {{ $value | printf \"%.1f\" }}%。"
+      - alert: DiskSpaceCritical
+        expr: (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nfs.*"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nfs.*"}) * 100 > 92
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.asset_name }} 分区 {{ $labels.mountpoint }} 使用率 > 92%"
+          description: "当前 {{ $value | printf \"%.1f\" }}%。"
+      - alert: DiskSpaceWarning
+        expr: (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nfs.*"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nfs.*"}) * 100 > 80
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 分区 {{ $labels.mountpoint }} 使用率 > 80%"
+          description: "当前 {{ $value | printf \"%.1f\" }}%。"
+      - alert: DiskWillFillIn24h
+        expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nfs.*"}[6h], 24 * 3600) < 0 and node_filesystem_avail_bytes > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 分区 {{ $labels.mountpoint }} 预计 24 小时内写满"
+          description: "按近 6 小时增长趋势线性预测。"
+      - alert: FilesystemReadOnly
+        expr: node_filesystem_readonly{fstype!~"tmpfs|overlay|squashfs|ramfs|nfs.*|iso9660"} == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.asset_name }} 分区 {{ $labels.mountpoint }} 变为只读"
+          description: "通常由磁盘故障或文件系统错误导致，请尽快检查。"
+      - alert: HostRebooted
+        expr: (time() - node_boot_time_seconds) < 600
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.asset_name }} 在 10 分钟内发生过重启"
+          description: "如非计划内重启请排查原因。"

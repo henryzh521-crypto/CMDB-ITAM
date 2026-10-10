@@ -1,0 +1,32 @@
+# ============================================================
+# Alertmanager —— 告警统一推送到平台（告警中心 / 自动派单 / 维护抑制 / IM 群推送均在平台完成）
+# ============================================================
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: dcim-platform
+  # 同一资产的同名告警合并；不同资产分开，便于平台逐台关联工单
+  group_by: ['alertname', 'asset_no', 'instance']
+  group_wait: 30s
+  group_interval: 2m
+  repeat_interval: 4h
+
+receivers:
+  - name: dcim-platform
+    webhook_configs:
+      - url: http://platform-be:8081/api/monitoring/ingest/alertmanager
+        send_resolved: true
+        max_alerts: 500
+        http_config:
+          authorization:
+            credentials_file: /etc/alertmanager/secrets/monitoring_token
+
+# 抑制：主机 Ping 不通时，同一资产的其他告警（代理不可达、指标异常等）不再单独上报
+inhibit_rules:
+  - source_matchers: ['alertname = HostDown']
+    target_matchers: ['alertname =~ "NodeExporterDown|DcgmExporterDown|HighCpuUsage|HighMemoryUsage|HighLoad"']
+    equal: ['asset_no']
+  - source_matchers: ['severity = critical']
+    target_matchers: ['severity = warning']
+    equal: ['alertname', 'asset_no']

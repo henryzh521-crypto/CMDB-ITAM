@@ -1,0 +1,20 @@
+# 平台与监控栈自身
+groups:
+  - name: platform
+    rules:
+      - alert: DcimPlatformDown
+        expr: probe_success{job="platform"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "资产管理平台后端不可用"
+          description: "/api/healthz 探测失败（服务停止或数据库不可用）。"
+      - alert: MonitoringDiscoveryEmpty
+        expr: absent(probe_success{job="icmp"})
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "监控未发现任何 Ping 目标"
+          description: "平台服务发现返回为空：检查监控接入令牌、资产 IP 与「纳入监控的资产状态」设置。"

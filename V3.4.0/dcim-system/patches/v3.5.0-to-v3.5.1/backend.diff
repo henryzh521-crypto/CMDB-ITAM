@@ -1,0 +1,1782 @@
+diff --git a/a/backend-resources/application.yml b/b/backend-resources/application.yml
+index e738695..abb67f1 100644
+--- a/a/backend-resources/application.yml
++++ b/b/backend-resources/application.yml
+@@ -214,8 +214,9 @@ dcim:
+     # 额外禁止的主机名（逗号分隔）
+     blocked-hosts: ${WEBHOOK_BLOCKED_HOSTS:}
+     # 禁止推送到平台自身网卡所在网段（容器部署时 = dcim-network，防止按 IP 打其它容器）。
+-    # Docker Compose 部署默认开启；原生部署时本机网段可能就是企业 OA 所在网段，默认关闭。
+-    block-local-subnets: ${WEBHOOK_BLOCK_LOCAL_SUBNETS:false}
++    # 修复：默认值此前为 false（仅 Compose 注入 true），原生部署漏配即失效；改为默认开启（安全底线）。
++    # 关闭的适用场景：原生部署且平台与目标系统（如企业内网 OA）确实同网段、并接受相应风险时显式置 false。
++    block-local-subnets: ${WEBHOOK_BLOCK_LOCAL_SUBNETS:true}
+     # 连续失败多少次自动停用端点并通知管理员
+     auto-disable-after-failures: ${WEBHOOK_AUTO_DISABLE:50}
+     # 投递记录保留天数（成功/死信）
+diff --git a/a/backend-resources/dcim-build.properties b/b/backend-resources/dcim-build.properties
+index 8e66e5e..3552a2b 100644
+--- a/a/backend-resources/dcim-build.properties
++++ b/b/backend-resources/dcim-build.properties
+@@ -1,3 +1,3 @@
+ # 后端构建信息（/api/healthz 与启动日志展示）
+-version=3.5.0
++version=3.5.1
+ built=2026-10-10
+diff --git a/a/backend-src/com/dcim/asset/controller/AssetController.java b/b/backend-src/com/dcim/asset/controller/AssetController.java
+index 9211165..6977963 100644
+--- a/a/backend-src/com/dcim/asset/controller/AssetController.java
++++ b/b/backend-src/com/dcim/asset/controller/AssetController.java
+@@ -52,6 +52,7 @@ import java.util.Objects;
+ import java.util.Set;
+ import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.dao.DuplicateKeyException;
++import org.springframework.jdbc.core.JdbcTemplate;
+ import org.springframework.transaction.PlatformTransactionManager;
+ import org.springframework.transaction.annotation.Transactional;
+ import org.springframework.transaction.support.TransactionTemplate;
+@@ -73,6 +74,13 @@ public class AssetController {
+     private static final String INIT_BIZ = "待上架";
+     private static final String INIT_FIN = "未入账";
+     private static final List<String> DELETABLE_BIZ = List.of("待上架");
++    /** v3.5：可删除的财务状态白名单——已进入折旧/减值/处置流程的资产删除会破坏财务台账，须先走财务处置 */
++    private static final List<String> DELETABLE_FIN = List.of("未入账", "已入账");
++    /** v3.5：资产导出行数上限（对齐工单侧导出 EXPORT_MAX_ROWS=10000 的既有约定） */
++    private static final int EXPORT_MAX_ROWS = 10000;
++    /** v3.5：CSV 导入上限：10MB / 50000 行，超限直接拒绝，避免全量读入内存 */
++    private static final long IMPORT_MAX_BYTES = 10485760L;
++    private static final int IMPORT_MAX_ROWS = 50000;
+     /** v3.4：与 CSV_HEADERS 一一对应的字段名（导出时按字段权限过滤列） */
+     private static final String[] CSV_FIELDS = {
+         "assetNo", "parentAssetNo", "name", "sn", "categoryCode", "modelCode", "ownerType", "statusBiz", "statusFin",
+@@ -116,6 +124,7 @@ public class AssetController {
+     private final RbacService rbacService;
+     private final RackOccupancyPort rackOccupancyPort;
+     private final TransactionTemplate rowTx;
++    private final JdbcTemplate jdbc;
+ 
+     public AssetController(
+         AssetMapper assetMapper,
+@@ -126,7 +135,8 @@ public class AssetController {
+         AssetNoGenerator assetNoGenerator,
+         RbacService rbacService,
+         RackOccupancyPort rackOccupancyPort,
+-        PlatformTransactionManager txManager
++        PlatformTransactionManager txManager,
++        JdbcTemplate jdbc
+     ,
+         final com.dcim.security.DataScopeService dataScope) {
+         this.dataScope = dataScope;
+@@ -138,6 +148,7 @@ public class AssetController {
+         this.assetNoGenerator = assetNoGenerator;
+         this.rbacService = rbacService;
+         this.rackOccupancyPort = rackOccupancyPort;
++        this.jdbc = jdbc;
+         TransactionTemplate t = new TransactionTemplate(txManager);
+         t.setPropagationBehavior(3);
+         this.rowTx = t;
+@@ -268,7 +279,10 @@ public class AssetController {
+             AssetEntity root = this.requireAsset(rootAssetNo.trim());
+             all = this.collectSubtree(root.getAssetNo());
+         } else {
+-            all = this.assetMapper.selectList((Wrappers.<AssetEntity>lambdaQuery().orderByAsc(AssetEntity::getAssetNo)).last("LIMIT 2000"));
++            // v3.5：全量树同样受数据范围约束（与 list 的 buildListWrapper 用法一致）
++            LambdaQueryWrapper<AssetEntity> qw = Wrappers.<AssetEntity>lambdaQuery().orderByAsc(AssetEntity::getAssetNo);
++            this.dataScope.applyAssetScope(qw, com.dcim.security.CurrentUser.get());
++            all = this.assetMapper.selectList(qw.last("LIMIT 2000"));
+         }
+ 
+         Map<String, Map<String, Object>> nodes = new LinkedHashMap<>();
+@@ -392,31 +406,34 @@ public class AssetController {
+     public ApiResult<List<AssetController.LookupVO>> lookup(@RequestParam String q) {
+         if (q != null && !q.isBlank()) {
+             String kw = q.trim();
++            LoginUser who = CurrentUser.get();
+             List<AssetEntity> hits = List.of();
+-            AssetEntity byNo = (AssetEntity)this.assetMapper.selectById(kw);
++            // v3.5：三个分支统一叠加数据范围（参照 list 的 buildListWrapper），范围外资产按不存在处理
++            LambdaQueryWrapper<AssetEntity> byNoW = Wrappers.<AssetEntity>lambdaQuery().eq(AssetEntity::getAssetNo, kw);
++            this.dataScope.applyAssetScope(byNoW, who);
++            AssetEntity byNo = (AssetEntity)this.assetMapper.selectOne(byNoW);
+             if (byNo != null) {
+                 hits = List.of(byNo);
+             }
+ 
+-            if (hits.isEmpty()) {
+-                AssetEntity bySn = (AssetEntity)this.assetMapper
+-                    .selectOne(Wrappers.<AssetEntity>lambdaQuery().apply("UPPER(sn) = {0}", new Object[]{kw.toUpperCase()}));
++            // v3.5：sn 为当前用户隐藏字段时不允许以 sn 作为查询条件（参照 GlobalSearchController 的隐藏字段处理）
++            if (hits.isEmpty() && !this.fieldPolicies.isHidden(who, "assets", "sn")) {
++                LambdaQueryWrapper<AssetEntity> bySnW = Wrappers.<AssetEntity>lambdaQuery().apply("UPPER(sn) = {0}", new Object[]{kw.toUpperCase()});
++                this.dataScope.applyAssetScope(bySnW, who);
++                AssetEntity bySn = (AssetEntity)this.assetMapper.selectOne(bySnW);
+                 if (bySn != null) {
+                     hits = List.of(bySn);
+                 }
+             }
+ 
+             if (hits.isEmpty()) {
+-                hits = this.assetMapper
+-                    .selectList(
+-                        ((Wrappers.<AssetEntity>lambdaQuery()
+-                                    .and(
+-                                        w -> ((w.like(AssetEntity::getName, kw)).or())
+-                                                .like(AssetEntity::getAssetNo, kw)
+-                                    ))
+-                                .orderByAsc(AssetEntity::getAssetNo))
+-                            .last("LIMIT 5")
++                LambdaQueryWrapper<AssetEntity> likeW = Wrappers.<AssetEntity>lambdaQuery()
++                    .and(
++                        w -> ((w.like(AssetEntity::getName, kw)).or())
++                                .like(AssetEntity::getAssetNo, kw)
+                     );
++                this.dataScope.applyAssetScope(likeW, who);
++                hits = this.assetMapper.selectList(likeW.orderByAsc(AssetEntity::getAssetNo).last("LIMIT 5"));
+             }
+ 
+             return ApiResult.ok(hits.stream().limit(5L).map(AssetController.LookupVO::of).toList());
+@@ -870,6 +887,10 @@ public class AssetController {
+                 if (childCount > 0L) {
+                     throw BusinessException.badRequest("该资产下还有 " + childCount + " 个子资产（部件），请先解除或删除子资产后再删父资产");
+                 } else {
++                    // v3.5：被未完结工单引用的资产不允许删除（防悬挂引用），409 并列工单号
++                    this.assertNoOpenWorkorderRef(assetNo);
++                    // v3.5：已进入折旧/减值/处置流程的财务档案不允许随资产删除直接抹除，须先走财务处置流程
++                    this.assertFinanceDeletable(cur);
+                     if (cur.getRackCode() != null) {
+                         this.rackOccupancyPort
+                             .syncAssetPlacement(assetNo, cur.getRackCode(), cur.getUnitNo(), cur.getUHeight() == null ? 1 : cur.getUHeight(), null, null, null);
+@@ -884,6 +905,31 @@ public class AssetController {
+         }
+     }
+ 
++    /** v3.5：删除前校验资产是否被未完结工单（非已关闭/已完成）引用，命中则拒绝删除并列出工单号 */
++    private void assertNoOpenWorkorderRef(String assetNo) {
++        List<String> woNos = this.jdbc
++            .queryForList(
++                "SELECT DISTINCT w.wo_no FROM workorder_item i JOIN workorder w ON w.wo_no = i.wo_no\nWHERE i.asset_no = ? AND w.deleted_at IS NULL AND w.status NOT IN ('已完成', '已关闭')\nORDER BY w.wo_no LIMIT 10\n",
++                String.class,
++                new Object[]{assetNo}
++            );
++        if (!woNos.isEmpty()) {
++            throw BusinessException.conflict("资产已被未完结工单引用：" + String.join("、", woNos) + "，请先处理相关工单后再删除");
++        }
++    }
++
++    /**
++     * v3.5：财务状态校验——status_fin 已进入折旧/减值/处置等流程的资产，其 asset_finance 档案
++     * 已承载财务台账数据，不允许随资产删除直接物理抹除，须先走财务处置/核销流程。
++     * null（未初始化财务状态）与「未入账」「已入账」放行。
++     */
++    private void assertFinanceDeletable(AssetEntity cur) {
++        String fin = cur.getStatusFin();
++        if (fin != null && !DELETABLE_FIN.contains(fin)) {
++            throw BusinessException.conflict("资产财务状态为「" + fin + "」，已进入财务核算流程，不允许直接删除，请先完成财务处置/核销后再删除");
++        }
++    }
++
+     @PostMapping({"/batch-transitions"})
+     @RequirePerm(
+         module = "assets",
+@@ -971,9 +1017,10 @@ public class AssetController {
+                                 }
+                             }
+                         );
+-                } catch (BusinessException var12) {
++                } catch (Exception var12) {
++                    // v3.5：扩大捕获范围，其他 RuntimeException 也计入失败行，已成功行继续返回
+                     AssetEntity cur = (AssetEntity)this.assetMapper.selectById(assetNo);
+-                    skipped.add(batchItem(assetNo, cur == null ? null : cur.getName(), var12.getMessage()));
++                    skipped.add(batchItem(assetNo, cur == null ? null : cur.getName(), var12.getMessage() == null ? var12.getClass().getSimpleName() : var12.getMessage()));
+                 }
+             }
+ 
+@@ -1101,9 +1148,10 @@ public class AssetController {
+                                 }
+                             }
+                         );
+-                } catch (BusinessException var14) {
++                } catch (Exception var14) {
++                    // v3.5：扩大捕获范围，其他 RuntimeException 也计入失败行，已成功行继续返回
+                     AssetEntity cur = (AssetEntity)this.assetMapper.selectById(assetNo);
+-                    skipped.add(batchItem(assetNo, cur == null ? null : cur.getName(), var14.getMessage()));
++                    skipped.add(batchItem(assetNo, cur == null ? null : cur.getName(), var14.getMessage() == null ? var14.getClass().getSimpleName() : var14.getMessage()));
+                 }
+             }
+ 
+@@ -1146,6 +1194,10 @@ public class AssetController {
+                                     if (childCount > 0L) {
+                                         throw new BusinessException(400, "还有 " + childCount + " 个子资产，不能删除");
+                                     } else {
++                                        // v3.5：被未完结工单引用的资产跳过删除（计入错误行，不中断整批）
++                                        this.assertNoOpenWorkorderRef(assetNo);
++                                        // v3.5：财务状态已进入折旧/处置流程的跳过删除（计入错误行，不中断整批）
++                                        this.assertFinanceDeletable(curx);
+                                         if (curx.getRackCode() != null) {
+                                             this.rackOccupancyPort
+                                                 .syncAssetPlacement(
+@@ -1176,9 +1228,10 @@ public class AssetController {
+                                 }
+                             }
+                         );
+-                } catch (BusinessException var10) {
++                } catch (Exception var10) {
++                    // v3.5：扩大捕获范围，其他 RuntimeException 也计入失败行，已成功行继续返回
+                     AssetEntity cur = (AssetEntity)this.assetMapper.selectById(assetNo);
+-                    skipped.add(batchItem(assetNo, cur == null ? null : cur.getName(), var10.getMessage()));
++                    skipped.add(batchItem(assetNo, cur == null ? null : cur.getName(), var10.getMessage() == null ? var10.getClass().getSimpleName() : var10.getMessage()));
+                 }
+             }
+ 
+@@ -1228,7 +1281,12 @@ public class AssetController {
+             this.dataScope.applyAssetScope(byNos, com.dcim.security.CurrentUser.get());
+             rows = nos.isEmpty() ? List.of() : this.assetMapper.selectList(byNos);
+         } else {
+-            rows = this.assetMapper.selectList(this.buildListWrapper(keyword, statusBiz, categoryCode, regionCode, roomCode, parentAssetNo));
++            // v3.5：对齐工单导出行数上限 EXPORT_MAX_ROWS=10000；多取一行探测超限并提示，而非静默截断
++            rows = this.assetMapper
++                .selectList(this.buildListWrapper(keyword, statusBiz, categoryCode, regionCode, roomCode, parentAssetNo).last("LIMIT " + (EXPORT_MAX_ROWS + 1)));
++            if (rows.size() > EXPORT_MAX_ROWS) {
++                throw BusinessException.badRequest("导出数据超过 " + EXPORT_MAX_ROWS + " 行上限，请缩小筛选范围后再导出");
++            }
+         }
+ 
+         int[] keep = this.fieldPolicies.keepColumns(com.dcim.security.CurrentUser.get(), "assets", CSV_FIELDS);
+@@ -1327,8 +1385,15 @@ public class AssetController {
+     )
+     public ApiResult<Map<String, Object>> importCsv(@RequestParam("file") MultipartFile file) throws IOException {
+         if (file != null && !file.isEmpty()) {
++            // v3.5：解析前校验大小与行数上限（10MB / 50000 行），超限 400 提示，避免全量读入内存
++            if (file.getSize() > IMPORT_MAX_BYTES) {
++                throw BusinessException.badRequest("导入文件不能超过 10MB");
++            }
+             String text = new String(file.getBytes(), StandardCharsets.UTF_8);
+             List<List<String>> rows = CsvSupport.parse(text);
++            if (rows.size() > IMPORT_MAX_ROWS) {
++                throw BusinessException.badRequest("导入数据超过 " + IMPORT_MAX_ROWS + " 行上限，请拆分文件后重试");
++            }
+             if (rows.isEmpty()) {
+                 throw BusinessException.badRequest("CSV 文件为空");
+             } else {
+diff --git a/a/backend-src/com/dcim/asset/controller/AssetLifecycleController.java b/b/backend-src/com/dcim/asset/controller/AssetLifecycleController.java
+index a8b2a55..97177a2 100644
+--- a/a/backend-src/com/dcim/asset/controller/AssetLifecycleController.java
++++ b/b/backend-src/com/dcim/asset/controller/AssetLifecycleController.java
+@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
+ @RequestMapping({"/api/asset-lifecycle"})
+ public class AssetLifecycleController {
+     private final JdbcTemplate jdbc;
++    private final com.dcim.security.DataScopeService dataScope;
+ 
+     @GetMapping({"/activities"})
+     @RequirePerm(
+@@ -44,6 +45,9 @@ public class AssetLifecycleController {
+             args.add(operator.trim());
+         }
+ 
++        // v3.5：注入数据范围（SELF/DEPT），不可见资产的生命周期事件不返回
++        where.append(this.dataScope.assetSql(com.dcim.security.CurrentUser.get(), "a", args));
++
+         Long total = (Long)this.jdbc.queryForObject("SELECT COUNT(*) FROM asset_event e" + where, Long.class, args.toArray());
+         List<Object> pa = new ArrayList<>(args);
+         pa.add(s);
+@@ -93,7 +97,8 @@ public class AssetLifecycleController {
+     }
+ 
+     
+-    public AssetLifecycleController(final JdbcTemplate jdbc) {
++    public AssetLifecycleController(final JdbcTemplate jdbc, final com.dcim.security.DataScopeService dataScope) {
+         this.jdbc = jdbc;
++        this.dataScope = dataScope;
+     }
+ }
+diff --git a/a/backend-src/com/dcim/change/service/ChangeService.java b/b/backend-src/com/dcim/change/service/ChangeService.java
+index 05a4836..5894c9f 100644
+--- a/a/backend-src/com/dcim/change/service/ChangeService.java
++++ b/b/backend-src/com/dcim/change/service/ChangeService.java
+@@ -259,6 +259,8 @@ public class ChangeService {
+         } else if (!"DRAFT".equals(cr.getStatus()) && !"CANCELLED".equals(cr.getStatus())) {
+             throw BusinessException.badRequest("仅草稿或已取消的变更可删除，其余请保留审计轨迹");
+         } else {
++            // v3.5：软删主记录时同步清理 change_asset 关联行，避免悬挂孤儿数据
++            this.caMapper.delete(Wrappers.<ChangeAsset>lambdaQuery().eq(ChangeAsset::getCrId, id));
+             this.crMapper.deleteById(id);
+         }
+     }
+diff --git a/a/backend-src/com/dcim/ci/service/CiGraphService.java b/b/backend-src/com/dcim/ci/service/CiGraphService.java
+index ad1987d..d026c62 100644
+--- a/a/backend-src/com/dcim/ci/service/CiGraphService.java
++++ b/b/backend-src/com/dcim/ci/service/CiGraphService.java
+@@ -20,9 +20,11 @@ public class CiGraphService {
+     private static final int MAX_DEPTH = 6;
+     private static final int MAX_NODES = 500;
+     private final JdbcTemplate jdbc;
++    private final com.dcim.security.DataScopeService dataScope;
+ 
+-    public CiGraphService(JdbcTemplate jdbc) {
++    public CiGraphService(JdbcTemplate jdbc, com.dcim.security.DataScopeService dataScope) {
+         this.jdbc = jdbc;
++        this.dataScope = dataScope;
+     }
+ 
+     public void validateType(String type) {
+@@ -163,12 +165,20 @@ public class CiGraphService {
+ 
+         if (!truncated) {
+             int remaining = MAX_NODES - nodes.size();
++            // v3.5：资产节点按数据范围过滤（SELF/DEPT），不可见资产不出现在图中，
++            // 其 PART_OF / CONTAINS 边及 ci_relation 边因节点缺席而自然不出现，避免间接泄露
++            List<Object> scopeArgs = new ArrayList<>();
++            String scope = this.dataScope.assetSql(com.dcim.security.CurrentUser.get(), "", scopeArgs);
+             String assetSql = room == null
+-                ? "SELECT asset_no, name, status_biz, rack_code, parent_asset_no FROM asset WHERE deleted_at IS NULL ORDER BY asset_no LIMIT ?"
+-                : "SELECT asset_no, name, status_biz, rack_code, parent_asset_no FROM asset WHERE deleted_at IS NULL AND rack_code IN (SELECT rack_code FROM rack WHERE room_code = ?) ORDER BY asset_no LIMIT ?";
+-            List<Map<String, Object>> assets = room == null
+-                ? this.jdbc.queryForList(assetSql, new Object[]{remaining + 1})
+-                : this.jdbc.queryForList(assetSql, new Object[]{room, remaining + 1});
++                ? "SELECT asset_no, name, status_biz, rack_code, parent_asset_no FROM asset WHERE deleted_at IS NULL" + scope + " ORDER BY asset_no LIMIT ?"
++                : "SELECT asset_no, name, status_biz, rack_code, parent_asset_no FROM asset WHERE deleted_at IS NULL AND rack_code IN (SELECT rack_code FROM rack WHERE room_code = ?)" + scope + " ORDER BY asset_no LIMIT ?";
++            List<Object> args = new ArrayList<>();
++            if (room != null) {
++                args.add(room);
++            }
++            args.addAll(scopeArgs);
++            args.add(remaining + 1);
++            List<Map<String, Object>> assets = this.jdbc.queryForList(assetSql, args.toArray());
+             if (assets.size() > remaining) {
+                 truncated = true;
+                 assets = new ArrayList<>(assets.subList(0, remaining));
+diff --git a/a/backend-src/com/dcim/collector/controller/EndpointController.java b/b/backend-src/com/dcim/collector/controller/EndpointController.java
+index 2732fc4..eea972d 100644
+--- a/a/backend-src/com/dcim/collector/controller/EndpointController.java
++++ b/b/backend-src/com/dcim/collector/controller/EndpointController.java
+@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.Wrapper;
+ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.dcim.collector.BmcIp;
+ import com.dcim.collector.dto.CollectorDtos;
+ import com.dcim.collector.entity.BmcCredentialEntity;
+ import com.dcim.collector.entity.BmcEndpointEntity;
+@@ -85,12 +86,19 @@ public class EndpointController {
+     )
+     public ApiResult<Map<String, Object>> create(@RequestBody EndpointController.UpsertEndpointReq req) {
+         if (req.getBmcIp() != null && !req.getBmcIp().isBlank()) {
+-            String bmcIp = req.getBmcIp().trim();
++            // 修复：bmcIp 此前仅做非空/去重校验，任意字符串（主机名、保留段地址）都能入库，
++            // 采集任务会拿着这些值直接外呼；接入 BmcIp.validate（IPv4 + 保留段校验），违例 400
++            String bmcIp = BmcIp.validate(req.getBmcIp());
+             Long dup = this.endpointMapper.selectCount(Wrappers.<BmcEndpointEntity>lambdaQuery().eq(BmcEndpointEntity::getBmcIp, bmcIp));
+             if (dup != null && dup > 0L) {
+                 throw BusinessException.conflict("带外端点已存在：" + bmcIp);
+             } else {
+                 this.validateRefs(req.getAssetNo(), req.getCredentialId());
++                // 修复：create 漏了 update 已有的采集间隔校验，任意值（含负数/超大值）可入库
++                if (req.getCollectIntervalMin() != null && (req.getCollectIntervalMin() < 5 || req.getCollectIntervalMin() > 1440)) {
++                    throw BusinessException.badRequest("采集间隔仅支持 5-1440 分钟");
++                }
++
+                 BmcEndpointEntity e = new BmcEndpointEntity();
+                 e.setBmcIp(bmcIp);
+                 e.setMac(this.blankToNull(req.getMac()));
+diff --git a/a/backend-src/com/dcim/collector/service/DiscoverService.java b/b/backend-src/com/dcim/collector/service/DiscoverService.java
+index d2014d4..bc55278 100644
+--- a/a/backend-src/com/dcim/collector/service/DiscoverService.java
++++ b/b/backend-src/com/dcim/collector/service/DiscoverService.java
+@@ -3,6 +3,7 @@ package com.dcim.collector.service;
+ import com.baomidou.mybatisplus.core.conditions.Wrapper;
+ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
++import com.dcim.collector.BmcIp;
+ import com.dcim.collector.Cidr;
+ import com.dcim.collector.IreEngine;
+ import com.dcim.collector.dto.CollectorDtos;
+@@ -246,7 +247,15 @@ public class DiscoverService {
+     }
+ 
+     private String ingestDevice(DiscoverTaskEntity task, CollectorDtos.FoundDevice d) {
+-        String bmcIp = d.bmcIp().trim();
++        // 修复：agent 上报的 bmcIp 此前原样入库（BmcIp.validate 是死代码），接入校验（IPv4 +
++        // 保留段）；违例设备拒绝并记 warn（跳过该台，不中断整批结果推送）
++        String bmcIp;
++        try {
++            bmcIp = BmcIp.validate(d.bmcIp());
++        } catch (BusinessException ex) {
++            log.warn("[discover] 任务 {} 拒绝非法 bmcIp 设备上报：{}（{}）", new Object[]{task.getTaskNo(), d.bmcIp(), ex.getMessage()});
++            return "SKIP";
++        }
+         String normSn = IreEngine.normSn(d.sn());
+         BmcEndpointEntity endpoint = (BmcEndpointEntity)this.endpointMapper.selectOne(Wrappers.<BmcEndpointEntity>lambdaQuery().eq(BmcEndpointEntity::getBmcIp, bmcIp));
+         if (endpoint == null) {
+diff --git a/a/backend-src/com/dcim/common/event/SseEventRelay.java b/b/backend-src/com/dcim/common/event/SseEventRelay.java
+index 55e776c..a5b3a39 100644
+--- a/a/backend-src/com/dcim/common/event/SseEventRelay.java
++++ b/b/backend-src/com/dcim/common/event/SseEventRelay.java
+@@ -99,17 +99,20 @@ public class SseEventRelay {
+         return CHANNELS.contains(channel) ? channel : null;
+     }
+ 
++    /**
++     * SSE 频道帧载荷（D2 修复：最小化为轻量信号）。broadcast 面向本机全部连接，
++     * 无法逐连接校验接收者权限，携带工单标题/申请人、库存量等业务正文会越权泄露。
++     * 因此只保留前端「触发列表刷新/红点」所需的路由与定位字段，正文一律由前端
++     * 自行带权限调用 REST 接口获取。注意 DomainEvent.data() 仍被 WebhookDispatcher
++     * 等后端监听者消费，裁剪只发生在 SSE 出口这一处。
++     */
+     private Map<String, Object> toPayload(DomainEvent event, String channel) {
+         Map<String, Object> payload = new LinkedHashMap<>();
+         payload.put("kind", "event");
+         payload.put("channel", channel);
+         payload.put("type", event.type());
+-        payload.put("objType", event.objType());
+         payload.put("objId", event.objId());
+         payload.put("occurredAt", event.occurredAt() == null ? null : event.occurredAt().toString());
+-        Map<String, Object> data = new LinkedHashMap<>(event.data());
+-        data.remove("snapshot"); // 资产快照可能很大（全量字段），SSE 只做变化信号
+-        payload.put("data", data);
+         return payload;
+     }
+ }
+diff --git a/a/backend-src/com/dcim/common/sse/SseConnectionRegistry.java b/b/backend-src/com/dcim/common/sse/SseConnectionRegistry.java
+index d6a8309..161bfef 100644
+--- a/a/backend-src/com/dcim/common/sse/SseConnectionRegistry.java
++++ b/b/backend-src/com/dcim/common/sse/SseConnectionRegistry.java
+@@ -6,9 +6,13 @@ import jakarta.annotation.PreDestroy;
+ import java.io.IOException;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
+ import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
+ import java.util.concurrent.atomic.AtomicLong;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -34,6 +38,20 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+ @Component
+ public class SseConnectionRegistry {
+     private static final Logger log = LoggerFactory.getLogger(SseConnectionRegistry.class);
++    /**
++     * 发送超时保护池（D1 修复）：SseEmitter.send 是同步阻塞写，慢消费者 TCP 窗口
++     * 打满时会把调用线程卡死在 socket 写上。心跳（单线程）与 pushUser/broadcast
++     * （业务请求线程）的每一次 send 都提交到本池执行并限时等待，超时即判死连接，
++     * 单个慢客户端不再冻结全实例心跳与其余连接的推送。缓存式按需建线程 + 守护 +
++     * 空闲自动回收：线程数上界即连接数上限（max-connections），无需显式关闭。
++     */
++    private static final ExecutorService SEND_GUARD = Executors.newCachedThreadPool(r -> {
++        Thread t = new Thread(r, "sse-send-guard");
++        t.setDaemon(true);
++        return t;
++    });
++    /** 单帧发送最长等待：超过即按死连接（慢消费者）处理 */
++    private static final long SEND_TIMEOUT_MS = 3_000L;
+     private final ConcurrentHashMap<String, SseEmitter> emitters = new ConcurrentHashMap<>();
+     private final AtomicLong connSeq = new AtomicLong();
+     private final boolean enabled;
+@@ -134,7 +152,7 @@ public class SseConnectionRegistry {
+ 
+     private int send(String key, SseEmitter emitter, Object payload) {
+         try {
+-            emitter.send(SseEmitter.event().name("message").data(payload));
++            this.guardedSend(key, emitter, () -> emitter.send(SseEmitter.event().name("message").data(payload)));
+             return 1;
+         } catch (RuntimeException | IOException e) {
+             log.debug("[sse] 推送失败，移除连接 {}：{}", key, e.toString());
+@@ -146,14 +164,60 @@ public class SseConnectionRegistry {
+     private void beat() {
+         for (Map.Entry<String, SseEmitter> e : this.emitters.entrySet()) {
+             try {
+-                // 注释帧（:ping）：只保活，不产生客户端事件
+-                e.getValue().send(SseEmitter.event().comment("ping"));
++                // 注释帧（:ping）：只保活，不产生客户端事件；经超时保护发送，防单个慢客户端冻结心跳
++                this.guardedSend(e.getKey(), e.getValue(), () -> e.getValue().send(SseEmitter.event().comment("ping")));
+             } catch (RuntimeException | IOException ex) {
+                 this.remove(e.getKey(), e.getValue());
+             }
+         }
+     }
+ 
++    /**
++     * 带超时保护的单帧发送（D1 修复）：真正的 send 在 {@code sse-send-guard} 池中执行，
++     * 本线程最多等 {@value #SEND_TIMEOUT_MS}ms。返回 true 表示送达；false 表示超时或
++     * 中断（超时的连接已就地清理）。send 本身抛出的 RuntimeException / IOException
++     * 原样向上抛，调用方沿用既有的失败清理逻辑不变。
++     */
++    private boolean guardedSend(String key, SseEmitter emitter, SendAction action) throws IOException {
++        // 包装为 Callable：SendAction 的受检异常经 Future 透传，解包后类型保持 IOException
++        Future<?> future = SEND_GUARD.submit(() -> {
++            action.run();
++            return null;
++        });
++        try {
++            future.get(SEND_TIMEOUT_MS, TimeUnit.MILLISECONDS);
++            return true;
++        } catch (TimeoutException e) {
++            log.warn("[sse] 发送等待超过 {}ms，按死连接移除 {}（慢消费者）", SEND_TIMEOUT_MS, key);
++            // 不走 remove()：其 quietComplete 会先 complete() 使 completeWithError 变成空操作，
++            // 阻塞在 send 上的守护线程可能永不退出。这里直接摘表后用 completeWithError
++            // 关闭 Tomcat 底层响应，阻塞的写线程会因此最终抛错退出。
++            if (this.emitters.remove(key, emitter)) {
++                log.debug("[sse] {} 下线，当前 {} 连接", key, this.emitters.size());
++            }
++            try {
++                emitter.completeWithError(e);
++            } catch (Exception ignored) {
++                // 与 quietComplete 同理：complete 系列可能 sneaky-throw，必须吞掉一切异常
++            }
++            return false;
++        } catch (InterruptedException e) {
++            // 停机（shutdownNow）或调用线程被中断：不判死连接，恢复中断标记后放弃本帧
++            Thread.currentThread().interrupt();
++            return false;
++        } catch (ExecutionException e) {
++            // 解包 send 的原始异常，交由调用方按既有清理逻辑处理
++            Throwable cause = e.getCause() == null ? e : e.getCause();
++            if (cause instanceof RuntimeException runtime) {
++                throw runtime;
++            }
++            if (cause instanceof IOException io) {
++                throw io;
++            }
++            throw new RuntimeException(cause);
++        }
++    }
++
+     private void remove(String key, SseEmitter emitter) {
+         boolean removed = this.emitters.remove(key, emitter);
+         if (removed) {
+@@ -172,4 +236,10 @@ public class SseConnectionRegistry {
+             // （事务已提交却返回 500）、并杀死心跳调度线程（死连接永不清理）。
+         }
+     }
++
++    /** 单帧发送动作：允许抛出 SseEmitter.send 声明的受检异常 IOException */
++    @FunctionalInterface
++    private interface SendAction {
++        void run() throws IOException;
++    }
+ }
+diff --git a/a/backend-src/com/dcim/expiry/ExpiryService.java b/b/backend-src/com/dcim/expiry/ExpiryService.java
+index 7e9b36f..51bbc47 100644
+--- a/a/backend-src/com/dcim/expiry/ExpiryService.java
++++ b/b/backend-src/com/dcim/expiry/ExpiryService.java
+@@ -5,7 +5,6 @@ import com.dcim.common.event.DomainEventPublisher;
+ import com.dcim.common.notify.NotificationPort;
+ import java.sql.Date;
+ import java.time.LocalDate;
+-import java.time.temporal.ChronoUnit;
+ import java.util.ArrayList;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+@@ -60,16 +59,15 @@ public class ExpiryService {
+ 
+     private int remind(String kind, TreeSet<Integer> stages) {
+         int maxStage = stages.isEmpty() ? 0 : stages.last();
+-        LocalDate today = LocalDate.now();
+         List<Map<String, Object>> due = "WARRANTY".equals(kind)
+             ? this.jdbc
+                 .queryForList(
+-                    "SELECT a.asset_no AS ref, a.name, a.warranty_end AS end_date, a.rack_code AS rack, a.room_code AS room,\n       a.model_code AS model\nFROM asset a\nWHERE a.deleted_at IS NULL AND a.warranty_end IS NOT NULL\n  AND a.warranty_end BETWEEN CURRENT_DATE AND CURRENT_DATE + ?::int\n  AND a.status_biz NOT IN ('报废处置', '待退役')\nORDER BY a.warranty_end, a.asset_no\n",
++                    "SELECT a.asset_no AS ref, a.name, a.warranty_end AS end_date, a.rack_code AS rack, a.room_code AS room,\n       a.model_code AS model, (a.warranty_end - CURRENT_DATE) AS left_days\nFROM asset a\nWHERE a.deleted_at IS NULL AND a.warranty_end IS NOT NULL\n  AND a.warranty_end BETWEEN CURRENT_DATE AND CURRENT_DATE + ?::int\n  AND a.status_biz NOT IN ('报废处置', '待退役')\nORDER BY a.warranty_end, a.asset_no\n",
+                     new Object[]{maxStage}
+                 )
+             : this.jdbc
+                 .queryForList(
+-                    "SELECT c.contract_no AS ref, c.name, c.end_date, c.party, c.type\nFROM contract c\nWHERE c.end_date IS NOT NULL AND c.end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + ?::int\n  AND c.status = '生效'\nORDER BY c.end_date, c.contract_no\n",
++                    "SELECT c.contract_no AS ref, c.name, c.end_date, c.party, c.type, (c.end_date - CURRENT_DATE) AS left_days\nFROM contract c\nWHERE c.end_date IS NOT NULL AND c.end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + ?::int\n  AND c.status = '生效'\nORDER BY c.end_date, c.contract_no\n",
+                     new Object[]{maxStage}
+                 );
+         Map<String, List<Map<String, Object>>> groups = new LinkedHashMap<>();
+@@ -77,7 +75,8 @@ public class ExpiryService {
+ 
+         for (Map<String, Object> r : due) {
+             LocalDate end = ((Date)r.get("end_date")).toLocalDate();
+-            int left = (int)ChronoUnit.DAYS.between(today, end);
++            // left 与 SQL 的 CURRENT_DATE 同源计算，消除 JVM/DB 跨时区错位
++            int left = ((Number)r.get("left_days")).intValue();
+             Integer stage = stages.ceiling(left);
+             if (stage != null) {
+                 int n = this.jdbc
+diff --git a/a/backend-src/com/dcim/finance/mapper/FinanceQueryMapper.java b/b/backend-src/com/dcim/finance/mapper/FinanceQueryMapper.java
+index 17ac283..912269e 100644
+--- a/a/backend-src/com/dcim/finance/mapper/FinanceQueryMapper.java
++++ b/b/backend-src/com/dcim/finance/mapper/FinanceQueryMapper.java
+@@ -37,6 +37,6 @@ public interface FinanceQueryMapper {
+     @Select({"SELECT period,\n       COUNT(*)        AS record_count,\n       SUM(month_dep)  AS total_amount\nFROM depreciation_record\nGROUP BY period\nORDER BY period DESC\n"})
+     List<PeriodRow> selectPeriods();
+ 
+-    @Select({"SELECT r.asset_no                    AS asset_no,\n       a.name                        AS asset_name,\n       r.period                      AS period,\n       r.net_value + r.month_dep     AS opening_net_value,\n       r.month_dep                   AS dep_amount,\n       r.accumulated                 AS accumulated_dep,\n       r.net_value                   AS closing_net_value\nFROM depreciation_record r\nJOIN asset a ON a.asset_no = r.asset_no\nWHERE r.period = #{period}\nORDER BY r.asset_no\n"})
++    @Select({"SELECT r.asset_no                    AS asset_no,\n       a.name                        AS asset_name,\n       r.period                      AS period,\n       r.net_value + r.month_dep     AS opening_net_value,\n       r.month_dep                   AS dep_amount,\n       r.accumulated                 AS accumulated_dep,\n       r.net_value                   AS closing_net_value\nFROM depreciation_record r\nJOIN asset a ON a.asset_no = r.asset_no AND a.deleted_at IS NULL\nWHERE r.period = #{period}\nORDER BY r.asset_no\n"})
+     List<DepreciationRow> selectWorksheet(@Param("period") LocalDate period);
+ }
+diff --git a/a/backend-src/com/dcim/finance/service/DepreciationCalculator.java b/b/backend-src/com/dcim/finance/service/DepreciationCalculator.java
+index 66c3599..fc0b3f6 100644
+--- a/a/backend-src/com/dcim/finance/service/DepreciationCalculator.java
++++ b/b/backend-src/com/dcim/finance/service/DepreciationCalculator.java
+@@ -23,7 +23,13 @@ public final class DepreciationCalculator {
+             return BigDecimal.ZERO.setScale(2);
+         } else {
+             BigDecimal monthly = total.divide(BigDecimal.valueOf((long)lifeMonths), 2, RoundingMode.HALF_UP);
+-            return acc.add(monthly).compareTo(total) > 0 ? total.subtract(acc) : monthly;
++            // 小原值长年限：月折旧按 HALF_UP 收敛为 0 时，剩余折旧额一次性计提，
++            // 避免累计永远提不满而在计提流程中被提前判为“折旧完毕”
++            if (monthly.signum() <= 0) {
++                return total.subtract(acc);
++            } else {
++                return acc.add(monthly).compareTo(total) > 0 ? total.subtract(acc) : monthly;
++            }
+         }
+     }
+ 
+diff --git a/a/backend-src/com/dcim/finance/service/DepreciationService.java b/b/backend-src/com/dcim/finance/service/DepreciationService.java
+index 9bb325b..a0a3f30 100644
+--- a/a/backend-src/com/dcim/finance/service/DepreciationService.java
++++ b/b/backend-src/com/dcim/finance/service/DepreciationService.java
+@@ -55,6 +55,11 @@ public class DepreciationService {
+ 
+     public Map<String, Object> runPeriod(String period) {
+         YearMonth ym = this.parsePeriod(period);
++        // 只允许计提到当前月（含）：与 autoRunPreviousMonth 的 YearMonth.now() 保持同一时区口径，禁止计提未来期间
++        YearMonth cur = YearMonth.now();
++        if (ym.isAfter(cur)) {
++            throw BusinessException.badRequest("计提期间不可晚于当前月：" + period + "（当前月 " + cur + "）");
++        }
+         LocalDate periodDate = ym.atDay(1);
+         List<DepCandidateRow> candidates = this.financeQueryMapper.selectDepCandidates();
+         int processed = 0;
+diff --git a/a/backend-src/com/dcim/finance/service/FinanceAssetService.java b/b/backend-src/com/dcim/finance/service/FinanceAssetService.java
+index e1b1917..d5118e3 100644
+--- a/a/backend-src/com/dcim/finance/service/FinanceAssetService.java
++++ b/b/backend-src/com/dcim/finance/service/FinanceAssetService.java
+@@ -106,8 +106,14 @@ public class FinanceAssetService {
+             FinanceStateMachine.assertActionAllowed("impair", cur);
+             FinanceStateMachine.assertTransit(cur, "减值");
+             BigDecimal newImpair = this.nvl(f.getImpairment()).add(amount);
++            BigDecimal newNet = f.getOriginValue().subtract(this.nvl(f.getAccumulatedDep())).subtract(newImpair);
++            if (newNet.compareTo(BigDecimal.ZERO) < 0) {
++                // 减值上限校验：减值后净值不可为负，提示当前账面净值（即可减值上限）
++                BigDecimal curNet = f.getOriginValue().subtract(this.nvl(f.getAccumulatedDep())).subtract(this.nvl(f.getImpairment()));
++                throw BusinessException.badRequest("减值金额超出可减值上限：当前账面净值 " + curNet + "，本次最多可减值 " + curNet);
++            }
+             f.setImpairment(newImpair);
+-            f.setNetValue(f.getOriginValue().subtract(this.nvl(f.getAccumulatedDep())).subtract(newImpair));
++            f.setNetValue(newNet);
+             f.setUpdatedAt(LocalDateTime.now());
+             this.financeAssetMapper.updateById(f);
+             this.financeQueryMapper.updateStatusFin(assetNo, "减值");
+diff --git a/a/backend-src/com/dcim/inspection/service/InspectionService.java b/b/backend-src/com/dcim/inspection/service/InspectionService.java
+index c9c0a8f..8531f82 100644
+--- a/a/backend-src/com/dcim/inspection/service/InspectionService.java
++++ b/b/backend-src/com/dcim/inspection/service/InspectionService.java
+@@ -19,6 +19,7 @@ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.function.Supplier;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -40,6 +41,8 @@ public class InspectionService {
+     private final NotificationPort notify;
+     private final JdbcTemplate jdbc;
+     private final TransactionTemplate tx;
++    /** 手动触发防抖：planId → 最近一次触发时间戳（毫秒），内存实现，集群下双实例各限一份可接受 */
++    private final ConcurrentHashMap<Long, Long> manualRunAt = new ConcurrentHashMap<>();
+ 
+     public InspectionService(
+         InspectionPlanMapper planMapper,
+@@ -274,10 +277,24 @@ public class InspectionService {
+     }
+ 
+     public String runNow(Long id) {
+-        return (String)this.tx.execute(s -> {
+-            InspectionPlan p = this.require(id);
+-            return this.generate(p, "MANUAL");
+-        });
++        this.require(id);
++        // 手动触发防抖：同一计划 60 秒内重复触发返回 409；生成失败不占用防抖窗口
++        long now = System.currentTimeMillis();
++        Long prev = this.manualRunAt.put(id, now);
++        if (prev != null && now - prev < 60_000L) {
++            this.manualRunAt.put(id, prev);
++            throw BusinessException.conflict("该巡检计划 60 秒内已手动触发过，请稍后再试");
++        }
++
++        try {
++            return (String)this.tx.execute(s -> {
++                InspectionPlan p = this.require(id);
++                return this.generate(p, "MANUAL");
++            });
++        } catch (RuntimeException e) {
++            this.manualRunAt.remove(id);
++            throw e;
++        }
+     }
+ 
+     private String generate(InspectionPlan p, String trigger) {
+diff --git a/a/backend-src/com/dcim/knowledge/KbController.java b/b/backend-src/com/dcim/knowledge/KbController.java
+index b9207ba..85b9c04 100644
+--- a/a/backend-src/com/dcim/knowledge/KbController.java
++++ b/b/backend-src/com/dcim/knowledge/KbController.java
+@@ -113,6 +113,11 @@ public class KbController {
+     }
+ 
+     @PostMapping({"/{id}/feedback"})
++    @RequirePerm(
++        module = "knowledge",
++        write = true,
++        action = "feedback"
++    )
+     public ApiResult<Map<String, Object>> feedback(@PathVariable Long id, @RequestBody Map<String, Boolean> body) {
+         Boolean helpful = body == null ? null : body.get("helpful");
+         if (helpful == null) {
+diff --git a/a/backend-src/com/dcim/metrics/MemoryMetricStore.java b/b/backend-src/com/dcim/metrics/MemoryMetricStore.java
+index 2e5cdbc..44261dc 100644
+--- a/a/backend-src/com/dcim/metrics/MemoryMetricStore.java
++++ b/b/backend-src/com/dcim/metrics/MemoryMetricStore.java
+@@ -6,7 +6,6 @@ import java.util.Comparator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.CopyOnWriteArrayList;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.stereotype.Component;
+ 
+@@ -17,6 +16,10 @@ import org.springframework.stereotype.Component;
+     matchIfMissing = true
+ )
+ public class MemoryMetricStore implements MetricStore {
++    /** 每 series 保留最近 N 个点，容量满时丢弃最旧点 */
++    private static final int MAX_POINTS_PER_SERIES = 720;
++    /** 全局 series（卡号）数软上限，新建 series 超限时淘汰最久未写入的 series */
++    private static final int MAX_SERIES = 2000;
+     private final Map<String, List<GpuMetric>> data = new ConcurrentHashMap<>();
+ 
+     @Override
+@@ -27,9 +30,26 @@ public class MemoryMetricStore implements MetricStore {
+     public void saveGpuMetrics(List<GpuMetric> metrics) {
+         if (metrics != null && !metrics.isEmpty()) {
+             for (GpuMetric m : metrics) {
+-                List<GpuMetric> list = this.data.computeIfAbsent(m.cardNo(), k -> new CopyOnWriteArrayList<>());
+-                list.add(m);
+-                list.sort(Comparator.comparing(GpuMetric::ts));
++                if (!this.data.containsKey(m.cardNo()) && this.data.size() >= MAX_SERIES) {
++                    this.evictStalestSeries();
++                }
++
++                List<GpuMetric> list = this.data.computeIfAbsent(m.cardNo(), k -> new ArrayList<>());
++                synchronized (list) {
++                    // 同一时刻重复上报以最新为准（去重），写入后保持按 ts 升序，查询语义不变
++                    for (int i = list.size() - 1; i >= 0; i--) {
++                        if (((GpuMetric)list.get(i)).ts().equals(m.ts())) {
++                            list.remove(i);
++                            break;
++                        }
++                    }
++
++                    list.add(m);
++                    list.sort(Comparator.comparing(GpuMetric::ts));
++                    if (list.size() > MAX_POINTS_PER_SERIES) {
++                        list.subList(0, list.size() - MAX_POINTS_PER_SERIES).clear();
++                    }
++                }
+             }
+         }
+     }
+@@ -42,9 +62,11 @@ public class MemoryMetricStore implements MetricStore {
+         } else {
+             List<GpuMetric> out = new ArrayList<>();
+ 
+-            for (GpuMetric m : list) {
+-                if (!m.ts().isBefore(from) && !m.ts().isAfter(to)) {
+-                    out.add(m);
++            synchronized (list) {
++                for (GpuMetric m : list) {
++                    if (!m.ts().isBefore(from) && !m.ts().isAfter(to)) {
++                        out.add(m);
++                    }
+                 }
+             }
+ 
+@@ -56,11 +78,41 @@ public class MemoryMetricStore implements MetricStore {
+     public List<GpuMetric> recentSeries(String cardNo, int limitPoints) {
+         List<GpuMetric> list = this.data.get(cardNo);
+         if (list != null && !list.isEmpty()) {
+-            int n = list.size();
+-            int from = Math.max(0, n - Math.max(1, limitPoints));
+-            return new ArrayList<>(list.subList(from, n));
++            synchronized (list) {
++                int n = list.size();
++                int from = Math.max(0, n - Math.max(1, limitPoints));
++                return new ArrayList<>(list.subList(from, n));
++            }
+         } else {
+             return List.of();
+         }
+     }
++
++    /** 淘汰最新点最旧的 series（软上限，并发下允许短暂略超，不追求精确） */
++    private void evictStalestSeries() {
++        String target = null;
++        LocalDateTime oldest = null;
++
++        for (Map.Entry<String, List<GpuMetric>> entry : this.data.entrySet()) {
++            List<GpuMetric> series = entry.getValue();
++            LocalDateTime newest;
++            synchronized (series) {
++                newest = series.isEmpty() ? null : series.get(series.size() - 1).ts();
++            }
++
++            if (newest == null) {
++                this.data.remove(entry.getKey());
++                return;
++            }
++
++            if (oldest == null || newest.isBefore(oldest)) {
++                oldest = newest;
++                target = entry.getKey();
++            }
++        }
++
++        if (target != null) {
++            this.data.remove(target);
++        }
++    }
+ }
+diff --git a/a/backend-src/com/dcim/metrics/TdengineMetricStore.java b/b/backend-src/com/dcim/metrics/TdengineMetricStore.java
+index da8dbbe..088bc31 100644
+--- a/a/backend-src/com/dcim/metrics/TdengineMetricStore.java
++++ b/b/backend-src/com/dcim/metrics/TdengineMetricStore.java
+@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.core.ParameterizedTypeReference;
++import org.springframework.http.client.SimpleClientHttpRequestFactory;
+ import org.springframework.stereotype.Component;
+ import org.springframework.web.client.RestClient;
+ import org.springframework.web.client.RestClient.Builder;
+@@ -44,7 +45,14 @@ public class TdengineMetricStore implements MetricStore {
+     ) {
+         this.database = database;
+         String basic = Base64.getEncoder().encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
+-        this.rest = builder.baseUrl(url).defaultHeader("Authorization", new String[]{"Basic " + basic}).build();
++        // 修复：此前未设超时，TDengine 假死/网络黑洞时调用线程会被无限阻塞；若发生在 @Scheduled
++        // 任务里（GPU 健康度评分→queryWindow），ScheduledJobLockAspect 的心跳续租会让集群锁被
++        // 无限期占用。对齐 PrometheusClient 的 3s/15s；全部读写都经 exec() 走 this.rest 单客户端，
++        // 在 requestFactory 上设一次即覆盖 ensureSchema/saveGpuMetrics/queryWindow/recentSeries 全部入口。
++        SimpleClientHttpRequestFactory f = new SimpleClientHttpRequestFactory();
++        f.setConnectTimeout(3000);
++        f.setReadTimeout(15000);
++        this.rest = builder.requestFactory(f).baseUrl(url).defaultHeader("Authorization", new String[]{"Basic " + basic}).build();
+     }
+ 
+     @Override
+@@ -130,13 +138,17 @@ public class TdengineMetricStore implements MetricStore {
+     }
+ 
+     static String childTable(String cardNo) {
++        // 修复：非字母数字统一映射 _ 会让 A-1 / A_1 / A 1 落到同一张子表（数据互相覆盖错乱），
++        // 追加 cardNo 哈希后缀保证不同 cardNo 不再碰撞。查询路径（queryWindow/recentSeries）全部
++        // 按超表 + card_no TAG 过滤，不依赖子表名：存量旧子表的历史数据仍可查到，仅同一卡的
++        // 新数据会写到新子表（新旧并存，对查询透明，无需迁移）。
+         StringBuilder sb = new StringBuilder("dcm_");
+ 
+         for (char c : cardNo.toLowerCase().toCharArray()) {
+             sb.append(Character.isLetterOrDigit(c) ? c : '_');
+         }
+ 
+-        return sb.toString();
++        return sb.append('_').append(Integer.toHexString(cardNo.hashCode())).toString();
+     }
+ 
+     private List<GpuMetric> parseRows(Map<String, Object> resp) {
+diff --git a/a/backend-src/com/dcim/monitoring/service/AlertIngestService.java b/b/backend-src/com/dcim/monitoring/service/AlertIngestService.java
+index 80f878d..ff29506 100644
+--- a/a/backend-src/com/dcim/monitoring/service/AlertIngestService.java
++++ b/b/backend-src/com/dcim/monitoring/service/AlertIngestService.java
+@@ -261,7 +261,9 @@ public class AlertIngestService {
+         }
+     }
+ 
+-    private Map<String, Object> eventData(AlertEvent e) {
++    // 包级可见 + static：超时自动关闭路径（AlertScheduler.expireStale）复用同一事件数据结构，
++    // 保证 alert.resolved 事件载荷与正常恢复路径完全一致
++    static Map<String, Object> eventData(AlertEvent e) {
+         Map<String, Object> d = new LinkedHashMap<>();
+         d.put("alertId", e.getId());
+         d.put("alertname", e.getAlertname());
+diff --git a/a/backend-src/com/dcim/monitoring/service/AlertScheduler.java b/b/backend-src/com/dcim/monitoring/service/AlertScheduler.java
+index c14feea..5285422 100644
+--- a/a/backend-src/com/dcim/monitoring/service/AlertScheduler.java
++++ b/b/backend-src/com/dcim/monitoring/service/AlertScheduler.java
+@@ -1,5 +1,12 @@
+ package com.dcim.monitoring.service;
+ 
++import com.baomidou.mybatisplus.core.toolkit.Wrappers;
++import com.dcim.common.event.DomainEvent;
++import com.dcim.common.event.DomainEventPublisher;
++import com.dcim.monitoring.entity.AlertEvent;
++import com.dcim.monitoring.mapper.AlertEventMapper;
++import java.time.LocalDateTime;
++import java.util.List;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.factory.annotation.Value;
+@@ -7,6 +14,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.jdbc.core.JdbcTemplate;
+ import org.springframework.scheduling.annotation.Scheduled;
+ import org.springframework.stereotype.Component;
++import org.springframework.transaction.support.TransactionTemplate;
+ 
+ @Component
+ @ConditionalOnProperty(
+@@ -19,17 +27,26 @@ public class AlertScheduler {
+     private static final Logger log = LoggerFactory.getLogger(AlertScheduler.class);
+     private final AlertTicketService tickets;
+     private final JdbcTemplate jdbc;
++    private final AlertEventMapper alertMapper;
++    private final DomainEventPublisher events;
++    private final TransactionTemplate tx;
+     private final int staleHours;
+     private final int retainDays;
+ 
+     public AlertScheduler(
+         AlertTicketService tickets,
+         JdbcTemplate jdbc,
++        AlertEventMapper alertMapper,
++        DomainEventPublisher events,
++        TransactionTemplate tx,
+         @Value("${dcim.monitoring.stale-hours:12}") int staleHours,
+         @Value("${dcim.monitoring.retain-days:180}") int retainDays
+     ) {
+         this.tickets = tickets;
+         this.jdbc = jdbc;
++        this.alertMapper = alertMapper;
++        this.events = events;
++        this.tx = tx;
+         this.staleHours = Math.max(1, staleHours);
+         this.retainDays = Math.max(7, retainDays);
+     }
+@@ -54,11 +71,62 @@ public class AlertScheduler {
+         initialDelay = 60000L
+     )
+     public void expireStale() {
+-        int n = this.jdbc
+-            .update(
+-                "UPDATE alert_event SET status = 'RESOLVED', ends_at = last_received_at, updated_at = NOW(), close_reason = '超时未再收到告警，系统自动关闭' WHERE status = 'FIRING' AND last_received_at < NOW() - make_interval(hours => ?)",
+-                new Object[]{this.staleHours}
+-            );
++        // 修复：此前仅批量 UPDATE 状态，超时自动关闭的告警既不发 alert.resolved 事件、也不给关联
++        // 工单追加恢复评论，与正常恢复路径（AlertIngestService.resolve + AlertTicketService.
++        // commentResolved）行为不一致。现逐条关闭并补齐两件事；事务语义对齐 ingest：每条告警独立
++        // 小事务（条件更新 + 发事件），工单评论在事务外由 commentResolved 自管事务，单条失败不影响其余。
++        LocalDateTime cutoff = LocalDateTime.now().minusHours((long)this.staleHours);
++        List<AlertEvent> stale = this.alertMapper
++            .selectList(Wrappers.<AlertEvent>lambdaQuery().eq(AlertEvent::getStatus, "FIRING").lt(AlertEvent::getLastReceivedAt, cutoff));
++        int n = 0;
++
++        for (AlertEvent e : stale) {
++            try {
++                Boolean closed = (Boolean)this.tx
++                    .execute(
++                        s -> {
++                            // 条件更新（仍为 FIRING 才翻转），避免与 ingest 并发恢复同一告警时
++                            // 双发 alert.resolved / 工单重复评论
++                            LocalDateTime now = LocalDateTime.now();
++                            int updated = this.alertMapper
++                                .update(
++                                    null,
++                                    (((((Wrappers.<AlertEvent>lambdaUpdate().eq(AlertEvent::getId, e.getId()))
++                                        .eq(AlertEvent::getStatus, "FIRING"))
++                                        .set(AlertEvent::getStatus, "RESOLVED"))
++                                        .set(AlertEvent::getEndsAt, e.getLastReceivedAt()))
++                                        .set(AlertEvent::getUpdatedAt, now))
++                                        .set(AlertEvent::getCloseReason, "超时未再收到告警，系统自动关闭")
++                                );
++                            if (updated == 1) {
++                                e.setStatus("RESOLVED");
++                                e.setEndsAt(e.getLastReceivedAt());
++                                if (!Boolean.TRUE.equals(e.getSuppressed())) {
++                                    this.events
++                                        .publish(
++                                            DomainEvent.of(
++                                                "alert.resolved", "alert", String.valueOf(e.getId()), "monitoring", AlertIngestService.eventData(e)
++                                            )
++                                        );
++                                }
++
++                                return true;
++                            } else {
++                                return false;
++                            }
++                        }
++                    );
++                if (Boolean.TRUE.equals(closed)) {
++                    n++;
++                    if (e.getWoNo() != null) {
++                        this.tickets.commentResolved(e.getWoNo(), e.getAlertname(), e.getSummary());
++                    }
++                }
++            } catch (RuntimeException var9) {
++                log.warn("[alert] 超时关闭告警 #{} 失败：{}", e.getId(), var9.toString());
++            }
++        }
++
+         if (n > 0) {
+             log.info("[alert] {} 条告警超过 {} 小时未再收到，已自动关闭", n, this.staleHours);
+         }
+diff --git a/a/backend-src/com/dcim/monitoring/service/AlertTicketService.java b/b/backend-src/com/dcim/monitoring/service/AlertTicketService.java
+index c23764e..2de278b 100644
+--- a/a/backend-src/com/dcim/monitoring/service/AlertTicketService.java
++++ b/b/backend-src/com/dcim/monitoring/service/AlertTicketService.java
+@@ -182,6 +182,11 @@ public class AlertTicketService {
+     }
+ 
+     public void commentResolved(String woNo, AlertIngestService.Incoming in) {
++        this.commentResolved(woNo, in.alertname(), in.summary());
++    }
++
++    /** 超时自动关闭等非 ingest 路径的恢复复用：按告警名/摘要给关联工单追加恢复评论 */
++    public void commentResolved(String woNo, String alertname, String summary) {
+         if ("true".equalsIgnoreCase(this.settings.get("resolve_comment", "true"))) {
+             try {
+                 List<Map<String, Object>> st = this.jdbc.queryForList("SELECT status FROM workorder WHERE wo_no = ?", new Object[]{woNo});
+@@ -192,20 +197,20 @@ public class AlertTicketService {
+                 this.tx
+                     .executeWithoutResult(
+                         s -> this.actor
+-                                .runAs(
+-                                    "admin",
+-                                    () -> this.workorderService
+-                                            .comment(
+-                                                woNo,
+-                                                "【告警已恢复】"
+-                                                    + brief(in.alertname())
+-                                                    + "："
+-                                                    + brief(in.summary())
+-                                                    + "，恢复时间 "
+-                                                    + LocalDateTime.now().withNano(0)
+-                                                    + "。请确认故障是否已彻底处理后再完结工单。"
+-                                            )
+-                                )
++                            .runAs(
++                                "admin",
++                                () -> this.workorderService
++                                        .comment(
++                                            woNo,
++                                            "【告警已恢复】"
++                                                + brief(alertname)
++                                                + "："
++                                                + brief(summary)
++                                                + "，恢复时间 "
++                                                + LocalDateTime.now().withNano(0)
++                                                + "。请确认故障是否已彻底处理后再完结工单。"
++                                        )
++                            )
+                     );
+             } catch (RuntimeException var4) {
+                 log.warn("[alert] 工单 {} 追加恢复评论失败：{}", woNo, var4.getMessage());
+diff --git a/a/backend-src/com/dcim/network/IpamService.java b/b/backend-src/com/dcim/network/IpamService.java
+index 10788cd..0b590dc 100644
+--- a/a/backend-src/com/dcim/network/IpamService.java
++++ b/b/backend-src/com/dcim/network/IpamService.java
+@@ -240,6 +240,14 @@ public class IpamService {
+                 throw BusinessException.badRequest("请填写 IP，或选择网段自动分配");
+             }
+ 
++            // v3.5：先锁定网段行再 nextFree，串行化同一网段的自动分配，
++            // 消除「查到空闲 IP 后、落库前被并发抢占」的 check-then-act 竞态（IP 重复分配）
++            List<Map<String, Object>> locked = this.jdbc
++                .queryForList("SELECT id FROM ipam_prefix WHERE id = ? FOR UPDATE", new Object[]{r.prefixId()});
++            if (locked.isEmpty()) {
++                throw BusinessException.notFound("网段不存在");
++            }
++
+             List<String> free = this.nextFree(r.prefixId(), 1);
+             if (free.isEmpty()) {
+                 throw BusinessException.conflict("网段已无可用地址");
+diff --git a/a/backend-src/com/dcim/problem/ProblemService.java b/b/backend-src/com/dcim/problem/ProblemService.java
+index 9a951a8..6cb7c1a 100644
+--- a/a/backend-src/com/dcim/problem/ProblemService.java
++++ b/b/backend-src/com/dcim/problem/ProblemService.java
+@@ -281,11 +281,15 @@ public class ProblemService {
+                         }
+                 }
+ 
+-                this.jdbc
++                int updated = this.jdbc
+                     .update(
+-                        "UPDATE problem SET status = ?, root_cause = ?, workaround = ?, resolution = ?, kb_no = ?, updated_at = NOW(),\n       resolved_at = CASE WHEN ? = 'RESOLVED' THEN NOW() WHEN ? = 'ANALYZING' THEN NULL ELSE resolved_at END,\n       closed_at = CASE WHEN ? = 'CLOSED' THEN NOW() ELSE closed_at END\nWHERE id = ?\n",
+-                        new Object[]{to, rootCause, workaround, resolution, kbNo, to, to, to, id}
++                        "UPDATE problem SET status = ?, root_cause = ?, workaround = ?, resolution = ?, kb_no = ?, updated_at = NOW(),\n       resolved_at = CASE WHEN ? = 'RESOLVED' THEN NOW() WHEN ? = 'ANALYZING' THEN NULL ELSE resolved_at END,\n       closed_at = CASE WHEN ? = 'CLOSED' THEN NOW() ELSE closed_at END\nWHERE id = ? AND status = ?\n",
++                        new Object[]{to, rootCause, workaround, resolution, kbNo, to, to, to, id, from}
+                     );
++                if (updated == 0) {
++                    // CAS：状态已被并发流转改写，拒绝本次提交（事务回滚已产生的副作用）
++                    throw BusinessException.conflict("问题单状态已被并发变更，请刷新后重试");
++                }
+                 this.flow(id, from, to, user, blank(r.comment()));
+                 Map<String, Object> data = new LinkedHashMap<>();
+                 data.put("prbNo", p.get("prbNo"));
+@@ -322,7 +326,12 @@ public class ProblemService {
+ 
+     public void unlink(String idOrNo, long linkId) {
+         Map<String, Object> p = this.require(idOrNo);
+-        this.jdbc.update("DELETE FROM problem_link WHERE id = ? AND problem_id = ?", new Object[]{linkId, p.get("id")});
++        if ("CLOSED".equals(p.get("status"))) {
++            // 与 update 的关闭态校验保持一致：已关闭问题单不允许解除关联
++            throw BusinessException.conflict("问题单已关闭，不能修改");
++        } else {
++            this.jdbc.update("DELETE FROM problem_link WHERE id = ? AND problem_id = ?", new Object[]{linkId, p.get("id")});
++        }
+     }
+ 
+     public void delete(String idOrNo) {
+diff --git a/a/backend-src/com/dcim/report/controller/DashboardExtras.java b/b/backend-src/com/dcim/report/controller/DashboardExtras.java
+index 0a43395..22ea784 100644
+--- a/a/backend-src/com/dcim/report/controller/DashboardExtras.java
++++ b/b/backend-src/com/dcim/report/controller/DashboardExtras.java
+@@ -106,6 +106,10 @@ public class DashboardExtras {
+         if (reach == null && avg > 0) {
+             reach = (int) Math.ceil((cap * 0.85 - now) / avg);
+         }
++        // 预测窗口仅 6 个月：reach 超窗时收敛到 6，与前端「forecastMonths ?? 6」的展示口径一致
++        if (reach != null && reach > 6) {
++            reach = 6;
++        }
+         out.put("forecast", fc);
+         out.put("forecastMonths", reach);
+     }
+diff --git a/a/backend-src/com/dcim/rfid/mapper/RfidAssetQueryMapper.java b/b/backend-src/com/dcim/rfid/mapper/RfidAssetQueryMapper.java
+index 7994c05..e2e70d2 100644
+--- a/a/backend-src/com/dcim/rfid/mapper/RfidAssetQueryMapper.java
++++ b/b/backend-src/com/dcim/rfid/mapper/RfidAssetQueryMapper.java
+@@ -8,4 +8,8 @@ import org.apache.ibatis.annotations.Select;
+ public interface RfidAssetQueryMapper {
+     @Select({"SELECT COUNT(*) FROM asset WHERE deleted_at IS NULL AND UPPER(sn) = #{sn}"})
+     long countBySn(@Param("sn") String sn);
++
++    /** 事务级咨询锁：按 SN 串行化“查重-建资产”窗口，返回值仅占位无业务含义（无 DDL 兜底方案） */
++    @Select({"SELECT pg_advisory_xact_lock(hashtext(#{sn}))"})
++    long lockSn(@Param("sn") String sn);
+ }
+diff --git a/a/backend-src/com/dcim/rfid/service/RfidBatchService.java b/b/backend-src/com/dcim/rfid/service/RfidBatchService.java
+index 0519492..2e615d4 100644
+--- a/a/backend-src/com/dcim/rfid/service/RfidBatchService.java
++++ b/b/backend-src/com/dcim/rfid/service/RfidBatchService.java
+@@ -249,10 +249,14 @@ public class RfidBatchService {
+                             throw BusinessException.badRequest("预期数量必须为正整数：" + qtyText);
+                         }
+ 
+-                        if (this.itemExists(batchNo, code) || !fileCodes.add(code)) {
++                        if (this.itemExists(batchNo, code)) {
+                             throw BusinessException.conflict("该批次已存在物料 " + code + " 的明细");
+                         }
+ 
++                        if (!fileCodes.add(code)) {
++                            throw BusinessException.conflict("文件内物料编码重复：" + code);
++                        }
++
+                         RfidBatchItemEntity item = new RfidBatchItemEntity();
+                         item.setBatchNo(batchNo);
+                         item.setMaterialCode(code);
+@@ -357,6 +361,8 @@ public class RfidBatchService {
+                     attrs.put("remark", remark.trim());
+                 }
+ 
++                // 事务级咨询锁串行化同 SN 的“查重-建资产”窗口，消除并发确认的 check-then-act 竞态（无 DDL）
++                this.assetQueryMapper.lockSn(sn);
+                 if (this.assetQueryMapper.countBySn(sn) > 0L) {
+                     String reason = "SN 已存在：" + sn + "，跳过建资产";
+                     this.markException(rec, "重复SN", reason);
+@@ -449,6 +455,11 @@ public class RfidBatchService {
+                     scanStatus = "异常";
+                     exceptionType = "未匹配";
+                     note = this.joinNote(note, "物料 " + materialCode + " 不在该批次明细中");
++                } else if (sn != null && this.assetQueryMapper.countBySn(sn) > 0L) {
++                    // SN 重复检查须在 incrReceived 占配额之前：改判异常时无需回减 received_qty，避免配额虚占
++                    scanStatus = "异常";
++                    exceptionType = "重复SN";
++                    note = this.joinNote(note, "SN 已存在于资产库：" + sn);
+                 } else if (this.itemMapper.incrReceived(matched.getId()) == 0) {
+                     scanStatus = "异常";
+                     exceptionType = "超量";
+@@ -456,12 +467,6 @@ public class RfidBatchService {
+                 }
+             }
+ 
+-            if ("已扫描".equals(scanStatus) && sn != null && this.assetQueryMapper.countBySn(sn) > 0L) {
+-                scanStatus = "异常";
+-                exceptionType = "重复SN";
+-                note = this.joinNote(note, "SN 已存在于资产库：" + sn);
+-            }
+-
+             RfidScanRecordEntity rec = new RfidScanRecordEntity();
+             rec.setBatchNo(batchNo);
+             rec.setEpc(epc);
+diff --git a/a/backend-src/com/dcim/room/controller/RackController.java b/b/backend-src/com/dcim/room/controller/RackController.java
+index 19582b3..e2dabc8 100644
+--- a/a/backend-src/com/dcim/room/controller/RackController.java
++++ b/b/backend-src/com/dcim/room/controller/RackController.java
+@@ -207,6 +207,9 @@ public class RackController {
+         if (e == null) {
+             throw BusinessException.notFound("机柜不存在：" + rackCode);
+         } else {
++            // 修复 A5：先锁 rack 行再做非空闲检查——与 occupy 的锁序一致（先 rack 后 rack_unit），
++            // 防止检查通过后并发上架、随后 DELETE 把已占用的 U 位一并删除
++            this.jdbc.queryForList("SELECT rack_code FROM rack WHERE rack_code = ? FOR UPDATE", rackCode);
+             Long nonFree = (Long)this.jdbc
+                 .queryForObject("SELECT COUNT(*) FROM rack_unit WHERE rack_code = ? AND status <> ?", Long.class, new Object[]{rackCode, "空闲"});
+             if (nonFree != null && nonFree > 0L) {
+@@ -562,6 +565,9 @@ public class RackController {
+ 
+     private void resizeUnits(RackEntity e, Integer newCap) {
+         this.checkUCapacity(newCap);
++        // 修复 A5：先锁 rack 行，使「maxUsed 检查 + DELETE」与资产上架 occupy（同样先锁 rack 行）串行化，
++        // 防止检查通过后、DELETE 之前并发上架占用的 U 位被误删
++        this.jdbc.queryForList("SELECT rack_code FROM rack WHERE rack_code = ? FOR UPDATE", e.getRackCode());
+         int oldCap = e.getUCapacity() == null ? 0 : e.getUCapacity();
+         if (newCap > oldCap) {
+             this.insertUnits(e.getRackCode(), 1, newCap);
+diff --git a/a/backend-src/com/dcim/room/rack/RackOccupancyAdapter.java b/b/backend-src/com/dcim/room/rack/RackOccupancyAdapter.java
+index b923700..26f1b14 100644
+--- a/a/backend-src/com/dcim/room/rack/RackOccupancyAdapter.java
++++ b/b/backend-src/com/dcim/room/rack/RackOccupancyAdapter.java
+@@ -52,7 +52,10 @@ public class RackOccupancyAdapter implements RackOccupancyPort {
+         if (unit < 1) {
+             throw BusinessException.badRequest("起始U位必须为正整数");
+         } else {
+-            RackEntity r = (RackEntity)this.rackMapper.selectOne(Wrappers.<RackEntity>lambdaQuery().eq(RackEntity::getRackCode, rack));
++            // 修复 A5：锁读 rack 行——容量校验基于当前已提交容量（不再按旧容量放行），
++            // 且与 resizeUnits/delete 的「锁 rack → 检查 → 删 U 位」互斥，锁序一致（先 rack 后 rack_unit）无交叉死锁
++            RackEntity r = (RackEntity)this.rackMapper
++                .selectOne(Wrappers.<RackEntity>lambdaQuery().eq(RackEntity::getRackCode, rack).last("FOR UPDATE"));
+             if (r == null) {
+                 throw BusinessException.badRequest("机柜不存在：" + rack);
+             } else {
+diff --git a/a/backend-src/com/dcim/security/DataScopeService.java b/b/backend-src/com/dcim/security/DataScopeService.java
+index 71d9008..4d33156 100644
+--- a/a/backend-src/com/dcim/security/DataScopeService.java
++++ b/b/backend-src/com/dcim/security/DataScopeService.java
+@@ -52,7 +52,10 @@ public class DataScopeService {
+         try {
+             return Scope.valueOf(String.valueOf(v).trim().toUpperCase(Locale.ROOT));
+         } catch (IllegalArgumentException e) {
+-            return Scope.ALL;
++            // 非法配置值按最窄范围处理（fail-closed），避免脏数据放大为全量可见；null（未配置）仍视为 ALL
++            org.slf4j.LoggerFactory.getLogger(DataScopeService.class)
++                .warn("[datascope] 非法数据范围配置值：{}，按 SELF 处理", v);
++            return Scope.SELF;
+         }
+     }
+ 
+diff --git a/a/backend-src/com/dcim/security/SecurityConfig.java b/b/backend-src/com/dcim/security/SecurityConfig.java
+index 85d24ac..5c284dc 100644
+--- a/a/backend-src/com/dcim/security/SecurityConfig.java
++++ b/b/backend-src/com/dcim/security/SecurityConfig.java
+@@ -77,7 +77,7 @@ public class SecurityConfig {
+                                                             }
+                                                         ))
+                                                     .permitAll()
+-                                                    .requestMatchers(new String[]{"/api/collector/**", "/api/v1/collector/**"}))
++                                                    .requestMatchers(new String[]{"/api/collector/**"}))
+                                                 .permitAll()
+                                                 .requestMatchers(HttpMethod.GET, new String[]{"/api/healthz", "/api/v1/healthz"}))
+                                             .permitAll()
+diff --git a/a/backend-src/com/dcim/security/field/FieldAccessInterceptor.java b/b/backend-src/com/dcim/security/field/FieldAccessInterceptor.java
+index cf7c2b1..32b4063 100644
+--- a/a/backend-src/com/dcim/security/field/FieldAccessInterceptor.java
++++ b/b/backend-src/com/dcim/security/field/FieldAccessInterceptor.java
+@@ -24,7 +24,8 @@ public class FieldAccessInterceptor implements HandlerInterceptor, WebMvcConfigu
+ 
+     @Override
+     public void addInterceptors(InterceptorRegistry registry) {
+-        registry.addInterceptor(this).addPathPatterns("/api/assets/**", "/api/workorders/**");
++        // v3.5：生命周期活动接口返回资产字段（assetNo/statusBiz 等），纳入字段权限拦截范围
++        registry.addInterceptor(this).addPathPatterns("/api/assets/**", "/api/workorders/**", "/api/asset-lifecycle/**");
+     }
+ 
+     @Override
+diff --git a/a/backend-src/com/dcim/system/controller/NotificationController.java b/b/backend-src/com/dcim/system/controller/NotificationController.java
+index 0d4e290..443f8f5 100644
+--- a/a/backend-src/com/dcim/system/controller/NotificationController.java
++++ b/b/backend-src/com/dcim/system/controller/NotificationController.java
+@@ -31,7 +31,8 @@ public class NotificationController {
+     public ApiResult<PageResult<Map<String, Object>>> my(
+         @RequestParam(defaultValue = "1") long page, @RequestParam(defaultValue = "20") long size, @RequestParam(required = false) Boolean unread
+     ) {
+-        Page<NotificationEntity> p = new Page(page, size);
++        // 修复：size 未收敛上限时传超大值会拉取全量通知（仿 UserController.list 的 1..200 收敛）
++        Page<NotificationEntity> p = new Page(page, Math.min(Math.max(size, 1L), 200L));
+         this.notificationMapper.selectPage(p, this.buildWrapper(unread));
+         return ApiResult.ok(PageResult.of(p, NotificationController::toRow));
+     }
+diff --git a/a/backend-src/com/dcim/system/controller/UserController.java b/b/backend-src/com/dcim/system/controller/UserController.java
+index e82f810..cafe79f 100644
+--- a/a/backend-src/com/dcim/system/controller/UserController.java
++++ b/b/backend-src/com/dcim/system/controller/UserController.java
+@@ -192,13 +192,22 @@ public class UserController {
+                 throw BusinessException.badRequest("不能停用当前登录账号");
+             }
+             boolean revoke = false;
++            // name/department/phone/email 统一语义（D4 修复）：null（字段未传）保留旧值，
++            // 不再被误置 NULL；需清空由前端显式传空串 ""（MyBatis-Plus updateById 跳过
++            // null 字段、写入空串，两种意图由此区分）
+             if (req.getName() != null) {
+                 user.setName(req.getName());
+             }
+ 
+-            user.setDepartment(req.getDepartment());
+-            user.setPhone(req.getPhone());
+-            user.setEmail(req.getEmail());
++            if (req.getDepartment() != null) {
++                user.setDepartment(req.getDepartment());
++            }
++            if (req.getPhone() != null) {
++                user.setPhone(req.getPhone());
++            }
++            if (req.getEmail() != null) {
++                user.setEmail(req.getEmail());
++            }
+             String newWecom = req.getWecomUserid() != null && !req.getWecomUserid().isBlank() ? req.getWecomUserid().trim() : null;
+             if (newWecom != null) {
+                 UserEntity bound = (UserEntity)this.userMapper.selectOne(Wrappers.<UserEntity>lambdaQuery().eq(UserEntity::getWecomUserid, newWecom));
+diff --git a/a/backend-src/com/dcim/system/service/NotificationAdapter.java b/b/backend-src/com/dcim/system/service/NotificationAdapter.java
+index 31ea2d4..6f73bb8 100644
+--- a/a/backend-src/com/dcim/system/service/NotificationAdapter.java
++++ b/b/backend-src/com/dcim/system/service/NotificationAdapter.java
+@@ -16,9 +16,12 @@ import java.util.Map;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Component;
++import org.springframework.transaction.PlatformTransactionManager;
++import org.springframework.transaction.TransactionDefinition;
+ import org.springframework.transaction.annotation.Transactional;
+ import org.springframework.transaction.support.TransactionSynchronization;
+ import org.springframework.transaction.support.TransactionSynchronizationManager;
++import org.springframework.transaction.support.TransactionTemplate;
+ 
+ @Component
+ public class NotificationAdapter implements NotificationPort {
+@@ -28,6 +31,8 @@ public class NotificationAdapter implements NotificationPort {
+     private final UserRoleMapper userRoleMapper;
+     private final UserMapper userMapper;
+     private final SsePushService ssePush;
++    /** 站内信落库专用 NESTED 保存点模板（同 WebhookDispatcher 惯例），见 {@link #insert} */
++    private final TransactionTemplate nestedTx;
+ 
+     @Transactional
+     @Override
+@@ -58,6 +63,12 @@ public class NotificationAdapter implements NotificationPort {
+         }
+     }
+ 
++    /**
++     * 单条站内信落库 + 实时推送。落库在 NESTED 保存点中执行（D3 修复）：
++     * insert 失败只回滚到保存点并被就地吞掉，建单/出入库等外层业务事务不再被
++     * 站内信拖垮回滚（与 WebhookDispatcher 的保存点隔离同语义；无外层事务时
++     * NESTED 退化为独立新事务，同样安全）。推送只在落库成功后进行。
++     */
+     private void insert(String username, String type, String title, String content, String refId) {
+         NotificationEntity n = new NotificationEntity();
+         n.setUsername(username);
+@@ -67,7 +78,12 @@ public class NotificationAdapter implements NotificationPort {
+         n.setRefId(refId);
+         n.setReadFlag(false);
+         n.setCreatedAt(LocalDateTime.now());
+-        this.notificationMapper.insert(n);
++        try {
++            this.nestedTx.executeWithoutResult(status -> this.notificationMapper.insert(n));
++        } catch (RuntimeException e) {
++            log.error("站内信落库失败，业务不受影响：username={}, type={}, refId={}", username, type, refId, e);
++            return;
++        }
+         this.pushRealtime(this.toPayload(n));
+     }
+ 
+@@ -111,10 +127,12 @@ public class NotificationAdapter implements NotificationPort {
+         return row;
+     }
+ 
+-    public NotificationAdapter(final NotificationMapper notificationMapper, final UserRoleMapper userRoleMapper, final UserMapper userMapper, final SsePushService ssePush) {
++    public NotificationAdapter(final NotificationMapper notificationMapper, final UserRoleMapper userRoleMapper, final UserMapper userMapper, final SsePushService ssePush, final PlatformTransactionManager txm) {
+         this.notificationMapper = notificationMapper;
+         this.userRoleMapper = userRoleMapper;
+         this.userMapper = userMapper;
+         this.ssePush = ssePush;
++        this.nestedTx = new TransactionTemplate(txm);
++        this.nestedTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_NESTED);
+     }
+ }
+diff --git a/a/backend-src/com/dcim/warehouse/controller/InventoryTaskController.java b/b/backend-src/com/dcim/warehouse/controller/InventoryTaskController.java
+index 704ee20..3059877 100644
+--- a/a/backend-src/com/dcim/warehouse/controller/InventoryTaskController.java
++++ b/b/backend-src/com/dcim/warehouse/controller/InventoryTaskController.java
+@@ -308,9 +308,11 @@ public class InventoryTaskController {
+     public ApiResult<Map<String, Object>> submitItem(
+         @PathVariable String taskNo, @PathVariable String itemNo, @RequestBody InventoryTaskController.SubmitItemReq req
+     ) {
+-        InventoryTaskEntity task = this.requireTask(taskNo);
++        // 修复 A2：任务行 FOR UPDATE 锁读并复查状态——与 complete/cancel 的状态占位更新互斥，
++        // 任务一旦完成/取消，迟到的明细提交以 409 拒绝，避免污染已定稿的 checked/diff 统计
++        InventoryTaskEntity task = this.requireTaskForUpdate(taskNo);
+         if (!"盘点中".equals(task.getStatus())) {
+-            throw BusinessException.badRequest("任务状态为「" + task.getStatus() + "」，不允许提交盘点结果");
++            throw BusinessException.conflict("任务已完成，提交被拒绝（任务状态：「" + task.getStatus() + "」）");
+         } else {
+             String result = req.getResult() == null ? "" : req.getResult().trim();
+             boolean isMaterialTask = "MATERIAL".equals(task.getTargetType());
+@@ -466,13 +468,26 @@ public class InventoryTaskController {
+         LoginUser u = CurrentUser.get();
+         String operator = u == null ? null : u.username();
+ 
+-        for (InventoryItemEntity item : this.itemMapper.selectList(Wrappers.<InventoryItemEntity>lambdaQuery().eq(InventoryItemEntity::getTaskNo, task.getTaskNo()))) {
++        // 修复 A1：明细按物料编码排序——多任务并发完成时以一致顺序加 material 行锁，避免交叉死锁
++        List<InventoryItemEntity> items = this.itemMapper
++            .selectList(
++                Wrappers.<InventoryItemEntity>lambdaQuery()
++                    .eq(InventoryItemEntity::getTaskNo, task.getTaskNo())
++                    .orderByAsc(InventoryItemEntity::getMaterialCode)
++            );
++
++        for (InventoryItemEntity item : items) {
+             if (item.getCountedQty() != null && item.getExpected() != null) {
+                 Object book = item.getExpected().get("qty");
+                 if (book != null) {
+                     int bookQty = ((Number)book).intValue();
+                     int counted = item.getCountedQty();
+                     if (bookQty != counted) {
++                        // 修复 A1：先锁 material 行再读当前账面（stock_level 的全部写入都以先锁 material 为前提），
++                        // 使「读账面→算差异→写目标」与 apply 锁内重读的 whBefore 使用同一数值——
++                        // 否则锁外读取与锁内写入之间提交的在途出入库会被基于旧账面的目标值回抹，
++                        // 且 stock_log 备注中的 before/after 与实际写入不一致
++                        this.jdbc.queryForList("SELECT material_code FROM material WHERE material_code = ? FOR UPDATE", item.getMaterialCode());
+                         // 修复：改为「按差额修正当前库存」，避免把建任务快照之后的正常出入库整量覆盖。
+                         // 目标 = 当前库存 + (实盘 - 快照账面)
+                         int current = this.currentLevel(item.getMaterialCode(), item.getWarehouseCode());
+@@ -534,6 +549,17 @@ public class InventoryTaskController {
+         }
+     }
+ 
++    /** 修复 A2：任务行 FOR UPDATE 锁读——submitItem 与 complete/cancel 并发时以行锁串行化并复查状态 */
++    private InventoryTaskEntity requireTaskForUpdate(String taskNo) {
++        InventoryTaskEntity t = (InventoryTaskEntity)this.taskMapper
++            .selectOne(Wrappers.<InventoryTaskEntity>lambdaQuery().eq(InventoryTaskEntity::getTaskNo, taskNo).last("FOR UPDATE"));
++        if (t == null) {
++            throw BusinessException.notFound("盘点任务不存在：" + taskNo);
++        } else {
++            return t;
++        }
++    }
++
+     private LocalDate parseDate(String s, String label) {
+         if (s != null && !s.isBlank()) {
+             try {
+diff --git a/a/backend-src/com/dcim/warehouse/controller/MaterialController.java b/b/backend-src/com/dcim/warehouse/controller/MaterialController.java
+index 8d2c6ed..396f585 100644
+--- a/a/backend-src/com/dcim/warehouse/controller/MaterialController.java
++++ b/b/backend-src/com/dcim/warehouse/controller/MaterialController.java
+@@ -23,6 +23,7 @@ import com.dcim.warehouse.mapper.StockLogMapper;
+ import com.dcim.warehouse.mapper.WarehouseLayerMapper;
+ import com.dcim.warehouse.mapper.WarehouseMapper;
+ import com.dcim.warehouse.mapper.WarehouseShelfMapper;
++import com.dcim.warehouse.service.LowStockService;
+ import jakarta.servlet.http.HttpServletResponse;
+ import jakarta.validation.Valid;
+ import jakarta.validation.constraints.NotBlank;
+@@ -65,6 +66,7 @@ public class MaterialController {
+     private final WarehouseLayerMapper layerMapper;
+     private final JdbcTemplate jdbc;
+     private final TransactionTemplate rowTx;
++    private final LowStockService lowStockService;
+     private static final List<String> CSV_HEADERS = List.of(
+         "物料编码", "物料名称", "分类", "类型", "品牌", "型号", "PN", "规格", "单位", "参考单价", "安全库存", "最高库存", "存放位置", "供应商编码", "仓库编号", "货架编号", "层位编号"
+     );
+@@ -269,6 +271,16 @@ public class MaterialController {
+                     if (rows == 0) {
+                         throw BusinessException.conflict("数据已被他人修改，请刷新后重试");
+                     } else {
++                        // 修复 A4：安全库存调高到高于当前库存时补一次低库存评估——
++                        // 否则该物料在下次出入库前，notify/ticket 联动（仅由 stock.movement 事件触发）永不提醒。
++                        // onLowStock 在事务内仅注册 afterCommit 钩子，提交后异步执行，不会读到未提交数据
++                        Integer newSafety = req.getSafetyStock();
++                        int curStock = cur.getStock() == null ? 0 : cur.getStock();
++                        if (newSafety != null && newSafety > curStock && !newSafety.equals(cur.getSafetyStock())) {
++                            this.lowStockService
++                                .onLowStock(cur.getMaterialCode(), cur.getName(), curStock, newSafety, cur.getUnit(), null);
++                        }
++
+                         Map<String, Object> out = this.toRow(this.requireMaterial(materialCode));
+                         this.enrichWarehouseStocks(List.of(out));
+                         return ApiResult.ok(out);
+@@ -664,7 +676,8 @@ public class MaterialController {
+         final WarehouseShelfMapper shelfMapper,
+         final WarehouseLayerMapper layerMapper,
+         final JdbcTemplate jdbc,
+-        final TransactionTemplate rowTx
++        final TransactionTemplate rowTx,
++        final LowStockService lowStockService
+     ) {
+         this.materialMapper = materialMapper;
+         this.stockLogMapper = stockLogMapper;
+@@ -674,6 +687,7 @@ public class MaterialController {
+         this.layerMapper = layerMapper;
+         this.jdbc = jdbc;
+         this.rowTx = rowTx;
++        this.lowStockService = lowStockService;
+     }
+ 
+     public static class CreateMaterialReq {
+diff --git a/a/backend-src/com/dcim/warehouse/controller/StockController.java b/b/backend-src/com/dcim/warehouse/controller/StockController.java
+index 3d279c1..952aa46 100644
+--- a/a/backend-src/com/dcim/warehouse/controller/StockController.java
++++ b/b/backend-src/com/dcim/warehouse/controller/StockController.java
+@@ -23,6 +23,7 @@ import java.time.LocalDate;
+ import java.time.format.DateTimeParseException;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+@@ -140,6 +141,8 @@ public class StockController {
+ 
+             List<Map<String, Object>> logs = new ArrayList<>();
+ 
++            // 修复 A6：进入逐行加锁循环前统一按物料编码排序，消除多行锁顺序不定导致的死锁面
++            cmds.sort(Comparator.comparing(StockMovementPort.MovementCmd::materialCode));
+             for (StockMovementPort.MovementCmd cmdx : cmds) {
+                 StockMovementPort.MovementResult r = this.stockMovementService.apply(cmdx);
+                 Map<String, Object> l = new LinkedHashMap<>();
+@@ -336,6 +339,12 @@ public class StockController {
+             if (stripped.scale() > 0) {
+                 throw BusinessException.badRequest("数量必须为正整数");
+             } else {
++                // 修复 A3：加业务上限防 int 溢出——超界值落进 intValueExact 会抛
++                // ArithmeticException 并以 500 返回，而不是可读的业务错误
++                if (stripped.compareTo(BigDecimal.valueOf(1_000_000_000L)) > 0) {
++                    throw BusinessException.badRequest("数量超出业务上限 1,000,000,000：" + stripped.toBigInteger());
++                }
++
+                 return stripped.intValueExact();
+             }
+         }
+diff --git a/a/backend-src/com/dcim/warehouse/service/StockMovementService.java b/b/backend-src/com/dcim/warehouse/service/StockMovementService.java
+index 69b7899..80efaa0 100644
+--- a/a/backend-src/com/dcim/warehouse/service/StockMovementService.java
++++ b/b/backend-src/com/dcim/warehouse/service/StockMovementService.java
+@@ -107,6 +107,14 @@ public class StockMovementService {
+                         newStock = stock;
+                 }
+ 
++                // 修复 A3：所有写 material.stock 的路径统一断言非负——OUT 分支此前只校验分仓库存，
++                // material.stock 与分仓合计漂移时会把总库存写负；IN 分支相加溢出时结果同样为负，此处一并拦截
++                if (newStock < 0) {
++                    throw BusinessException.badRequest(
++                        "物料「" + m.getName() + "」（" + m.getMaterialCode() + "）总库存不允许为负：当前 " + stock + "，本次变动后为 " + newStock
++                    );
++                }
++
+                 this.jdbc
+                     .update(
+                         "UPDATE material SET stock = ?, total_in = ?, total_out = ?, updated_at = now() WHERE material_code = ?",
+diff --git a/a/backend-src/com/dcim/webhook/service/WebhookService.java b/b/backend-src/com/dcim/webhook/service/WebhookService.java
+index 258c1c4..b606488 100644
+--- a/a/backend-src/com/dcim/webhook/service/WebhookService.java
++++ b/b/backend-src/com/dcim/webhook/service/WebhookService.java
+@@ -30,6 +30,7 @@ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.UUID;
++import java.util.concurrent.ThreadLocalRandom;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.factory.annotation.Value;
+@@ -183,6 +184,15 @@ public class WebhookService {
+         long start = System.nanoTime();
+ 
+         try {
++            // SSRF 纵深（DNS rebinding TOCTOU）：本行 check() 会解析并校验目标 IP，但 java.net.http
++            // HttpClient 建立连接时会做第二次独立 DNS 解析，攻击者理论上可用超短 TTL/逐次应答在两次
++            // 解析之间把主机重绑定到内网地址。彻底方案（按已校验 IP 直连 + Host 头保留原域名）不可行：
++            // java.net.http 把 Host 列为受限头，手设会抛异常；放开需全局系统属性
++            // jdk.httpclient.allowRestrictedHeaders（削弱整个 JVM 的 HTTP 防护），不予采用。
++            // 故按降级方案维持「投递前紧邻 send 重新走守卫校验」（注册/改端点时是第一次，本行是第二次，
++            // 与实际建连仅隔内存操作）。残余风险：µs~ms 窗口内的逐次重绑定。缓解因素：JVM InetAddress
++            // 默认缓存成功解析 30s，第二次解析通常命中本行已校验的同一批地址；https 目标另受 TLS
++            // 主机名校验约束（证书须匹配原域名），等效于钉扎，按原 URI 直连。
+             URI uri = this.urlGuard.check(ep.getUrl());
+             String secret = ep.getSecret() != null && !ep.getSecret().isBlank() ? this.cryptBox.decrypt(ep.getSecret()) : null;
+             WebhookPayloadRenderer.Rendered r = this.renderer.render(ep.getFormat(), uri.toString(), secret, String.valueOf(d.getId()), d.getPayload());
+@@ -253,7 +263,10 @@ public class WebhookService {
+             status = "SUCCESS";
+         } else if (attempts < MAX_ATTEMPTS && !"ping".equals(d.getEventType())) {
+             status = "RETRY";
+-            next = now.plus(BACKOFF[attempts - 1]);
++            // 修复：固定间隔退避会让同一时刻失败的大量端点/多条投递在完全相同的时刻集体重试
++            // （同步重试风暴），对目标服务瞬时压力成倍放大；加 ±20% 随机抖动把各重试时刻打散
++            long baseMs = BACKOFF[attempts - 1].toMillis();
++            next = now.plus(Duration.ofMillis((long)((double)baseMs * (0.8D + ThreadLocalRandom.current().nextDouble(0.4D)))));
+         } else {
+             status = "DEAD";
+         }
+diff --git a/a/backend-src/com/dcim/webhook/service/WebhookUrlGuard.java b/b/backend-src/com/dcim/webhook/service/WebhookUrlGuard.java
+index 716a16e..26c1050 100644
+--- a/a/backend-src/com/dcim/webhook/service/WebhookUrlGuard.java
++++ b/b/backend-src/com/dcim/webhook/service/WebhookUrlGuard.java
+@@ -69,7 +69,10 @@ public class WebhookUrlGuard {
+         @Value("${dcim.webhook.allow-private-network:true}") boolean allowPrivate,
+         @Value("${dcim.webhook.blocked-hosts:}") String extraBlocked,
+         @Value("${dcim.webhook.test-allow-loopback:false}") boolean allowLoopback,
+-        @Value("${dcim.webhook.block-local-subnets:false}") boolean blockLocalSubnets
++        // 修复：代码默认值此前为 false，原生部署漏配即失效（仅 Compose 注入 true）。该开关语义是
++        //「禁止推送平台所在网段」，默认开启是安全底线；仅当原生部署且平台与目标系统（如企业内网
++        // OA）确实同网段、并接受相应风险时，才应显式配置为 false 放开。
++        @Value("${dcim.webhook.block-local-subnets:true}") boolean blockLocalSubnets
+     ) {
+         this.localSubnets = blockLocalSubnets ? localInterfaceSubnets() : java.util.List.of();
+         this.allowPrivate = allowPrivate;
+@@ -127,6 +130,9 @@ public class WebhookUrlGuard {
+                                 }
+                             }
+ 
++                            // 注意：返回的 URI 仍含主机名。本方法解析校验过的 IP 与投递方实际连接的 IP
++                            // 之间存在 DNS rebinding TOCTOU 残余风险（HttpClient 建连时会做第二次独立解析），
++                            // 因此投递前必须紧邻 send 重新走一次本方法（见 WebhookService.send 注释）。
+                             return uri;
+                         } else {
+                             throw BusinessException.badRequest("Webhook 目标主机不允许：" + host);
+diff --git a/a/backend-src/com/dcim/workorder/service/WoCompletionService.java b/b/backend-src/com/dcim/workorder/service/WoCompletionService.java
+index 4ce07ef..f71cfe7 100644
+--- a/a/backend-src/com/dcim/workorder/service/WoCompletionService.java
++++ b/b/backend-src/com/dcim/workorder/service/WoCompletionService.java
+@@ -206,10 +206,6 @@ public class WoCompletionService {
+         }
+     }
+ 
+-    public void offlineCrossRegionForTransfer(String woNo) {
+-        this.offlineForTransfer(woNo);
+-    }
+-
+     @Transactional
+     public void onProcessing(String woNo) {
+         WorkorderEntity wo = (WorkorderEntity)this.workorderMapper
+diff --git a/a/backend-src/com/dcim/workorder/service/WorkorderAttachmentService.java b/b/backend-src/com/dcim/workorder/service/WorkorderAttachmentService.java
+index dab69ed..1fd7b4c 100644
+--- a/a/backend-src/com/dcim/workorder/service/WorkorderAttachmentService.java
++++ b/b/backend-src/com/dcim/workorder/service/WorkorderAttachmentService.java
+@@ -163,7 +163,8 @@ public class WorkorderAttachmentService {
+     }
+ 
+     public void delete(String woNo, Long id) {
+-        this.requireWo(woNo);
++        // v3.5：删除附件同样走终态检查（已完成/已关闭冻结，409 提示）
++        this.workorderService.requireUploadableWo(woNo);
+         AttachmentEntity a = this.requireAttachment(woNo, id);
+         LoginUser user = CurrentUser.get();
+         if (user == null) {
+@@ -182,12 +183,8 @@ public class WorkorderAttachmentService {
+     }
+ 
+     private WorkorderEntity requireWo(String woNo) {
+-        WorkorderEntity wo = (WorkorderEntity)this.workorderMapper.selectOne(Wrappers.<WorkorderEntity>lambdaQuery().eq(WorkorderEntity::getWoNo, woNo));
+-        if (wo == null) {
+-            throw BusinessException.notFound("工单不存在：" + woNo);
+-        } else {
+-            return wo;
+-        }
++        // v3.5：复用工单数据范围校验（SELF/DEPT），不可见与不存在同样按 notFound 处理，避免泄露工单存在性
++        return this.workorderService.requireWo(woNo);
+     }
+ 
+     private AttachmentEntity requireAttachment(String woNo, Long id) {
+diff --git a/a/backend-src/com/dcim/workorder/service/WorkorderService.java b/b/backend-src/com/dcim/workorder/service/WorkorderService.java
+index dbccc42..bba66db 100644
+--- a/a/backend-src/com/dcim/workorder/service/WorkorderService.java
++++ b/b/backend-src/com/dcim/workorder/service/WorkorderService.java
+@@ -702,7 +702,7 @@ public class WorkorderService {
+     }
+ 
+     private static boolean isDangerAction(String action) {
+-        return "驳回".equals(action) || "关闭".equals(action) || "重新打开".equals(action) || "退回".equals(action);
++        return "驳回".equals(action) || "关闭".equals(action) || "撤销".equals(action) || "重新打开".equals(action) || "退回".equals(action);
+     }
+ 
+     private String denyReason(WorkorderEntity wo, WorkflowConfigEntity cfg, LoginUser user, String action) {
+@@ -710,6 +710,9 @@ public class WorkorderService {
+             return this.approverDeny(wo, cfg, user);
+         } else if ("关闭".equals(action) && "处理中".equals(wo.getStatus())) {
+             return user.isAdmin() ? null : "仅管理员可关闭工单";
++        } else if ("撤销".equals(action)) {
++            // v3.5：待处理工单仅申请人（或管理员）可撤销
++            return user.isAdmin() || user.username().equals(wo.getApplicantUsername()) ? null : "仅申请人可撤销工单";
+         } else if ("重新打开".equals(action)) {
+             return user.isAdmin() ? null : "仅管理员可重新打开工单";
+         } else {
+@@ -733,7 +736,7 @@ public class WorkorderService {
+         p.put("addItem", editable && related);
+         p.put("remind", !"已关闭".equals(wo.getStatus()) && related);
+         p.put("comment", !"已关闭".equals(wo.getStatus()) && related);
+-        p.put("uploadAtt", !"已关闭".equals(wo.getStatus()) && this.canUpdateWorkorders(user));
++        p.put("uploadAtt", !"已关闭".equals(wo.getStatus()) && !"已完成".equals(wo.getStatus()) && this.canUpdateWorkorders(user));
+         p.put("transfer", canApproveNow);
+         p.put("addApprover", canApproveNow);
+         return p;
+@@ -1452,6 +1455,11 @@ public class WorkorderService {
+                         }
+                     }
+ 
++                    // v3.5：撤销（待处理→已关闭）仅申请人或管理员可执行
++                    if ("撤销".equals(action) && !user.isAdmin() && !user.username().equals(wo.getApplicantUsername())) {
++                        throw BusinessException.forbidden("仅申请人可撤销工单");
++                    }
++
+                     if (rootCause != null && !rootCause.isBlank()) {
+                         checkLen("根因分类", rootCause.trim(), 50);
+                     }
+@@ -1514,6 +1522,7 @@ public class WorkorderService {
+                                 }
+                                 break;
+                             case "关闭":
++                            case "撤销":
+                                 if (rootCause != null && !rootCause.isBlank()) {
+                                     upd.setRootCause(rootCause.trim());
+                                 }
+@@ -1880,7 +1889,7 @@ public class WorkorderService {
+         }
+     }
+ 
+-    private WorkorderEntity requireWo(String woNo) {
++    public WorkorderEntity requireWo(String woNo) {
+         WorkorderEntity wo = (WorkorderEntity)this.workorderMapper.selectOne(Wrappers.<WorkorderEntity>lambdaQuery().eq(WorkorderEntity::getWoNo, woNo));
+         if (wo != null && !this.visibleToCurrentUser(wo)) {
+             wo = null;
+@@ -1910,8 +1919,10 @@ public class WorkorderService {
+ 
+     public WorkorderEntity requireUploadableWo(String woNo) {
+         WorkorderEntity wo = this.requireWo(woNo);
+-        if ("已关闭".equals(wo.getStatus())) {
+-            throw BusinessException.conflict("工单已关闭，不能上传附件：" + woNo);
++        String st = wo.getStatus();
++        // v3.5：已完成与已关闭同为终态，附件冻结（禁止增删）
++        if ("已关闭".equals(st) || "已完成".equals(st)) {
++            throw BusinessException.conflict("工单" + st + "，附件已冻结，不能上传或删除：" + woNo);
+         } else {
+             return wo;
+         }
+diff --git a/a/backend-src/com/dcim/workorder/statemachine/WorkorderStateMachine.java b/b/backend-src/com/dcim/workorder/statemachine/WorkorderStateMachine.java
+index 94f049e..65aca20 100644
+--- a/a/backend-src/com/dcim/workorder/statemachine/WorkorderStateMachine.java
++++ b/b/backend-src/com/dcim/workorder/statemachine/WorkorderStateMachine.java
+@@ -27,6 +27,8 @@ public final class WorkorderStateMachine {
+         Map<String, List<String>> pending = new LinkedHashMap<>();
+         pending.put("开始处理", List.of("处理中"));
+         pending.put("提交审批", List.of("待审批"));
++        // v3.5：补充「待处理→已关闭」撤销路径（仅申请人可撤销，权限在 WorkorderService.transition 校验）
++        pending.put("撤销", List.of("已关闭"));
+         m.put("待处理", pending);
+         Map<String, List<String>> approving = new LinkedHashMap<>();
+         approving.put("审批通过", List.of("待审批", "处理中"));

@@ -1,0 +1,285 @@
+# ============================================================
+# 智算资产管理平台（新基座）— 主配置
+# 默认 profile: dev（本机无 Docker，用 zonky embedded-postgres）
+# 生产: --spring.profiles.active=prod + 环境变量注入数据源
+# ============================================================
+spring:
+  application:
+    name: dcim-platform
+  profiles:
+    default: dev
+  # 空 host 会让 RedisAutoConfiguration 抛 "Host must not be empty"，故排除之；
+  # 配置了 redis 时由 com.dcim.security.RedisClientConfig 按条件装配等价 bean。
+  # UserDetailsServiceAutoConfiguration 同理排除：本项目鉴权走 JwtAuthFilter +
+  # LoginUserLoader，没有 Spring Security 的 UserDetailsService，开着只会凭空
+  # 造一个 user 账号并把随机口令 WARN 进生产日志。
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration,org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+  # 数据库连接池（v3.4 可配置）：默认 20 条 / 实例；借不到连接最多等 10 秒，随后返回 503 + Retry-After，
+  # 而不是让请求线程挂 30 秒。多实例部署时：实例数 × DB_POOL_MAX 须小于 PostgreSQL max_connections（编排里为 200）。
+  datasource:
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX:20}
+      minimum-idle: ${DB_POOL_MIN_IDLE:5}
+      connection-timeout: ${DB_POOL_TIMEOUT_MS:10000}
+      leak-detection-threshold: ${DB_POOL_LEAK_MS:0}
+  # JdbcTemplate 查询兜底超时：报表 / 分析类大查询异常时不至于长期占用连接与锁（单位秒）
+  jdbc:
+    template:
+      query-timeout: ${JDBC_QUERY_TIMEOUT:120}
+  # 定时任务线程池：SLA 升级 / 折旧计提 / 审计保留 / GPU 评分 / Webhook 投递 / 巡检生成
+  # 共用调度器；默认单线程会让一个慢任务（如 Webhook 目标超时）拖住其余全部任务
+  task:
+    scheduling:
+      pool:
+        size: ${SCHEDULING_POOL_SIZE:4}
+      thread-name-prefix: sched-
+  jackson:
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+  data:
+    redis:
+      host: ${REDIS_HOST:}        # 留空则 refresh token 走内存实现（单机 dev 用）
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      # 本项目无任何 Redis repository；开着会让 redisReferenceResolver
+      # 去要被排除的 RedisAutoConfiguration 提供的 redisTemplate，启动必败
+      repositories:
+        enabled: false
+
+server:
+  port: 8081
+  shutdown: graceful
+  # 大响应 gzip（Prometheus 服务发现 10 万级目标约 40MB → 约 3MB；浏览器端由 Caddy/nginx 再压缩亦可）
+  compression:
+    enabled: true
+    mime-types: application/json
+    min-response-size: 64KB
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    cache-enabled: false
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+      logic-delete-field: deletedAt
+      logic-delete-value: "NOW()"
+      logic-not-delete-value: "NULL"
+
+springdoc:
+  api-docs:
+    path: /api-docs
+    # 默认关闭：完整接口清单匿名可读属于信息泄露；本地开发用 SPRINGDOC_ENABLED=true 打开。
+    # 文件末尾的 dev profile 文档块会把它重新置为 true（本机默认 profile 即 dev）。
+    enabled: ${SPRINGDOC_ENABLED:false}
+  swagger-ui:
+    path: /swagger-ui.html
+
+dcim:
+  # 开发联调免密登录（POST /api/auth/wecom/dev-login）
+  # 默认关闭：匿名可按 username 直接签发令牌，等同认证绕过，必须显式 opt-in。
+  # 开启需同时满足：本开关=true、wecom.enabled=false、非 prod profile、仅回环地址。
+  security:
+    # 仅应急：允许使用已知外泄密钥启动（默认拒绝）
+    allow-leaked-secrets: ${DCIM_ALLOW_LEAKED_SECRETS:false}
+  scheduler:
+    cluster-lock:
+      # 多实例部署时定时任务互斥（单实例无副作用）
+      enabled: ${DCIM_SCHEDULER_CLUSTER_LOCK:true}
+      lease-seconds: ${DCIM_SCHEDULER_LOCK_LEASE:600}
+      # v3.5.2：租约上限（秒）——续租不可超过「加锁时刻 + 上限」，持锁实例崩溃后
+      # 锁至多在上限内自愈释放，防止无限续租让已终止实例的锁长期阻塞任务；
+      # 须大于最慢定时任务的执行时长
+      max-lease-seconds: ${DCIM_SCHEDULER_LOCK_MAX_LEASE:1800}
+  auth:
+    dev-login-enabled: ${DCIM_DEV_LOGIN_ENABLED:false}
+    # 首登强制改密的服务端强制（此前仅前端路由守卫生效，可被直接调 API 绕过）
+    enforce-must-change-pwd: ${DCIM_ENFORCE_MUST_CHANGE_PWD:true}
+    # 内置 admin 的初始口令（仅在 users 表为空的首次启动时用一次）。
+    # 留空且 profile=prod → DataInitializer 随机生成并 WARN 打印一次；
+    # 留空且非 prod → 走内置 dev 初始口令（DataInitializer.DEV_INITIAL_PASSWORD，
+    # 仅本地/IT 开箱可用）。生产建议由 .env 显式提供，或留空让它随机生成。
+    admin-initial-password: ${DCIM_ADMIN_INITIAL_PASSWORD:}
+    # 登录防爆破：窗口内失败次数达到上限即 429（键含 IP，避免外部锁死他人账号）
+    login-max-fail-per-account: ${LOGIN_MAX_FAIL_PER_ACCOUNT:10}
+    login-max-fail-per-ip: ${LOGIN_MAX_FAIL_PER_IP:30}
+    login-fail-window-minutes: ${LOGIN_FAIL_WINDOW_MINUTES:15}
+    # v3.4：账号级（跨 IP）失败上限与锁定时长；近 N 天登录成功过的 IP 不受账号锁定影响
+    login-max-fail-per-account-global: ${LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL:30}
+    login-account-lock-minutes: ${LOGIN_ACCOUNT_LOCK_MINUTES:15}
+    login-trusted-ip-days: ${LOGIN_TRUSTED_IP_DAYS:30}
+  # 接口限流（v3.4）：per-minute 为「每 IP 每分钟」粗粒度防洪闸（0 = 关闭全部限流）；
+  # 其余为按用户的令牌桶：普通接口、匿名接口、重操作（导出 / 导入 / 批量）
+  rate-limit:
+    per-minute: ${RATE_LIMIT_PER_MINUTE:3000}
+    enabled: ${RATE_LIMIT_ENABLED:true}
+    user-rps: ${RATE_LIMIT_USER_RPS:20}
+    user-burst: ${RATE_LIMIT_USER_BURST:40}
+    anon-rps: ${RATE_LIMIT_ANON_RPS:10}
+    anon-burst: ${RATE_LIMIT_ANON_BURST:20}
+    heavy-per-minute: ${RATE_LIMIT_HEAVY_PER_MINUTE:10}
+  # 可信反向代理（逗号分隔，支持「单个IP」与「网段/前缀」）：
+  # 仅当 TCP 对端落在这些网段内时，才采信 X-Forwarded-For 作为客户端真实 IP。
+  # 本项目入口是 Caddy，它与 platform-be 同处 Docker 网络，对端地址是容器 IP
+  # （172.x.x.x）而非 127.0.0.1 —— 若只信回环，所有审计 IP 会退化成同一个容器 IP，
+  # 且登录限流的「每 IP 次数」会把全站用户塞进一个桶。
+  # v3.5.2：默认信任面收敛为「回环 + Docker 默认网桥段 172.16.0.0/12」。此前默认
+  # 含全部 RFC1918（10/8、192.168/16），内网客户端直连后端端口时可伪造 XFF 冒充
+  # 任意来源 IP，绕过登录跨 IP 锁定（SE-06）与审计定位。原生部署且网关与后端
+  # 同处 10/8、192.168/16 网段的，需在 .env 显式配置 DCIM_TRUSTED_PROXIES。
+  trusted-proxies: ${DCIM_TRUSTED_PROXIES:127.0.0.0/8,::1/128,172.16.0.0/12}
+  jwt:
+    # 生产必须通过环境变量注入（>= 64 字符随机串），未设置则启动失败
+    secret: ${JWT_SECRET}
+    access-ttl-minutes: 120
+    refresh-ttl-hours: 72
+  cors:
+    allowed-origins: ${CORS_ORIGINS:http://localhost:5173}
+  audit:
+    # 审计异步写入线程池
+    pool-size: 2
+    # 操作日志按月分区：提前创建的未来月数 / 保留月数（到期直接删除，不落归档）
+    ahead-months: ${AUDIT_AHEAD_MONTHS:3}
+    retain-months: ${AUDIT_RETAIN_MONTHS:12}
+    # 登录失败审计写入限流（每分钟上限：账号 / IP，超出只记 WARN 不落库）
+    login-fail-user-per-minute: ${AUDIT_LOGIN_FAIL_USER_MAX:5}
+    login-fail-ip-per-minute: ${AUDIT_LOGIN_FAIL_IP_MAX:30}
+  upload-dir: ${UPLOAD_DIR:./data/uploads}
+  # 附件存储：local=upload-dir 本地目录（dev/IT 默认）/ minio=对象存储（生产）
+  storage:
+    type: ${STORAGE_TYPE:local}
+    minio:
+      endpoint: ${MINIO_ENDPOINT:http://localhost:9000}
+      access-key: ${MINIO_ACCESS_KEY:minioadmin}
+      secret-key: ${MINIO_SECRET_KEY:minioadmin}
+      bucket: ${MINIO_BUCKET:dcim-attachments}
+  # W2 带外凭据加密密钥（base64 的 32 字节 AES 密钥；生产必须环境变量注入）
+  crypto:
+    key: ${DCIM_CRYPTO_KEY}
+    # 密钥轮换：旧密钥（逗号分隔）。配置后启动时自动把旧密文重加密为当前密钥，完成后可移除
+    old-keys: ${DCIM_CRYPTO_KEY_OLD:}
+  collector:
+    # 采集器 agent 鉴权密钥（X-Agent-Key，生产必须环境变量注入）
+    agent-key: ${DCIM_AGENT_KEY}
+    # v3.5.2：带外硬件快照保留天数——SnapshotRetentionJob 每日 02:40 分批清理
+    # 超期快照（≤0 表示不清理）；配套 V47 迁移已建 (asset_id, collected_at) 索引
+    snapshot-retention-days: ${DCIM_COLLECTOR_SNAPSHOT_RETENTION_DAYS:180}
+  ire:
+    # IRE 身份冲突策略：fill=自动以带外为准回填 / manual=冲突留待认领池人工裁决
+    conflict-policy: ${DCIM_IRE_POLICY:manual}
+  metrics:
+    # GPU 指标存储：memory=内存环形缓冲（dev/IT）/ tdengine=taosAdapter REST
+    store: ${DCIM_METRICS_STORE:memory}
+    tdengine:
+      url: ${TDENGINE_URL:http://localhost:6041}
+      username: ${TDENGINE_USERNAME:root}
+      password: ${TDENGINE_PASSWORD:taosdata}
+      database: ${TDENGINE_DATABASE:dcim_metrics}
+  # 监控告警（v3.2）：Prometheus 服务发现与 Alertmanager 告警接入
+  # LDAP / Active Directory 登录（本地账号优先；目录账号首次登录自动开通）
+  ldap:
+    enabled: ${LDAP_ENABLED:false}
+    # ldap://dc01.corp.local:389 或 ldaps://dc01.corp.local:636（生产建议 ldaps）
+    url: ${LDAP_URL:}
+    base-dn: ${LDAP_BASE_DN:}
+    # 只读服务账号（AD 可写 svc-dcim@corp.local 或完整 DN）
+    bind-dn: ${LDAP_BIND_DN:}
+    bind-password: ${LDAP_BIND_PASSWORD:}
+    # AD：(&(objectClass=user)(sAMAccountName={0}))；OpenLDAP：(&(objectClass=inetOrgPerson)(uid={0}))
+    user-filter: ${LDAP_USER_FILTER:(&(objectClass=user)(sAMAccountName={0}))}
+    name-attr: ${LDAP_NAME_ATTR:displayName}
+    email-attr: ${LDAP_EMAIL_ATTR:mail}
+    phone-attr: ${LDAP_PHONE_ATTR:telephoneNumber}
+    department-attr: ${LDAP_DEPARTMENT_ATTR:department}
+    # 组 DN=角色编码，分号分隔；命中时以目录组为准同步角色
+    group-role-map: ${LDAP_GROUP_ROLE_MAP:}
+    # 未命中组映射的新账号默认角色
+    default-role: ${LDAP_DEFAULT_ROLE:VIEWER}
+    auto-create: ${LDAP_AUTO_CREATE:true}
+    timeout-ms: ${LDAP_TIMEOUT_MS:5000}
+  monitoring:
+    # 监控系统接入令牌（Prometheus http_sd 与 Alertmanager webhook 的 Bearer 令牌；为空则拒绝接入）
+    token: ${MONITORING_TOKEN:}
+    # Prometheus 查询地址（平台内资产指标、目标健康、规则清单）
+    prometheus-url: ${PROMETHEUS_URL:}
+    # 活动告警超过多少小时未再收到即自动关闭（Alertmanager 默认每 4h 重推仍在触发的告警）
+    stale-hours: ${ALERT_STALE_HOURS:12}
+    # 已恢复告警保留天数
+    retain-days: ${ALERT_RETAIN_DAYS:180}
+  # 消息推送 / Webhook（v3.1）
+  webhook:
+    # 是否允许推送到内网地址（企业内网 OA/告警平台通常在 10.x/172.16.x/192.168.x）；
+    # 回环、链路本地（含云元数据 169.254.169.254）、本栈容器服务名始终禁止
+    allow-private-network: ${WEBHOOK_ALLOW_PRIVATE:true}
+    # 额外禁止的主机名（逗号分隔）
+    blocked-hosts: ${WEBHOOK_BLOCKED_HOSTS:}
+    # 禁止推送到平台自身网卡所在网段（容器部署时 = dcim-network，防止按 IP 打其它容器）。
+    # 修复：默认值此前为 false（仅 Compose 注入 true），原生部署漏配即失效；改为默认开启（安全底线）。
+    # 关闭的适用场景：原生部署且平台与目标系统（如企业内网 OA）确实同网段、并接受相应风险时显式置 false。
+    block-local-subnets: ${WEBHOOK_BLOCK_LOCAL_SUBNETS:true}
+    # 连续失败多少次自动停用端点并通知管理员
+    auto-disable-after-failures: ${WEBHOOK_AUTO_DISABLE:50}
+    # 投递记录保留天数（成功/死信）
+    retain-days: ${WEBHOOK_RETAIN_DAYS:30}
+  gpu:
+    # 健康度评分调度间隔（毫秒，默认 1h）
+    score-fixed-delay-ms: ${GPU_SCORE_DELAY_MS:3600000}
+  # 实时推送 SSE（v3.5）：站内信按用户推送、领域事件按频道广播。
+  # enabled=false 时端点返回 503，前端自动降级 30s 轮询（回到 3.4 行为）。
+  # 心跳为自建守护线程（不走 @Scheduled，避免被集群锁拦成单实例心跳）。
+  sse:
+    enabled: ${SSE_ENABLED:true}
+    # 每实例最大并发连接（防 fd / 内存耗尽，超限 503 触发前端降级轮询）
+    max-connections-per-instance: ${SSE_MAX_CONNECTIONS:200}
+    # 心跳间隔毫秒（注释帧 :ping 维持中间层不掐空闲连接）
+    heartbeat-ms: ${SSE_HEARTBEAT_MS:25000}
+  # 联动闭环（v3.5）
+  linkage:
+    # 盘点完成存在差异 → 自动生成「盘点差异」工单（与完成同事务，建单失败则整体回滚）
+    inventory-diff-ticket:
+      enabled: ${INVENTORY_DIFF_TICKET_ENABLED:true}
+    # 低库存联动：off=仅原有 webhook 事件 / notify=站内信通知仓库管理员 / ticket=通知并自动创建补货工单
+    low-stock:
+      mode: ${LOW_STOCK_MODE:notify}
+      # ticket 模式创建的工单类型（须存在于 workflow_config）
+      wo-type: ${LOW_STOCK_WO_TYPE:补货}
+
+# 企微扫码登录（默认关闭：不装配 HttpWecomApiClient、不外呼）
+# 开启后 /api/auth/wecom/login 走真实企微 OAuth，dev-login 强制 403（安全红线）
+wecom:
+  enabled: ${WECOM_ENABLED:false}
+  corp-id: ${WECOM_CORP_ID:}
+  agent-id: ${WECOM_AGENT_ID:}
+  secret: ${WECOM_SECRET:}
+
+# ============================================================
+# profile=dev 覆盖块（必须放在文件末尾：YAML 多文档中，分隔符之后的所有内容
+# 只在对应 profile 激活时才生效 —— 若把它插在文件中间，后续的 dcim:/wecom:
+# 等主配置会一并落进 dev 文档，导致 prod/it 启动时找不到 dcim.* 属性）。
+# 本机默认 profile 即 dev（见文件头 spring.profiles.default）。
+# ============================================================
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+springdoc:
+  api-docs:
+    enabled: ${SPRINGDOC_ENABLED:true}
+dcim:
+  jwt:
+    secret: ${JWT_SECRET:dev-only-secret-key-change-me-in-production-0123456789abcdef-0123456789abcdef}
+  crypto:
+    key: ${DCIM_CRYPTO_KEY:ZGNpbS13Mi1kZWZhdWx0LWFlczI1Ni1rZXktMzJieCE=}
+  collector:
+    agent-key: ${DCIM_AGENT_KEY:dev-agent-key}

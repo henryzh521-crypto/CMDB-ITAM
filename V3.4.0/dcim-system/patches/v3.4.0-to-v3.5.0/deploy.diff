@@ -1,0 +1,555 @@
+diff --git a/pkg/README.md b/pkg/README.md
+index 773df06..6d8476a 100644
+--- a/pkg/README.md
++++ b/pkg/README.md
+@@ -1,15 +1,15 @@
+-# 智算资产管理平台 v3.4.0 安装包
++# 智算资产管理平台 v3.5.0 安装包
+ 
+ ```bash
+ ./install.sh                                   # 全新安装（Docker Compose）
+-./dcimctl upgrade /path/to/本安装包目录          # 在旧版本目录执行，从 v3.2 / v3.3 升级
++./dcimctl upgrade /path/to/本安装包目录          # 在旧版本目录执行，从 v3.2 / v3.3 / v3.4 升级
+ ./install.sh --native                          # 原生部署（systemd + 已有 PostgreSQL/Redis）
+ ```
+ 
+-- **升级前请先阅读 `docs/UPGRADE-3.4.md` 第一节**：非管理员角色的「删除」勾选会被复位，需管理员按需重新授予。
+-- 从 v3.2.0 升级的，还需阅读 `docs/UPGRADE-3.3.md` 第一节（v3.2.0 安装包密钥外泄与轮换）。
++- **升级前请先阅读 `docs/UPGRADE-3.5.md` 第一节**：本版新增联动与 SSE 的配置开关、反向代理需为 `/api/notifications/sse` 关闭缓冲。
++- 从 v3.4.0 升级的：v3.4 的注意事项见 `docs/UPGRADE-3.4.md`（非管理员角色的「删除」勾选会被复位）；从 v3.2.0 升级的，还需阅读 `docs/UPGRADE-3.3.md` 第一节（v3.2.0 安装包密钥外泄与轮换）。
+ - 安装包不含任何密钥、证书和运行数据；`deploy/.env` 与自签证书在安装时随机生成。
+-- 运维命令：`./dcimctl help`；升级后自检：`ADMIN_PW=... EXPECT_VERSION=3.4.0 python3 tests/run_all.py -s smoke`
++- 运维命令：`./dcimctl help`；升级后自检：`ADMIN_PW=... EXPECT_VERSION=3.5.0 python3 tests/run_all.py -s smoke`
+ 
+ | 目录 | 内容 |
+ |---|---|
+@@ -18,7 +18,7 @@
+ | `scripts/` | 备份 / 恢复 / 恢复演练 / 密钥工具 |
+ | `platform-web/` | 前端源码 |
+ | `source/backend/` | 后端源码（见其中 README） |
+-| `patches/v3.3.0-to-v3.4.0/` | 相对 v3.3.0 的改动补丁（后端 / 前端 / 部署 / 测试） |
+-| `tests/` | 回归测试套件：9 个套件 80 个用例，见 `tests/README.md` |
+-| `docs/` | 用户手册、升级说明（UPGRADE-3.4.md）、本版回归测试报告（TEST-REPORT-3.4.md） |
++| `patches/v3.4.0-to-v3.5.0/` | 相对 v3.4.0 的改动补丁（后端 / 前端 / 部署 / 测试）；更早版本见 `patches/v3.3.0-to-v3.4.0/` |
++| `tests/` | 回归测试套件：9 个套件 92 个用例，见 `tests/README.md` |
++| `docs/` | 用户手册、升级说明（UPGRADE-3.5.md）、本版回归测试报告（TEST-REPORT-3.5.md） |
+ | `SHA256SUMS` | 全部文件的校验和：`sha256sum -c SHA256SUMS` |
+diff --git a/pkg/VERSION b/pkg/VERSION
+index 1809198..1545d96 100644
+--- a/pkg/VERSION
++++ b/pkg/VERSION
+@@ -1 +1 @@
+-3.4.0
++3.5.0
+diff --git a/pkg/deploy/.env.example b/pkg/deploy/.env.example
+index 73715ec..9dcf86c 100644
+--- a/pkg/deploy/.env.example
++++ b/pkg/deploy/.env.example
+@@ -1,5 +1,5 @@
+ # ============================================================
+-# deploy/.env —— 智算资产管理平台 v3.3 运行配置
++# deploy/.env —— 智算资产管理平台 v3.5 运行配置
+ #
+ # 推荐：直接运行 ./install.sh，安装程序会自动生成本文件并填入随机强密钥（权限 0600）。
+ # 手工配置：cp deploy/.env.example deploy/.env，把所有 CHANGEME 替换成真实值。
+@@ -7,7 +7,7 @@
+ # ============================================================
+ 
+ # ── 版本 / 镜像 ────────────────────────────────────────────
+-DCIM_VERSION=3.4.0
++DCIM_VERSION=3.5.0
+ # 公共镜像的仓库前缀（Docker Hub 镜像站或内网私有仓库），例：docker.m.daocloud.io / registry.local:5000
+ IMAGE_REGISTRY=docker.m.daocloud.io
+ BACKEND_BASE_IMAGE=docker.m.daocloud.io/library/eclipse-temurin:17-jre
+@@ -97,6 +97,18 @@ BACKUP_RETENTION_DAYS=30
+ # 采集器
+ AGENT_POLL_INTERVAL_SEC=15
+ AGENT_MOCK=false
++# 实时推送 SSE（v3.5）：站内信与工单/告警事件实时下发；enabled=false 时前端自动降级 30s 轮询
++SSE_ENABLED=true
++# 每实例最大并发连接（超限 503 触发前端降级轮询；多实例部署时每实例独立计数）
++SSE_MAX_CONNECTIONS=200
++# 心跳间隔毫秒（注释帧维持反向代理不掐空闲连接）
++SSE_HEARTBEAT_MS=25000
++# 联动闭环（v3.5）：盘点完成存在差异时自动生成「盘点差异」工单（与完成同事务，失败整体回滚）
++INVENTORY_DIFF_TICKET_ENABLED=true
++# 低库存联动：off=仅原有 webhook 事件 / notify=站内信通知仓库管理员 / ticket=通知并自动创建补货工单
++LOW_STOCK_MODE=notify
++# ticket 模式创建的工单类型（须存在于 workflow_config）
++LOW_STOCK_WO_TYPE=补货
+ 
+ # ── 企业微信扫码登录（可选）────────────────────────────────
+ WECOM_ENABLED=false
+diff --git a/pkg/deploy/Caddyfile/Caddyfile b/pkg/deploy/Caddyfile/Caddyfile
+index 836e609..da568dd 100644
+--- a/pkg/deploy/Caddyfile/Caddyfile
++++ b/pkg/deploy/Caddyfile/Caddyfile
+@@ -1,5 +1,5 @@
+ # ============================================================
+-# deploy/Caddyfile — 智算资产管理平台 v3.3 统一入口
++# deploy/Caddyfile — 智算资产管理平台 v3.5 统一入口
+ #
+ # 分流规则：
+ #   /api/*    → platform-be:8081   后端（后端挂在 /api 前缀，不去前缀）
+@@ -14,8 +14,24 @@
+ 
+ # ── 路由片段：被下方站点块 import（改这里即可同时生效于 HTTP 与 HTTPS）──
+ (dcim_routes) {
+-	# 压缩 API JSON 与静态资源（前端 nginx 已压缩的不会重复压缩）
+-	encode zstd gzip
++	# 压缩 API JSON 与静态资源（前端 nginx 已压缩的不会重复压缩）。
++	# v3.5：SSE 路径（/api/notifications/sse）排除压缩——text/event-stream 流式响应
++	# 不能进入压缩缓冲，心跳（25s :ping）与广播帧依赖即时 flush。
++	@compressable not path /api/notifications/sse
++	encode @compressable zstd gzip
++
++	# ── SSE 实时推送（v3.5）：/api/notifications/sse ──
++	# 必须放在 /api/* 之前（更长前缀优先匹配）：
++	#   · flush_interval -1 关闭响应缓冲，心跳（25s :ping）与广播帧到达即转发；
++	#   · 长连接不走 request_body 限制；不参与压缩（上方 match 已排除 event-stream）。
++	handle /api/notifications/sse {
++		reverse_proxy platform-be:8081 {
++			header_up X-Real-IP {remote_host}
++			header_up X-Forwarded-For {remote_host}
++			header_up X-Forwarded-Proto {scheme}
++			flush_interval -1
++		}
++	}
+ 
+ 	# ── 后端 API：/api/* 原样反代（后端就是 /api，不 Strip）──
+ 	handle /api/* {
+@@ -74,7 +90,16 @@
+ 			roll_size 50mb
+ 			roll_keep 5
+ 		}
+-		format json
++		# SSE 建连 token 走 query（EventSource 无法携带 Authorization 头），
++		# JWT 不得落盘：日志里删除该参数，其余 query 参数保留（分页/筛选排查仍可用）
++		format filter {
++			wrap json
++			fields {
++				request>uri query {
++					delete token
++				}
++			}
++		}
+ 	}
+ }
+ 
+@@ -99,7 +124,15 @@
+ 			roll_size 50mb
+ 			roll_keep 5
+ 		}
+-		format json
++		# 同 :80 站点：SSE token 走 query，日志中删除该参数，JWT 不落盘
++		format filter {
++			wrap json
++			fields {
++				request>uri query {
++					delete token
++				}
++			}
++		}
+ 	}
+ }
+ 
+diff --git a/pkg/deploy/docker-compose.yml b/pkg/deploy/docker-compose.yml
+index 2ac4bee..dedc44d 100644
+--- a/pkg/deploy/docker-compose.yml
++++ b/pkg/deploy/docker-compose.yml
+@@ -1,5 +1,5 @@
+ # ============================================================
+-# 智算资产管理平台 v3.3 — Docker Compose 生产部署
++# 智算资产管理平台 v3.5 — Docker Compose 生产部署
+ #
+ # 服务：postgres / redis / minio / tdengine / platform-be / platform-web /
+ #       caddy（统一入口 80/443）/ collector-agent / backup（定时备份 + 每周恢复验证）
+@@ -197,7 +197,7 @@ services:
+       dockerfile: deploy/docker/backend.Dockerfile
+       args:
+         BASE_IMAGE: ${BACKEND_BASE_IMAGE:-docker.m.daocloud.io/library/eclipse-temurin:17-jre}
+-    image: dcim-platform-be:${DCIM_VERSION:-3.4.0}
++    image: dcim-platform-be:${DCIM_VERSION:-3.5.0}
+     container_name: dcim-platform-be
+     depends_on:
+       postgres:
+@@ -302,7 +302,7 @@ services:
+       dockerfile: deploy/docker/web.Dockerfile
+       args:
+         BASE_IMAGE: ${WEB_BASE_IMAGE:-docker.m.daocloud.io/library/nginx:1.27-alpine}
+-    image: dcim-platform-web:${DCIM_VERSION:-3.4.0}
++    image: dcim-platform-web:${DCIM_VERSION:-3.5.0}
+     container_name: dcim-platform-web
+     security_opt:
+       - seccomp:unconfined   # 应用容器已启用 no-new-privileges；默认 seccomp 在老 Docker 上会让 Java 线程创建失败
+@@ -327,7 +327,7 @@ services:
+       dockerfile: Dockerfile
+       args:
+         BASE_IMAGE: ${AGENT_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim}
+-    image: dcim-collector-agent:${DCIM_VERSION:-3.4.0}
++    image: dcim-collector-agent:${DCIM_VERSION:-3.5.0}
+     container_name: dcim-collector-agent
+     # 默认随栈启动（.env 中 COMPOSE_PROFILES=collector）；采集器部署在其他管理节点时去掉该值即可
+     profiles: ["collector"]
+diff --git a/pkg/deploy/native/nginx-dcim.conf b/pkg/deploy/native/nginx-dcim.conf
+index f6d6784..f37e637 100644
+--- a/pkg/deploy/native/nginx-dcim.conf
++++ b/pkg/deploy/native/nginx-dcim.conf
+@@ -31,6 +31,22 @@ server {
+         proxy_read_timeout 120s;
+     }
+ 
++    # SSE 实时推送（v3.5）：精确匹配优先于 /api/ 前缀。
++    # proxy_buffering off 关闭响应缓冲，心跳（25s :ping）与广播帧到达即转发；
++    # HTTP/1.1 + 空 Connection 头保持长连接；读超时 24h（心跳每 25s 一次，天然保活）。
++    location = /api/notifications/sse {
++        proxy_pass http://127.0.0.1:8081;
++        proxy_http_version 1.1;
++        proxy_set_header Connection '';
++        proxy_set_header Host $http_host;
++        proxy_set_header X-Real-IP $remote_addr;
++        proxy_set_header X-Forwarded-For $remote_addr;
++        proxy_set_header X-Forwarded-Proto $scheme;
++        proxy_buffering off;
++        proxy_cache off;
++        proxy_read_timeout 24h;
++    }
++
+     location ~* ^/assets/.+\.(js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|otf|eot)$ {
+         expires 30d;
+         add_header Cache-Control "public, immutable";
+diff --git a/pkg/docs/TEST-REPORT-3.5.md b/pkg/docs/TEST-REPORT-3.5.md
+new file mode 100644
+index 0000000..cf69428
+--- /dev/null
++++ b/pkg/docs/TEST-REPORT-3.5.md
+@@ -0,0 +1,165 @@
++# v3.5.0 回归测试报告
++
++- 时间：2026-10-10 14:00（8 套件回归批次 1010134801b66d，用时 254 秒；安装包检查对包构建目录运行）
++- 被测：混合打包后端 dcim-platform-3.5.0.jar（1,553,077 字节，与安装包内 jar 的 SHA-256 一致），双实例（8081/8082，LOW_STOCK_MODE=ticket）共用 PostgreSQL 16 + Redis；前端为安装包内构建产物；库内 100,102 台资产
++- 结果：8 套件 84 项：通过 83 · 失败 0 · 错误 0 · 跳过 1；安装包检查 8 项：通过 7 · 跳过 1。合计 92 项：通过 90 · 跳过 2（CL-06 需 SLOW=1 的慢测、DP-04 需 POSIX 权限位，均非产品问题）
++- 复跑：见 tests/README.md
++
++## 交付期修复与复测（2026-10-10）
++
++### 产品缺陷
++
++1. **低库存联动被 Webhook 订阅门控（P0，CT-13 回归发现）**：`WebhookDispatcher` 在「无启用的端点订阅该事件」时提前返回，低库存联动（站内信 / 自动补货单）在门控之后的代码块内随之整体失效——未配置 Webhook 的部署里 `LOW_STOCK_MODE` 形同虚设。修复：`stock.movement` 事件豁免订阅门控，联动只由模式开关决定（无订阅时入队自然空转，仅多一条端点 SELECT，其余事件类型的跳过优化不变）。复测：CT-13 通过（ticket 模式自动建补货单 + 幂等校验）、CL-08 通过（双实例并发出库，全库仅一张补货单）。
++2. **SSE 连接表项泄漏**：`SseConnectionRegistry.quietComplete` 只捕获 RuntimeException，客户端半开连接触发的 IO Error 逃逸后连接表项不回收，最终挤占 200 连接 / 实例上限。修复：捕获范围扩大到 Exception，并为 SseEmitter 设 24 小时超时兜底。复测：CC-07 通过（20 路建连 → 断开回收 → 再建连两轮 + 3/3 广播）。
++3. **接口限流误伤 SSE 建连**：突发限流按请求数计，SSE 建连易被 429 拒绝。修复：`UserRateLimitFilter` 豁免 SSE 建连路径。复测：CC-07 20 路建连全部成功。
++4. **监控总览无缓存全表扫描（PERF-08）**：`countMonitoredAssets` 每请求全表计数、`targetHealth` 逐目标统计。修复：分别加 60s / 30s 缓存，并对相关表 ANALYZE。复测：PERF-08 p50 53 ms → 9 ms（预算 120 ms）。
++5. **资产列表深分页 OFFSET 扫描（PERF-02）**：第 4000 页需跳过约 2.8 万行。修复：两段式查询（先按游标定位页内主键，再按主键取行）。复测：p50 38 ms → 27 ms（预算 100 ms）。
++
++### 测试套件缺陷（方法学，非产品问题）
++
++6. **SSE 用例双生成器假超时**：CT-15 / CC-07 / CL-07 原以两个生成器读同一响应，闲置生成器持有的响应对象被 GC 时 urllib3 关闭底层连接，另一生成器读到连接重置表现为超时。修复：单生成器消费全部事件帧。复测：三套件全绿。
++7. **UI-07 选择器二义性**：布局铃铛下拉与通知中心页各有一个「全部已读」按钮，Playwright strict mode 报错。修复：选择器限定 `.noti-toolbar` 工具栏。复测：通过。
++8. **UI-08 视口不足**：看板 6 列（每列 280px）在 1440 宽视口下「已关闭」列溢出可视区，拖拽 drop 落空。修复：用例视口调整为 1920×900。复测：合法拖拽生效、非法移动回弹并提示，均通过。
++
++### 环境要求明确
++
++9. **CORS_ORIGINS 须包含浏览器实际访问源**：默认白名单仅 `http://localhost:5173`；经反向代理或以其他主机名 / 地址访问而未配置对应 Origin 时，浏览器登录 POST（必带 Origin 头）会被 CorsFilter 以 403 拒绝（curl 不带 Origin 头故不易察觉）。`deploy/.env.example` 已注明按实际访问地址配置。
++
++## 冒烟（smoke）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| SM-01 | 健康检查返回 up 且报告后端版本 | P0 | ✅ 通过 | 版本 3.5.0 |
++| SM-02 | 匿名访问健康检查不返回 JVM / 连接池明细 | P1 | ✅ 通过 |  |
++| SM-03 | 管理员能登录并取得当前用户、模块、操作与字段权限 | P0 | ✅ 通过 |  |
++| SM-04 | OpenAPI 中全部无路径参数的 GET 接口不返回 5xx | P0 | ✅ 通过 | 113 个接口；依赖未配置而降级 2 个：/api/monitoring/rules（未配置 Prometheus 地址（监控设置 / dcim.）、/api/monitoring/sd（未配置监控接入令牌 dcim.monitoring.toke） |
++| SM-05 | 未登录访问业务接口返回 401 | P0 | ✅ 通过 |  |
++
++## 接口契约（contract）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| CT-01 | OpenAPI 文档结构有效、版本与后端一致、operationId 不重复 | P1 | ✅ 通过 | 347 个操作 |
++| CT-02 | 写接口都声明了所需权限（x-permission），例外须在白名单 | P0 | ✅ 通过 | 白名单内 18 个 |
++| CT-03 | 工单建单入参别名都在文档中声明（relatedAssets 的 x-aliases） | P1 | ✅ 通过 |  |
++| CT-04 | 统一响应结构 {code, msg, data}：成功 code=0，失败 code=HTTP 状态 | P0 | ✅ 通过 |  |
++| CT-05 | 缺必填字段返回 400 且提示字段 | P1 | ✅ 通过 |  |
++| CT-06 | 工单关联资产：11 种常见写法全部落库（assetNos 回归） | P0 | ✅ 通过 |  |
++| CT-07 | 认不出的资产字段返回 400，不静默丢弃 | P0 | ✅ 通过 |  |
++| CT-08 | PUT 更新工单可整体替换关联资产；已关闭工单返回 409 | P1 | ✅ 通过 |  |
++| CT-09 | 删除工单最后一条资产行后 relatedAssets 清空 | P1 | ✅ 通过 |  |
++| CT-10 | 唯一键冲突返回 409 并指出字段 | P1 | ✅ 通过 |  |
++| CT-11 | v3.5 新事件 workorder.sla_escalated / inventory.diff 可被 Webhook 订阅，未知事件仍被拒 | P1 | ✅ 通过 | 两个 v3.5 新事件均已登记事件目录 |
++| CT-12 | 物料盘点盘亏：完成任务自动生成「盘点差异」工单且明细正确 | P0 | ✅ 通过 | 差异工单 WO-20261010-0331（关联物料 MAT-CT35-31FD8FDE） |
++| CT-13 | 低库存出库触发联动：ticket 模式自动建补货单且不重复；notify 模式仓库管理员收站内信 | P0 | ✅ 通过 | ticket 模式：补货单 WO-20261010-0332，幂等校验通过 |
++| CT-14 | SLA 超时升级补发 workorder.sla_escalated 事件并进入 Webhook 发件箱 | P1 | ✅ 通过 | 投递记录 #233 + 站内信 #83 |
++| CT-15 | SSE 端点契约：无 token 401；建连发 connected 帧；工单事件按频道实时广播 | P0 | ✅ 通过 | connected 帧 + workorder 频道广播均正常 |
++
++## 权限矩阵（permission）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| PM-01 | 只读角色：可查资产、不能新建资产 | P0 | ✅ 通过 |  |
++| PM-02 | 未授予模块：访问工单返回 403 | P0 | ✅ 通过 |  |
++| PA-01 | 未授予删除：删除 / 批量删除资产返回 403 并说明原因 | P0 | ✅ 通过 |  |
++| PA-02 | 显式授予删除：可删除待上架资产；/auth/me 的 actions 同步 | P0 | ✅ 通过 |  |
++| PA-03 | 导出被禁止：资产导出、工单导出都返回 403 | P1 | ✅ 通过 |  |
++| PS-01 | 工单 SELF：列表只含本人相关，他人工单详情 404 | P0 | ✅ 通过 |  |
++| PS-02 | 工单 DEPT：可见同部门同事的工单，不可见其他部门 | P1 | ✅ 通过 |  |
++| PS-03 | 资产 SELF：按编号导出也不能拿到他人资产（v3.3 绕过修复） | P0 | ✅ 通过 |  |
++| PF-01 | 读：列表、详情、子资产、变更记录剔除隐藏字段，并声明 X-Field-Hidden | P0 | ✅ 通过 |  |
++| PF-02 | 写：原样回传只读字段可保存；改动只读或隐藏字段返回 403；新建带隐藏字段 403 | P0 | ✅ 通过 |  |
++| PF-03 | 写：批量修改与状态流转里出现受限字段返回 403 | P1 | ✅ 通过 |  |
++| PF-04 | 导出不含隐藏列 | P0 | ✅ 通过 |  |
++| PF-05 | 搜索：不能用隐藏的 SN / 管理 IP 反查资产；不能按隐藏字段筛选 | P0 | ✅ 通过 |  |
++| PF-06 | 有字段限制的角色不能批量导入 | P1 | ✅ 通过 |  |
++| PF-07 | 工单：费用与附件隐藏；改只读的描述 / 关联资产返回 403 | P0 | ✅ 通过 |  |
++| PF-08 | 多角色合并：另一个角色未隐藏 SN，则 SN 可见（取最宽） | P1 | ✅ 通过 |  |
++| PF-09 | 管理员不受字段规则约束 | P1 | ✅ 通过 |  |
++| PF-10 | 角色保存：未知字段 / 未支持模块返回 400 | P2 | ✅ 通过 |  |
++| PC-01 | 非管理员不能把自己没有的删除权限授出去（新建角色 / 分配已有角色） | P0 | ✅ 通过 |  |
++| PC-02 | 非管理员不能授出比自己宽的数据范围或更松的字段规则 | P0 | ✅ 通过 |  |
++
++## 安全回归（security）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| SE-01 | 系统管理写权限用户不能给自己授予管理员、不能重置 / 停用 admin | P0 | ✅ 通过 |  |
++| SE-02 | 退出登录后旧 access token 立即失效 | P0 | ✅ 通过 |  |
++| SE-03 | 改密后该账号所有旧 access token 失效 | P0 | ✅ 通过 |  |
++| SE-04 | 同一 refresh token 16 路并发只能换发一次 | P0 | ✅ 通过 |  |
++| SE-05 | 登录耗时不暴露用户名是否存在 | P1 | ✅ 通过 | 存在 93 ms / 不存在 90 ms |
++| SE-06 | 账号跨 IP 失败 30 次即锁定：新 IP 被拒、可信 IP 不受影响、管理员可解锁 | P0 | ✅ 通过 |  |
++| SE-07 | 接口限流：同一用户瞬时请求超出突发上限返回 429 + Retry-After，稍后恢复 | P1 | ✅ 通过 | 77/120 被限流 |
++| SE-08 | 重操作限流：同一用户每分钟导出超过 10 次返回 429 | P2 | ✅ 通过 |  |
++| SE-09 | 审计：新建类操作记录对象号，返回值能序列化 | P1 | ✅ 通过 |  |
++| SE-10 | Webhook 不能指向平台内部的监控栈 | P0 | ✅ 通过 |  |
++
++## 并发正确性（concurrency）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| CC-01 | 8 路并发录入同一 SN：1 个成功，其余 409，无 500 | P0 | ✅ 通过 |  |
++| CC-02 | 同一版本号并发修改资产：只有 1 个成功，其余 409 | P0 | ✅ 通过 |  |
++| CC-03 | 8 路并发流转同一工单：只有 1 个成功，无 500 | P1 | ✅ 通过 |  |
++| CC-04 | 8 路并发给同一工单添加同一资产：只建 1 行 | P1 | ✅ 通过 |  |
++| CC-05 | 40 路并发建单（超过连接池默认 20）：全部成功且工单号不重复 | P0 | ✅ 通过 |  |
++| CC-06 | 有 Webhook 订阅时 30 路并发建单：全部成功，每张工单恰好一条投递记录 | P0 | ✅ 通过 | 30 条投递记录与 30 张工单一一对应 |
++| CC-07 | 20 路 SSE 并发：全部建连成功、收到心跳与广播、断开后连接可回收再建 | P0 | ✅ 通过 | 20 建连 + 心跳 + 2×20 建断回收 + 3/3 广播全部正常 |
++
++## 性能基线（performance）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| PERF-01 | 资产列表第 1 页 p50 ≤ 60 ms | P1 | ✅ 通过 | p50 20 ms / p90 22 ms（预算 60 ms） |
++| PERF-02 | 资产列表深分页（第 4000 页） p50 ≤ 100 ms | P1 | ✅ 通过 | p50 27 ms / p90 29 ms（预算 100 ms） |
++| PERF-03 | 资产关键字搜索 p50 ≤ 80 ms | P1 | ✅ 通过 | p50 22 ms / p90 24 ms（预算 80 ms） |
++| PERF-04 | 全局搜索（IP 片段） p50 ≤ 120 ms | P1 | ✅ 通过 | p50 59 ms / p90 65 ms（预算 120 ms） |
++| PERF-05 | 工单列表 p50 ≤ 60 ms | P1 | ✅ 通过 | p50 16 ms / p90 17 ms（预算 60 ms） |
++| PERF-06 | 运营总览（缓存） p50 ≤ 60 ms | P1 | ✅ 通过 | p50 9 ms / p90 11 ms（预算 60 ms） |
++| PERF-07 | 容量-机房（缓存） p50 ≤ 60 ms | P1 | ✅ 通过 | p50 8 ms / p90 10 ms（预算 60 ms） |
++| PERF-08 | 监控总览 p50 ≤ 120 ms | P1 | ✅ 通过 | p50 9 ms / p90 10 ms（预算 120 ms） |
++| PERF-20 | 资产列表 20 路并发（10 个用户）吞吐 ≥ 80 req/s、无错误 | P1 | ✅ 通过 | 280 req/s |
++| PERF-21 | 20 条活跃 SSE 连接下资产列表 p50 ≤ 60 ms（推送常开不拖累查询） | P1 | ✅ 通过 | SSE×20 常开下 p50 22 ms / p90 23 ms |
++
++## 浏览器端到端（e2e）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| UI-01 | 管理员登录后运营总览渲染，无 5xx、无脚本错误 | P0 | ✅ 通过 |  |
++| UI-02 | 通过界面创建带关联资产的工单，后端行项目正确落库 | P0 | ✅ 通过 |  |
++| UI-03 | 字段受限用户：资产列表不显示隐藏列，没有删除 / 导入按钮 | P0 | ✅ 通过 |  |
++| UI-04 | 角色编辑页可配置字段权限并保存 | P1 | ✅ 通过 |  |
++| UI-05 | 接口文档页可浏览，关于对话框显示前后端版本一致 | P2 | ✅ 通过 |  |
++| UI-06 | 暗色模式刷新后保持 | P2 | ✅ 通过 |  |
++| UI-07 | 通知中心：实时到达、红点、列表、全部已读、点击跳转工单 | P0 | ✅ 通过 |  |
++| UI-08 | 工单看板：拖拽流转生效，非法移动（处理中→已关闭）卡片回弹并提示 | P1 | ✅ 通过 |  |
++| UI-09 | 网络拓扑：全量图渲染、图例可勾选、机房过滤不报错 | P1 | ✅ 通过 |  |
++
++## 多实例一致性（cluster）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| CL-01 | 两个实例运行同一版本 | P0 | ✅ 通过 |  |
++| CL-02 | 在实例 A 退出登录，实例 B 立即拒绝旧令牌 | P0 | ✅ 通过 |  |
++| CL-03 | 管理员在实例 A 停用账号，该账号在实例 B 的会话立即失效 | P0 | ✅ 通过 |  |
++| CL-04 | 登录失败计数跨实例累计：A、B 各失败 15 次后账号锁定 | P0 | ✅ 通过 |  |
++| CL-05 | 同一用户的限流额度跨实例共享 | P1 | ✅ 通过 | 放行 44/120，用时 0.3 秒 |
++| CL-06 | 定时任务每周期只在一个实例上执行（job_lock.run_count） | P0 | ⏭ 跳过 | 耗时约 3 分钟，设置 SLOW=1 运行 |
++| CL-07 | SSE 跨实例：实例 A 产生的工单事件 3 秒内到达实例 B 的连接（Redis pub/sub） | P0 | ✅ 通过 | 跨实例送达 0.03s |
++| CL-08 | 双实例并发出库触发低库存：全库仅生成一张补货工单（跨实例幂等） | P0 | ✅ 通过 | 补货单 WO-20261010-0418，跨实例幂等成立 |
++
++## 安装包检查（deploy）
++
++对包构建目录运行（与最终 tar.gz 内容一致）：
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| DP-01 | 全部 shell 脚本语法正确 | P0 | ✅ 通过 | 12 个脚本 |
++| DP-02 | docker-compose.yml 在两种 seccomp 设置下都能通过校验 | P0 | ✅ 通过 |  |
++| DP-03 | 安装包里没有 .env、私钥、数据目录 | P0 | ✅ 通过 |  |
++| DP-04 | 没有全局可写文件，脚本可执行 | P1 | ⏭ 跳过 | Windows 文件系统无 POSIX 权限位（发布门禁在 Linux 上执行） |
++| DP-05 | 版本号一致：VERSION、后端包名、.env.example、compose 默认值 | P0 | ✅ 通过 | v3.5.0 |
++| DP-06 | 已发布的数据库迁移未被改动（与登记的校验和一致） | P0 | ✅ 通过 | 已登记 46 个，当前 46 个 |
++| DP-07 | 启动脚本在新旧 jar 并存时选版本最高的 | P0 | ✅ 通过 |  |
++| DP-08 | Prometheus 未开启远程生命周期接口，热加载用 SIGHUP | P1 | ✅ 通过 |  |
+diff --git a/pkg/docs/UPGRADE-3.5.md b/pkg/docs/UPGRADE-3.5.md
+new file mode 100644
+index 0000000..5c7fbf0
+--- /dev/null
++++ b/pkg/docs/UPGRADE-3.5.md
+@@ -0,0 +1,132 @@
++# 智算资产管理平台 v3.5.0 升级说明
++
++v3.5.0 以**联动闭环、SSE 实时推送、可视化增强与事件结构强化**为主。可从 v3.2.x / v3.3.x / v3.4.x 直接升级。
++全部改动经 `tests/` 下 92 个自动化用例（9 个套件）在 10 万资产环境上回归通过。
++
++> 从 v3.2.0 升级的，请先阅读 `docs/UPGRADE-3.3.md` 第一节（v3.2.0 安装包密钥外泄与轮换）。
++
++---
++
++## 一、⚠ 升级前必读：反向代理与 SSE
++
++本版新增 SSE（Server-Sent Events）实时推送，浏览器与后端之间保持长连接。
++**默认的 Docker Compose 部署（Caddy 入口）已自动配置，无需任何操作。** 但以下情况需要注意：
++
++1. **自建 / 自维护反向代理**（nginx、已有 F5 等）必须为 `GET /api/notifications/sse` 关闭响应缓冲，否则事件帧会被代理攒着不转发，前端表现为"通知不实时"：
++   - nginx 示例（`deploy/native/nginx-dcim.conf` 已内置，供参照）：
++     ```nginx
++     location = /api/notifications/sse {
++         proxy_pass http://127.0.0.1:8081;
++         proxy_http_version 1.1;
++         proxy_set_header Connection '';
++         proxy_buffering off;
++         proxy_read_timeout 24h;   # 后端每 25s 发心跳帧，连接不会空闲
++     }
++     ```
++   - Caddy：`flush_interval -1`（本包 `deploy/Caddyfile` 已含）。
++2. **SSE 认证方式**：浏览器前端走**同源 cookie 自动认证**（`access_token` cookie，EventSource 自动携带），令牌**不进 URL**、不进代理日志。后端仅为 SSE 端点额外兼容 `?token=<JWT>` 查询参数（供非浏览器客户端 / 脚本接入使用），此时：
++   - Caddy 访问日志已配置删除 query 中的 `token` 参数，JWT 不落盘；
++   - 自建代理若放行 query token 接入，请同样确保访问日志脱敏；
++   - 该兼容通道意味着 JWT 可能出现在浏览器历史 / 代理日志里，属内网部署可接受的权衡；若合规要求更高，把 `SSE_ENABLED=false` 关闭 SSE（前端自动降级 30s 轮询，行为回到 v3.4）。
++3. **联动闭环默认值**：升级后立即生效的三条联动（盘点差异工单、低库存通知、SLA 升级投递），默认配置见第四节；不想启用某条联动，改环境变量重启即可，无需改库。
++
++---
++
++## 二、升级步骤
++
++### Docker 部署
++
++```bash
++# 在旧安装目录
++./dcimctl backup                                 # 先手工备份一次
++./dcimctl upgrade /path/to/dcim-system-3.5.0     # 复制 .env/证书 → 自动备份 → 构建 → 启动
++```
++
++- 首次启动执行数据库迁移 V46（秒级，仅向 `workflow_config` 注册「盘点差异」「补货」两个免审工单类型，幂等 ON CONFLICT DO NOTHING，无表结构变更）。
++- `.env` 会被沿用；新增配置项都有默认值，不改也能运行（见第四节）。
++- 安装程序会把 `artifacts/backend/` 中残留的旧版 jar 移到 `artifacts/stale-jars-<时间>/`，避免「覆盖解压后仍跑旧包」。
++- **升级 Caddy 配置**：新 `deploy/Caddyfile` 增加 SSE 分流与日志脱敏。`dcimctl upgrade` 会整体替换 `deploy/` 目录；若你手工维护过 Caddyfile，请把本包中的 `handle /api/notifications/sse` 块与日志 `format filter` 段合并进去，然后 `docker exec dcim-caddy caddy reload --config /etc/caddy/Caddyfile`。
++
++### 原生部署（systemd）
++
++替换 `artifacts/` 后执行 `./install.sh --native`。启动脚本会在多个 jar 并存时选择**版本号最高**的一个。
++`deploy/native/nginx-dcim.conf` 新增 SSE location，安装时会重新铺开；自行维护 nginx 的请按第一节手工合并。
++
++### 升级后自检
++
++```bash
++ADMIN_PW='<admin口令>' EXPECT_VERSION=3.5.0 python3 tests/run_all.py -s smoke
++```
++
++界面右上角「关于本系统」会显示前后端版本（3.5.0），不一致时会标红。
++登录后打开「通知中心」页面，或直接验证 SSE 通路：
++
++```bash
++curl -N -H 'Accept: text/event-stream' "http://<host>/api/notifications/sse?token=<登录JWT>"
++# 建连成功会立即收到：event:connected 与 data:{"ok":true,...}；每 25 秒一条 :ping 心跳
++```
++
++### 回滚
++
++V46 只向 `workflow_config` INSERT 两条工单类型定义（幂等，无 DDL），v3.4 后端可在 V46 之后的库上继续运行
++（Flyway 默认忽略「未来版本」的迁移）。回滚时换回旧目录即可；SSE 与联动即使残留配置也随旧后端不生效。
++稳妥起见回滚后可把 `SSE_ENABLED=false`、`LOW_STOCK_MODE=off`、`INVENTORY_DIFF_TICKET_ENABLED=false` 写入 `.env`，彻底回到 v3.4 行为。
++
++---
++
++## 三、行为变化（请通知用户）
++
++| 变化 | 说明 |
++|---|---|
++| 站内信实时化 | 所有站内信（工单流转、告警、低库存、SLA 升级等）经 SSE 即时推送，浏览器不再等轮询；SSE 不可用时前端自动降级 30s 轮询 |
++| 铃铛红点 | 顶栏铃铛显示未读数，点开通知中心；点单条通知跳转对应工单；「全部已读」一键清理 |
++| 盘点差异工单（默认开） | 盘点任务完成时若存在盘亏 / 盘盈 / 错位差异，自动生成「盘点差异」工单（与完成同事务，建单失败整体回滚），差异明细在工单描述 |
++| 低库存联动（默认 notify） | 出库 / 调整 / 调拨使库存低于安全线时：notify 模式向仓库管理员（R-WAREHOUSE 角色用户）发站内信；ticket 模式额外自动创建补货工单（建议补货量 = 安全库存 − 当前库存）。三层幂等保证并发出库只建一张单 |
++| SLA 超时升级 | 工单超过 SLA 处理时限自动升级：优先级提高、发站内信、按订阅投递 `workorder.sla_escalated` webhook（升级判定每 60 秒一轮，已有 `job_lock` 互斥） |
++| 工单通知补全 | 「开始处理」通知申请人、「关闭」通知申请人与处理人（此前这两步不发通知） |
++| 工单看板 | 工单列表页支持「表格 / 看板」切换：按状态分列、拖拽流转，非法流转（409）卡片自动回弹；「处理中 → 已关闭」需根因分类，看板会引导去详情页 |
++| 网络拓扑（新页面） | 「配置项 → 网络拓扑」全量关系图（力导向布局，支持机房过滤、关系类型图例、节点跳转） |
++| 仪表盘布局 | 运营总览卡片支持显隐与排序配置（localStorage 持久化），刷新后保持 |
++| 告警中心节流 | 页面停留期间自动刷新降频，降低无效查询 |
++
++---
++
++## 四、新增配置项（均有默认值，不改也能运行）
++
++| 配置项 | 默认 | 说明 |
++|---|---|---|
++| `SSE_ENABLED` | `true` | SSE 实时推送总开关；`false` = 端点 503，前端降级 30s 轮询（回到 v3.4 行为） |
++| `SSE_MAX_CONNECTIONS` | `200` | 每实例最大并发 SSE 连接，超限返回 503 触发前端降级 |
++| `SSE_HEARTBEAT_MS` | `25000` | 心跳间隔（`:ping` 注释帧），维持中间层不掐空闲连接 |
++| `INVENTORY_DIFF_TICKET_ENABLED` | `true` | 盘点完成存在差异时自动生成「盘点差异」工单 |
++| `LOW_STOCK_MODE` | `notify` | 低库存联动：`off` 仅原有 webhook 事件 / `notify` 站内信通知仓库管理员 / `ticket` 通知并自动创建补货工单 |
++| `LOW_STOCK_WO_TYPE` | `补货` | ticket 模式创建的工单类型（须存在于 workflow_config） |
++
++Webhook 订阅者无需配置即可收到两个新事件：`workorder.sla_escalated`（SLA 升级）、`inventory.diff`（盘点差异）。
++
++多实例部署：SSE 广播经 Redis pub/sub 跨实例转发（未配置 Redis 时仅本实例连接可收到推送，站内信落库不受影响）。
++
++---
++
++## 五、新增与改进
++
++- **联动闭环**：盘点差异 → 工单、低库存 → 通知 / 补货单（三层幂等：实例内存防抖 + 行锁 + 开放工单查重）、SLA 升级 → webhook + 站内信
++- **SSE 实时推送**：`SseConnectionRegistry` 自管连接（自建心跳线程、不用 @Scheduled，避免被集群定时任务锁拦成单实例）、200 连接 / 实例上限、Redis pub/sub 跨实例分发
++- **通知中心**：未读红点、列表、全部已读、点击跳转；30s 轮询降级兜底
++- **可视化**：工单看板（DnD 拖拽流转 + 409 回弹）、网络拓扑（ECharts 力导向 + 机房过滤 + 图例）、仪表盘卡片显隐排序（localStorage 持久化）、告警中心节流刷新
++- **结构强化**：`UnifiedEventPublisher` 组合门面统一领域事件出口（站内信 + webhook + SSE 频道一次发布），事务提交后才投递（AFTER_COMMIT），业务回滚不产生假事件
++- **安全**：Caddy 日志对 SSE 建连 query 脱敏（token 不落盘）；`/api/notifications/sse` 无令牌返回 401
++- **测试**：新增 12 个用例（CT-11~15 / CC-07 / PERF-21 / UI-07~09 / CL-07~08），总计 92 个；回归报告见 `docs/TEST-REPORT-3.5.md`
++
++**未纳入本版的决定**：报表定时导出（运营总览定时导出 PDF/Excel 到邮箱）经评估暂不实现——
++当前「运营总览 + 导出」手动链路已覆盖需求，自动化的收件人管理、失败重试与敏感数据外发控制需要独立设计；
++避免为凑功能而引入半成品。后续版本如需要，将以「报表订阅」形式单独设计。
++
++---
++
++## 六、源码、补丁与测试
++
++- `source/backend/`：完整后端源码（v3.5.0），见其中 README
++- `patches/v3.4.0-to-v3.5.0/`：相对 v3.4.0 的补丁（后端 / 前端 / 部署 / 测试）
++- `tests/`：回归测试套件 92 用例，用法见 `tests/README.md`；联动用例（CT-13 / CL-08）验证补货单路径需以 `LOW_STOCK_MODE=ticket` 启动被测实例
++- 数据库迁移：仅 `V46__v35_linkage_sse.sql`（向 `workflow_config` 注册联动工单类型，无 DDL）
+diff --git a/pkg/install.sh b/pkg/install.sh
+index 6fdd885..50dc668 100755
+--- a/pkg/install.sh
++++ b/pkg/install.sh
+@@ -22,7 +22,7 @@ set -euo pipefail
+ 
+ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ cd "$ROOT"
+-VERSION="$(cat VERSION 2>/dev/null || echo 3.4.0)"
++VERSION="$(cat VERSION 2>/dev/null || echo 3.5.0)"
+ 
+ MODE=docker
+ UPGRADE_FROM=""
+diff --git a/pkg/source/backend/build.sh b/pkg/source/backend/build.sh
+index 813f2c5..d6819ac 100755
+--- a/pkg/source/backend/build.sh
++++ b/pkg/source/backend/build.sh
+@@ -3,7 +3,7 @@
+ set -euo pipefail
+ cd "$(dirname "$0")"
+ LIB="${LIB:-../../artifacts/backend/lib}"
+-VER="$(cat ../../VERSION 2>/dev/null || echo 3.4.0)"
++VER="$(cat ../../VERSION 2>/dev/null || echo 3.5.0)"
+ rm -rf build/classes && mkdir -p build/classes
+ find src -name "*.java" > build/sources.txt
+ javac -nowarn -parameters -g -encoding UTF-8 --release 17 -cp "$LIB/*" -d build/classes @build/sources.txt

@@ -1,0 +1,179 @@
+# ============================================================
+# deploy/Caddyfile — 智算资产管理平台 v3.5 统一入口
+#
+# 分流规则：
+#   /api/*    → platform-be:8081   后端（后端挂在 /api 前缀，不去前缀）
+#   其余      → platform-web:80    前端（Vue3 SPA）
+#
+# 【当前状态】:80（HTTP）+ :443（HTTPS，deploy/tls 自签证书，SAN 含主机 IP）。
+# 【切换到正式域名】：把末尾「一键启用 HTTPS」注释块取消注释、改掉域名，
+#   替换掉上面的 `:80 { ... }` 与 `:443 { ... }` 两个站点块，然后执行：
+#     docker exec dcim-caddy caddy reload --config /etc/caddy/Caddyfile
+#   路由已抽成 snippet（dcim_routes），HTTP / HTTPS 两个块共用，不会漏改。
+# ============================================================
+
+# ── 路由片段：被下方站点块 import（改这里即可同时生效于 HTTP 与 HTTPS）──
+(dcim_routes) {
+	# 压缩 API JSON 与静态资源（前端 nginx 已压缩的不会重复压缩）。
+	# v3.5：SSE 路径（/api/notifications/sse）排除压缩——text/event-stream 流式响应
+	# 不能进入压缩缓冲，心跳（25s :ping）与广播帧依赖即时 flush。
+	@compressable not path /api/notifications/sse
+	encode @compressable zstd gzip
+
+	# ── SSE 实时推送（v3.5）：/api/notifications/sse ──
+	# 必须放在 /api/* 之前（更长前缀优先匹配）：
+	#   · flush_interval -1 关闭响应缓冲，心跳（25s :ping）与广播帧到达即转发；
+	#   · 长连接不走 request_body 限制；不参与压缩（上方 match 已排除 event-stream）。
+	handle /api/notifications/sse {
+		reverse_proxy platform-be:8081 {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			flush_interval -1
+		}
+	}
+
+	# ── 后端 API：/api/* 原样反代（后端就是 /api，不 Strip）──
+	handle /api/* {
+		# 与后端 multipart 上限（50MB）对齐，超大请求在入口直接拒绝，不占后端线程
+		request_body {
+			max_size 60MB
+		}
+		reverse_proxy platform-be:8081 {
+			header_up X-Real-IP {remote_host}
+			# 覆盖式写入：后端只采信可信代理（dcim.trusted-proxies）覆写的 XFF，
+			# 客户端自带的伪造头一律被顶掉，这里必须是 = 而不是追加。
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			# /api-docs 在 prod 下 springdoc.enabled=false 会 404、安全链又要求认证，
+			# 拿它做健康探测会把上游标成 unhealthy → /api/* 全线 502。
+			# /api/healthz 是专门开给探针的匿名只读端点（成功 200 / 数据库不可用 503）。
+			health_uri /api/healthz
+			health_interval 30s
+			health_timeout 5s
+		}
+	}
+
+	# ── 其余全部走前端 ──
+	handle {
+		reverse_proxy platform-web:80
+	}
+}
+
+# ── 安全响应头片段（HTTP / HTTPS 共用）──
+# 说明：HSTS 只在 HTTPS 站点块里下发（浏览器忽略纯 HTTP 传来的 HSTS，
+#       且过早下发会导致域名一旦降级就无法回退，故不放进这里）。
+(sec_headers) {
+	header {
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		X-Permitted-Cross-Domain-Policies "none"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+		- Server
+		- X-Powered-By
+	}
+}
+
+# ============================================================
+# 当前启用：HTTP + HTTPS（自签证书）
+# ============================================================
+:80 {
+	import sec_headers
+	import dcim_routes
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 50mb
+			roll_keep 5
+		}
+		# SSE 建连 token 走 query（EventSource 无法携带 Authorization 头），
+		# JWT 不得落盘：日志里删除该参数，其余 query 参数保留（分页/筛选排查仍可用）
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					delete token
+				}
+			}
+		}
+	}
+}
+
+# HTTPS 站点块（自签证书，内网使用）
+# 为什么用文件证书而不是 `tls internal`：站点地址是裸 :443（无主机名），
+# Caddy 无法为它签发证书，握手会直接报 TLS internal error（实测无证书产出）。
+# 证书由 deploy/tls/{server.crt,server.key} 提供（SAN 含主机 IP 与 localhost）。
+# 有公网域名后：改回 `tls internal` 或删掉让 Caddy 自动申请 Let's Encrypt。
+:443 {
+	tls /tls/server.crt /tls/server.key
+
+	import sec_headers
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+	}
+
+	import dcim_routes
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 50mb
+			roll_keep 5
+		}
+		# 同 :80 站点：SSE token 走 query，日志中删除该参数，JWT 不落盘
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					delete token
+				}
+			}
+		}
+	}
+}
+
+# ============================================================
+# 一键启用 HTTPS —— 有域名后按下面三步操作：
+#
+#   1) 复制整块（含末尾大括号），粘贴到上面 `:80 { ... }` 站点块的位置；
+#   2) 把 dcim.example.com 换成真实域名：
+#        · 公网域名 + 80/443 对外可达 → 删掉 `tls internal` 行，
+#          Caddy 自动向 Let's Encrypt 申请并续期真实证书；
+#        · 内网/无公网 CA → 保留 `tls internal`（自签，浏览器会有告警）；
+#   3) 删除原 `:80 { ... }` 块（Caddy 会自动加 80 → 443 跳转），
+#      然后执行：
+#        docker exec dcim-caddy caddy reload --config /etc/caddy/Caddyfile
+#
+# dcim.example.com {
+# 	tls internal
+#
+# 	encode zstd gzip
+#
+# 	header {
+# 		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+# 		X-Frame-Options "DENY"
+# 		X-Content-Type-Options "nosniff"
+# 		Referrer-Policy "strict-origin-when-cross-origin"
+# 		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+# 		X-Permitted-Cross-Domain-Policies "none"
+# 		Cross-Origin-Opener-Policy "same-origin"
+# 		Cross-Origin-Resource-Policy "same-origin"
+# 		- Server
+# 		- X-Powered-By
+# 	}
+#
+# 	import dcim_routes
+#
+# 	log {
+# 		output file /var/log/caddy/access.log {
+# 			roll_size 50mb
+# 			roll_keep 5
+# 		}
+# 		format json
+# 	}
+# }
+# ============================================================

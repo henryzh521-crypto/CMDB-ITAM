@@ -1,0 +1,745 @@
+diff --git a/tests/README.md b/tests/README.md
+index a658b34..7000c9f 100644
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -1,6 +1,6 @@
+-# 回归测试套件（v3.4）
++# 回归测试套件（v3.5）
+ 
+-一条命令跑完 9 层、80 个用例，输出控制台结果和三种报告（`report.md` 给人看，`junit.xml` 给 CI，`report.json` 给脚本）。
++一条命令跑完 9 层、92 个用例，输出控制台结果和三种报告（`report.md` 给人看，`junit.xml` 给 CI，`report.json` 给脚本）。
+ 只依赖 Python 3.9+ 和 `requests`；浏览器用例另需 `playwright`，数据库相关用例另需 `psql`。条件不满足的套件或用例会**跳过**，不会报错。
+ 
+ ```bash
+@@ -36,13 +36,13 @@ python3 tests/run_all.py --list          # 只列出用例
+ | 套件 | 编号 | 内容 | 前置条件 |
+ |---|---|---|---|
+ | smoke 冒烟 | SM | 健康检查、版本、登录、全部无参 GET 不出 5xx、未登录 401 | 后端 |
+-| contract 接口契约 | CT | OpenAPI 完整性、写接口权限声明、统一响应结构、11 种关联资产写法（assetNos 回归） | 后端 |
++| contract 接口契约 | CT | OpenAPI 完整性、写接口权限声明、统一响应结构、11 种关联资产写法（assetNos 回归）；v3.5：新事件目录、盘点差异工单、低库存联动、SLA 升级投递、SSE 帧契约 | 后端 |
+ | permission 权限矩阵 | PM/PA/PS/PF/PC | 模块读写、删除显式授予、导出、数据范围、字段级权限、授权上限 | 后端 |
+ | security 安全回归 | SE | 越权、会话吊销、令牌重放、用户名枚举、账号锁定、限流、审计、SSRF | 后端 |
+-| concurrency 并发正确性 | CC | 唯一键、乐观锁、状态流转、编号生成、连接池、事务性发件箱 | 后端 |
+-| performance 性能基线 | PERF | 8 个关键接口的延迟预算 + 多用户吞吐 | ≥5 万资产 |
+-| e2e 浏览器端到端 | UI | 登录、界面建单落库、字段受限界面、角色字段权限编辑、接口文档、暗色模式 | 前端 + playwright |
+-| cluster 多实例一致性 | CL | 跨实例会话吊销、账号停用、登录计数、限流共享、定时任务互斥 | `BASE2` |
++| concurrency 并发正确性 | CC | 唯一键、乐观锁、状态流转、编号生成、连接池、事务性发件箱；v3.5：SSE 并发建连/心跳/广播/回收 | 后端 |
++| performance 性能基线 | PERF | 8 个关键接口的延迟预算 + 多用户吞吐；v3.5：SSE 20 连接常开下的列表延迟 | ≥5 万资产 |
++| e2e 浏览器端到端 | UI | 登录、界面建单落库、字段受限界面、角色字段权限编辑、接口文档、暗色模式；v3.5：通知中心、看板拖拽回弹、网络拓扑 | 前端 + playwright |
++| cluster 多实例一致性 | CL | 跨实例会话吊销、账号停用、登录计数、限流共享、定时任务互斥；v3.5：SSE 跨实例送达、补货单跨实例幂等 | `BASE2`（CL-07 另需 Redis，CL-08 另需 ticket 模式） |
+ | deploy 安装包检查 | DP | 脚本语法、编排校验、敏感文件、权限、版本一致、迁移未改动、选包逻辑、监控热加载 | `PKG_DIR` |
+ 
+ ## 测试数据
+@@ -50,6 +50,7 @@ python3 tests/run_all.py --list          # 只列出用例
+ - 用例创建的角色以 `R34-` 开头、用户以 `t34-` 开头、资产名称以 `t34-` 开头，可按前缀清理；不会修改既有业务数据。
+ - 角色和用户每次运行都会复位到用例需要的状态，重复运行结果一致。
+ - 不要对生产库运行 concurrency / security 套件：它们会故意制造锁定账号、限流和大量测试工单。
++- v3.5 联动用例（CT-13 / CL-08）：默认部署运行在 notify 模式，验证站内信路径即可；要验证自动补货单与幂等，须以 `-Ddcim.linkage.low-stock.mode=ticket`（或环境变量）启动被测实例后重跑。
+ 
+ ## 新增用例
+ 
+diff --git a/tests/data/migration-checksums.json b/tests/data/migration-checksums.json
+index d24b3d1..549f81d 100644
+--- a/tests/data/migration-checksums.json
++++ b/tests/data/migration-checksums.json
+@@ -1,47 +1,48 @@
+-{
+- "V1__baseline.sql": "ab101fca0fc0cdfea8c3eb2286a0f7c59e90b6f05b21555f43ef9eeec923d9de",
+- "V2__seed.sql": "aca880cd6296f1c2fcc857deb39f47199c2314e56228330771d275f29198891a",
+- "V3__asset_p1.sql": "04d484c07e22057ee54b4fd45a125b2138c9376b69d6f549333f51da2a42d80c",
+- "V4__room_p2.sql": "a4ec3023956b6d17ee4f2da31b5b00a4076a7b492558cfdabd430eb42594cea4",
+- "V5__warehouse_p3.sql": "521caa63127a653c483940cf03c64bb77b2347c99eac39cb985bfeedcec08b17",
+- "V6__workorder_p4.sql": "1f60df6c01229441ddef4c2e48042059574ebabc44f672fa3d856586cd648ec8",
+- "V7__wecom_login.sql": "0c0c82157c70b4807219d34f2dd21d69b8bd958d6ba9e13c4a0edfc806147be5",
+- "V8__collect_w2.sql": "a6601bee02a0daee0b80c3e3d6783fa341596744d0ccaf5088a8b9d1bb834a04",
+- "V9__asset_parent.sql": "8fbbb4802caf3ba5f249550ad3ebdcf7565e123ef085876cb6031228c2a8f316",
+- "V10__workorder_item.sql": "cf19bb43c591da163bb58f9df828f7fa39260f10307bc48cfcdc211365394d17",
+- "V11__workorder_transfer.sql": "18b34fbe2d4983c7d494e6349e32f4237a255fa56103a389df1e550fbdab7294",
+- "V12__user_role_id.sql": "29c49dc4b90ebf39fc51075f7df5015e5da0aa3fef053b8dd193947a08e03836",
+- "V13__menu_rbac_align.sql": "77d4b64e9cca9608ae44dbb2ac1c7a6d756370a8b0553b03b85297ec4cec9fcd",
+- "V14__wo_replacements.sql": "3f0a6ee415035adbf45d307c5ada5c4e854b66f3d31137118b2bada49bf8ecce",
+- "V15__warehouse_stock.sql": "1fe4ccd73db4b3395f97d69608639b351f98df059c79a0a48dc5cca8a7607d63",
+- "V16__warehouse_read_dep.sql": "780378771bc03cb4f835091953e8d12acd0d09d7c8132f65ae384a69f373ba80",
+- "V17__workorder_p5.sql": "d1f99eb9e88508e67c8107d6799288533e58ddea90c225b7306c724bcda0a366",
+- "V18__wo_part_replace.sql": "3e6c6f685d1286ca8ec93d56c16c8fef5d4c01ca8c21a2f4d6780aacb6ce0294",
+- "V19__audit_log_query_index.sql": "febef96ef292c5709624901110e707818a25186f971ccbb2f1d525606efb5bad",
+- "V20__audit_log_partitions.sql": "c9029165eed957a6a6a1f072220ad68c98462057d8818039c5932946549c5c39",
+- "V21__asset_biz_states_trim.sql": "229d80999ddc4376680b45011a81ee0f1fa3be1381f506f0d3687e6f04367e8c",
+- "V22__rack_unit_backfill_from_assets.sql": "389bc27a31e854e5da435e300ac6df0741aaa8b7a05985306a20ffc21514a55d",
+- "V23__asset_biz_states_slim_to_8.sql": "be96369b701593e77fa9f0143b7214f11d22f7ab7d0dd625e201f02c94f3f47e",
+- "V24__wo_custom_approval.sql": "0c602c30f33a1f8a8c811812a250729de64be3d278f587a795f11708fa3bc3b7",
+- "V25__workorder_attachment.sql": "0df9bd9480d730bd4e54539c8881b76f9d96d2e9396fe833d501dfbf63cf1d62",
+- "V26__role_builtin_admin_only.sql": "16532d2bcad0190e2fbf60db808c84df023d665ff551488019610084c08cfc30",
+- "V27__fin_state_lease_accrual.sql": "25df3655afe2e4f249a816d127148a13aec33d202c07967ff43d22d57d142432",
+- "V28__viewer_role.sql": "d4ab6a74b9018fb7bbd28e7afba81a6e4e8a03a363aff96c813276c30a5346da",
+- "V29__wo_repair_analysis.sql": "f16ac4d35d0fa6cfb7df0b188ca610deec18224820c32ceef07b87acb2ae84d0",
+- "V30__asset_code_rule.sql": "91b333ff166519757322233a28fb10df39a9a9b818bbded94b0f6fee705048af",
+- "V31__drop_device_model.sql": "704b7e18f9ae10e9312c81d31496e1608fd9a84a9ad10182de6ac9c6b0d4f9d0",
+- "V32__clear_zombie_model_code.sql": "77f1f5eaaa422355e8ea65b3d1315784c02f55c27559f5700fc66770da03da2e",
+- "V33__soft_delete.sql": "cd6ce6b6e591bb70f04d89a74b05558e97bd01bde0918bfbf0609a29c0b26d8f",
+- "V34__foreign_key_indexes.sql": "0eabe0d5fb828e2eb3f93624c2bdcab6fe1f2a6502f635c76eceea829a9059eb",
+- "V35__webhook.sql": "dff8400f0af220ce594a40b2053b704eaf74c809a8a22d801c74591c022f901b",
+- "V36__change_management.sql": "29fc1a8efb53b3d1dc5c50bb5c55615350d97d0b616f400acf7c81fc19dcf26f",
+- "V37__soft_delete_unique.sql": "70f6be2cfcc03f64a82875fb2d0575c5811305016d36377655b78c64524f6936",
+- "V38__itsm_integration_upgrade.sql": "a359b2162105464bb7cf70684e927dc19f3594ccdf03ddfaf89efb4e2c45f4b4",
+- "V39__monitoring.sql": "cc630c6a06407d18a6a0ae03020a41f87beaf201f3646739376fdbce20b62646",
+- "V40__capacity_ipam_cabling.sql": "fbaa9a0dd362e56190a4b294f2eb6b4231951d8ee327246767a668a9a53ad75c",
+- "V41__problem_kb_catalog.sql": "4e3690e1f6d7f25961c9398239d19a4222b05e0eff87bd696a5dad9fe2d30126",
+- "V42__api_token_ldap.sql": "2e2d11d9592f7ff69593679d25f92150cd23892c0740e6fea5ce43ce3464f8e7",
+- "V43__v33_security_perf.sql": "23b0adffbb3f2b77426c539529000766c511483184c3c21f1022ea87f8a98461",
+- "V44__report_settings.sql": "3875d468be4509a4de1a5999330d827d4f829317da0f8cca319acae417c8edbd",
+- "V45__v34_permissions_perf.sql": "be8812e4482c241e6d1162fdf269698a27e6e3ca500bbd97ba0ed34bcc0b6346"
++{
++ "V1__baseline.sql": "ab101fca0fc0cdfea8c3eb2286a0f7c59e90b6f05b21555f43ef9eeec923d9de",
++ "V2__seed.sql": "aca880cd6296f1c2fcc857deb39f47199c2314e56228330771d275f29198891a",
++ "V3__asset_p1.sql": "04d484c07e22057ee54b4fd45a125b2138c9376b69d6f549333f51da2a42d80c",
++ "V4__room_p2.sql": "a4ec3023956b6d17ee4f2da31b5b00a4076a7b492558cfdabd430eb42594cea4",
++ "V5__warehouse_p3.sql": "521caa63127a653c483940cf03c64bb77b2347c99eac39cb985bfeedcec08b17",
++ "V6__workorder_p4.sql": "1f60df6c01229441ddef4c2e48042059574ebabc44f672fa3d856586cd648ec8",
++ "V7__wecom_login.sql": "0c0c82157c70b4807219d34f2dd21d69b8bd958d6ba9e13c4a0edfc806147be5",
++ "V8__collect_w2.sql": "a6601bee02a0daee0b80c3e3d6783fa341596744d0ccaf5088a8b9d1bb834a04",
++ "V9__asset_parent.sql": "8fbbb4802caf3ba5f249550ad3ebdcf7565e123ef085876cb6031228c2a8f316",
++ "V10__workorder_item.sql": "cf19bb43c591da163bb58f9df828f7fa39260f10307bc48cfcdc211365394d17",
++ "V11__workorder_transfer.sql": "18b34fbe2d4983c7d494e6349e32f4237a255fa56103a389df1e550fbdab7294",
++ "V12__user_role_id.sql": "29c49dc4b90ebf39fc51075f7df5015e5da0aa3fef053b8dd193947a08e03836",
++ "V13__menu_rbac_align.sql": "77d4b64e9cca9608ae44dbb2ac1c7a6d756370a8b0553b03b85297ec4cec9fcd",
++ "V14__wo_replacements.sql": "3f0a6ee415035adbf45d307c5ada5c4e854b66f3d31137118b2bada49bf8ecce",
++ "V15__warehouse_stock.sql": "1fe4ccd73db4b3395f97d69608639b351f98df059c79a0a48dc5cca8a7607d63",
++ "V16__warehouse_read_dep.sql": "780378771bc03cb4f835091953e8d12acd0d09d7c8132f65ae384a69f373ba80",
++ "V17__workorder_p5.sql": "d1f99eb9e88508e67c8107d6799288533e58ddea90c225b7306c724bcda0a366",
++ "V18__wo_part_replace.sql": "3e6c6f685d1286ca8ec93d56c16c8fef5d4c01ca8c21a2f4d6780aacb6ce0294",
++ "V19__audit_log_query_index.sql": "febef96ef292c5709624901110e707818a25186f971ccbb2f1d525606efb5bad",
++ "V20__audit_log_partitions.sql": "c9029165eed957a6a6a1f072220ad68c98462057d8818039c5932946549c5c39",
++ "V21__asset_biz_states_trim.sql": "229d80999ddc4376680b45011a81ee0f1fa3be1381f506f0d3687e6f04367e8c",
++ "V22__rack_unit_backfill_from_assets.sql": "389bc27a31e854e5da435e300ac6df0741aaa8b7a05985306a20ffc21514a55d",
++ "V23__asset_biz_states_slim_to_8.sql": "be96369b701593e77fa9f0143b7214f11d22f7ab7d0dd625e201f02c94f3f47e",
++ "V24__wo_custom_approval.sql": "0c602c30f33a1f8a8c811812a250729de64be3d278f587a795f11708fa3bc3b7",
++ "V25__workorder_attachment.sql": "0df9bd9480d730bd4e54539c8881b76f9d96d2e9396fe833d501dfbf63cf1d62",
++ "V26__role_builtin_admin_only.sql": "16532d2bcad0190e2fbf60db808c84df023d665ff551488019610084c08cfc30",
++ "V27__fin_state_lease_accrual.sql": "25df3655afe2e4f249a816d127148a13aec33d202c07967ff43d22d57d142432",
++ "V28__viewer_role.sql": "d4ab6a74b9018fb7bbd28e7afba81a6e4e8a03a363aff96c813276c30a5346da",
++ "V29__wo_repair_analysis.sql": "f16ac4d35d0fa6cfb7df0b188ca610deec18224820c32ceef07b87acb2ae84d0",
++ "V30__asset_code_rule.sql": "91b333ff166519757322233a28fb10df39a9a9b818bbded94b0f6fee705048af",
++ "V31__drop_device_model.sql": "704b7e18f9ae10e9312c81d31496e1608fd9a84a9ad10182de6ac9c6b0d4f9d0",
++ "V32__clear_zombie_model_code.sql": "77f1f5eaaa422355e8ea65b3d1315784c02f55c27559f5700fc66770da03da2e",
++ "V33__soft_delete.sql": "cd6ce6b6e591bb70f04d89a74b05558e97bd01bde0918bfbf0609a29c0b26d8f",
++ "V34__foreign_key_indexes.sql": "0eabe0d5fb828e2eb3f93624c2bdcab6fe1f2a6502f635c76eceea829a9059eb",
++ "V35__webhook.sql": "dff8400f0af220ce594a40b2053b704eaf74c809a8a22d801c74591c022f901b",
++ "V36__change_management.sql": "29fc1a8efb53b3d1dc5c50bb5c55615350d97d0b616f400acf7c81fc19dcf26f",
++ "V37__soft_delete_unique.sql": "70f6be2cfcc03f64a82875fb2d0575c5811305016d36377655b78c64524f6936",
++ "V38__itsm_integration_upgrade.sql": "a359b2162105464bb7cf70684e927dc19f3594ccdf03ddfaf89efb4e2c45f4b4",
++ "V39__monitoring.sql": "cc630c6a06407d18a6a0ae03020a41f87beaf201f3646739376fdbce20b62646",
++ "V40__capacity_ipam_cabling.sql": "fbaa9a0dd362e56190a4b294f2eb6b4231951d8ee327246767a668a9a53ad75c",
++ "V41__problem_kb_catalog.sql": "4e3690e1f6d7f25961c9398239d19a4222b05e0eff87bd696a5dad9fe2d30126",
++ "V42__api_token_ldap.sql": "2e2d11d9592f7ff69593679d25f92150cd23892c0740e6fea5ce43ce3464f8e7",
++ "V43__v33_security_perf.sql": "23b0adffbb3f2b77426c539529000766c511483184c3c21f1022ea87f8a98461",
++ "V44__report_settings.sql": "3875d468be4509a4de1a5999330d827d4f829317da0f8cca319acae417c8edbd",
++ "V45__v34_permissions_perf.sql": "be8812e4482c241e6d1162fdf269698a27e6e3ca500bbd97ba0ed34bcc0b6346",
++ "V46__v35_linkage_sse.sql": "deb7254806df993069e597f7a2319fd68b9c6cfedcda1b635a2dd8d76b333651"
+ }
+\ No newline at end of file
+diff --git a/tests/suites/s20_contract.py b/tests/suites/s20_contract.py
+index 029f732..a06bd25 100644
+--- a/tests/suites/s20_contract.py
++++ b/tests/suites/s20_contract.py
+@@ -1,4 +1,13 @@
+-"""接口契约：OpenAPI 完整性、统一响应结构、入参校验与字段别名（含 v3.3.1 assetNos 问题的回归）。"""
++"""接口契约：OpenAPI 完整性、统一响应结构、入参校验与字段别名（含 v3.3.1 assetNos 问题的回归）。
++
++v3.5 增补：CT-11~15 覆盖新事件目录（workorder.sla_escalated / inventory.diff）、
++盘点差异联动工单、低库存联动（补货单 / 站内信）、SLA 升级事件投递与 SSE 端点帧契约。
++"""
++import time
++import uuid
++
++import requests as rq
++
+ from lib.framework import suite, case, check, skip
+ from lib.context import data, msg
+ 
+@@ -141,3 +150,217 @@ def _(ctx):
+     ctx.asset(sn=sn)
+     st, r = ctx.admin.post("/assets", {"name": "dup", "sn": sn, "categoryCode": "SRV"})
+     check(st == 409, f"HTTP {st} {msg(r)}")
++
++
++# ───────── v3.5：事件目录 / 联动工单 / SSE 契约 ─────────
++
++def _first_unit(ctx):
++    """从单位字典取一个合法计量单位（物料创建强校验单位字典，历史数据可能存有非法值）"""
++    st, b = ctx.admin.get("/materials/meta")
++    units = (data(b) or {}).get("units") or []
++    if not units:
++        skip("单位字典为空，取不到合法计量单位")
++    return units[0]
++
++
++def _first_warehouse(ctx):
++    st, b = ctx.admin.get("/warehouses", params={"page": 1, "size": 1})
++    recs = (data(b) or {}).get("records") or []
++    if not recs:
++        skip("库中无仓库，无法做出入库")
++    return recs[0]["warehouseCode"]
++
++
++def _material(ctx, safety=0, stock=0):
++    """创建测试物料并按需入库，返回 (materialCode, warehouseCode)"""
++    code = f"MAT-CT35-{uuid.uuid4().hex[:8].upper()}"
++    wh = _first_warehouse(ctx)
++    st, b = ctx.admin.post("/materials", {"materialCode": code, "name": f"契约物料 {code}",
++                                          "unit": _first_unit(ctx), "safetyStock": safety})
++    check(st == 200, f"创建物料 HTTP {st} {msg(b)}")
++    if stock:
++        st, b = ctx.admin.post("/stock-logs", {"logType": "IN", "materialCode": code, "qty": stock, "warehouseCode": wh})
++        check(st == 200, f"物料入库 HTTP {st} {msg(b)}")
++    return code, wh
++
++
++@case(S, "CT-11", "v3.5 新事件 workorder.sla_escalated / inventory.diff 可被 Webhook 订阅，未知事件仍被拒",
++      risk="新事件未登记目录，订阅即 400", level="P1")
++def _(ctx):
++    st, b = ctx.admin.post("/webhooks", {"name": f"t35-catalog-{ctx.run_id}", "url": "http://203.0.113.10:9/hook",
++                                          "eventTypes": ["workorder.sla_escalated", "inventory.diff"], "enabled": True})
++    check(st == 200, f"订阅两个新事件 HTTP {st} {msg(b)}")
++    hid = data(b)["id"]
++    try:
++        st, b = ctx.admin.post("/webhooks", {"name": "t35-unknown-event", "url": "http://203.0.113.10:9/hook",
++                                              "eventTypes": ["not.a-real-event"], "enabled": True})
++        if st == 200:
++            ctx.admin.delete(f"/webhooks/{data(b)['id']}")
++        check(st == 400 and "not.a-real-event" in msg(b), f"未知事件应 400：HTTP {st} {msg(b)}")
++        return "两个 v3.5 新事件均已登记事件目录"
++    finally:
++        ctx.admin.delete(f"/webhooks/{hid}")
++
++
++@case(S, "CT-12", "物料盘点盘亏：完成任务自动生成「盘点差异」工单且明细正确", risk="盘点差异无人跟进（v3.5 联动核心）", level="P0")
++def _(ctx):
++    code, wh = _material(ctx, safety=0, stock=10)
++    st, b = ctx.admin.post("/inventory-tasks", {"name": f"契约盘点 {ctx.run_id}", "inspector": ctx.admin_user,
++                                                "targetType": "MATERIAL",
++                                                "filter": {"materialCodes": [code], "warehouseCodes": [wh]}})
++    check(st == 200, f"创建盘点任务 HTTP {st} {msg(b)}")
++    task = data(b)
++    check(task["totalCount"] == 1, f"任务应只圈定 1 个物料行，实际 {task['totalCount']}")
++    st, b = ctx.admin.get(f"/inventory-tasks/{task['taskNo']}/items", params={"page": 1, "size": 10})
++    items = (data(b) or {}).get("records") or []
++    check(len(items) == 1, f"盘点明细 {len(items)} 行")
++    check((items[0].get("expected") or {}).get("qty") == 10, f"账面快照 {items[0].get('expected')}")
++    st, b = ctx.admin.put(f"/inventory-tasks/{task['taskNo']}/items/{items[0]['itemNo']}",
++                          {"countedQty": 7, "diffNote": "契约测试盘亏"})
++    check(st == 200 and (data(b) or {}).get("result") == "盘亏", f"提交实盘 HTTP {st} {(data(b) or {}).get('result')} {msg(b)}")
++    st, b = ctx.admin.post(f"/inventory-tasks/{task['taskNo']}/complete")
++    check(st == 200 and (data(b) or {}).get("diffCount") == 1, f"完成任务 HTTP {st} diffCount={(data(b) or {}).get('diffCount')}")
++    st, b = ctx.admin.get("/workorders", params={"page": 1, "size": 20, "keyword": task["taskNo"]})
++    recs = [r for r in (data(b) or {}).get("records") or [] if r.get("woType") == "盘点差异"]
++    check(len(recs) == 1, f"应恰好生成 1 张「盘点差异」工单，实际 {len(recs)}")
++    wo_no = recs[0]["woNo"]
++    st, d = ctx.admin.get(f"/workorders/{wo_no}")
++    d = data(d) or {}
++    check(code in (d.get("relatedMaterials") or ""), f"差异工单未关联物料：{d.get('relatedMaterials')!r}")
++    check("账面 10，实盘 7" in (d.get("description") or ""), "差异工单描述缺少正确的差额明细")
++    return f"差异工单 {wo_no}（关联物料 {code}）"
++
++
++def _open_restock_tickets(ctx, code):
++    st, b = ctx.admin.get("/workorders", params={"page": 1, "size": 50, "keyword": code})
++    return [r for r in (data(b) or {}).get("records") or []
++            if r.get("woType") == "补货" and r.get("status") in ("待处理", "待审批", "处理中")]
++
++
++@case(S, "CT-13", "低库存出库触发联动：ticket 模式自动建补货单且不重复；notify 模式仓库管理员收站内信",
++      risk="低库存无人跟进 / 重复建单（v3.5 联动核心）", level="P0")
++def _(ctx):
++    code, wh = _material(ctx, safety=5, stock=10)
++    # notify 模式的通知对象是 R-WAREHOUSE 角色成员，须在触发前就位
++    st, b = ctx.admin.get("/roles", params={"page": 1, "size": 300})
++    has_wh = any((r or {}).get("roleCode") == "R-WAREHOUSE" for r in (data(b) or {}).get("records") or [])
++    watcher = ctx.user("t34-whnotify", ["R-WAREHOUSE"]) if has_wh else None
++    st, b = ctx.admin.post("/stock-logs", {"logType": "OUT", "materialCode": code, "qty": 8,
++                                           "warehouseCode": wh, "remark": "CT-13 低库存触发"})
++    check(st == 200, f"出库 HTTP {st} {msg(b)}")
++
++    ticket = None
++    for _ in range(15):   # 联动在事务提交后异步执行，最多等 15s
++        rows = _open_restock_tickets(ctx, code)
++        if rows:
++            ticket = rows[0]
++            break
++        time.sleep(1.0)
++    if ticket is None:
++        if watcher is None:
++            skip("非 ticket 模式且库中无 R-WAREHOUSE 角色，notify 通知无从验证（ticket 模式请用 -Ddcim.linkage.low-stock.mode=ticket 启动被测实例）")
++        hit = None
++        for _ in range(10):
++            st, b = watcher.get("/notifications/my", params={"page": 1, "size": 50})
++            hit = next((n for n in (data(b) or {}).get("records") or []
++                        if n.get("type") == "STOCK_LOW" and n.get("refId") == code), None)
++            if hit:
++                break
++            time.sleep(1.0)
++        check(hit is not None, "notify 模式：仓库管理员 10s 内未收到 STOCK_LOW 站内信")
++        check(code in (hit.get("content") or ""), f"通知正文未提及物料：{hit.get('content')!r}")
++        return "notify 模式：仓库管理员已收到低库存站内信"
++
++    # ticket 模式：工单内容 + 幂等（再次出库仍只有一张未完结补货单）
++    st, d = ctx.admin.get(f"/workorders/{ticket['woNo']}")
++    d = data(d) or {}
++    check(code in (d.get("relatedMaterials") or ""), f"补货单未关联物料：{d.get('relatedMaterials')!r}")
++    check("建议补货 3" in (d.get("description") or ""), f"建议量应为 3（安全 5 − 库存 2）：{ (d.get('description') or '')[:80] }")
++    st, b = ctx.admin.post("/stock-logs", {"logType": "OUT", "materialCode": code, "qty": 1,
++                                           "warehouseCode": wh, "remark": "CT-13 重复触发"})
++    check(st == 200, f"再次出库 HTTP {st} {msg(b)}")
++    time.sleep(4.0)
++    rows = _open_restock_tickets(ctx, code)
++    check(len(rows) == 1, f"重复触发后应仍只有 1 张未完结补货单，实际 {len(rows)}")
++    return f"ticket 模式：补货单 {ticket['woNo']}，幂等校验通过"
++
++
++@case(S, "CT-14", "SLA 超时升级补发 workorder.sla_escalated 事件并进入 Webhook 发件箱", risk="升级只发站内信（v3.5 补全）", level="P1")
++def _(ctx):
++    wo_type, prio = "巡检", "高"
++    st, b = ctx.admin.get("/workorders/sla-config")
++    prev = next((r for r in (data(b) or []) if r.get("woType") == wo_type and r.get("priority") == prio), None)
++    restore = {"responseMinutes": (prev or {}).get("responseMinutes"),
++               "resolveMinutes": (prev or {}).get("resolveMinutes"),
++               "escalateTo": (prev or {}).get("escalateTo")}
++    st, b = ctx.admin.put(f"/workorders/sla-config/{wo_type}/{prio}", {"responseMinutes": 1, "resolveMinutes": 1})
++    check(st == 200, f"收紧 SLA 时限 HTTP {st} {msg(b)}")
++    hid, wo = None, None
++    try:
++        st, b = ctx.admin.post("/webhooks", {"name": f"t35-sla-{ctx.run_id}", "url": "http://203.0.113.10:9/hook",
++                                              "eventTypes": ["workorder.sla_escalated"], "enabled": True})
++        check(st == 200, f"创建 Webhook HTTP {st} {msg(b)}")
++        hid = data(b)["id"]
++        wo = ctx.workorder(wo_type=wo_type, priority=prio, title="CT-14 SLA 升级")
++        st, d = ctx.admin.get(f"/workorders/{wo}")
++        check((data(d) or {}).get("slaResolveDeadline"), "工单未按 SLA 配置生成解决时限")
++        got = None
++        for _ in range(44):   # 升级扫描 60s 一轮、时限 1 分钟：最多等 220s
++            time.sleep(5.0)
++            st, b = ctx.admin.get(f"/webhooks/{hid}/deliveries", params={"page": 1, "size": 50})
++            rows = (data(b) or {}).get("records") or (data(b) or {}).get("list") or []
++            got = next((r for r in rows if r.get("eventType") == "workorder.sla_escalated"
++                        and (r.get("payload") or {}).get("objId") == wo), None)
++            if got:
++                break
++        check(got is not None, f"220s 内未等到 {wo} 的 workorder.sla_escalated 投递记录")
++        st, b = ctx.admin.get("/notifications/my", params={"page": 1, "size": 30})
++        noti = next((n for n in (data(b) or {}).get("records") or []
++                     if n.get("type") == "SLA" and n.get("refId") == wo), None)
++        check(noti is not None, "申请人未收到 SLA 升级站内信")
++        return f"投递记录 #{got.get('id')} + 站内信 #{noti.get('id')}"
++    finally:
++        if hid:
++            ctx.admin.delete(f"/webhooks/{hid}")
++        if wo:
++            try:
++                ctx.admin.post(f"/workorders/{wo}/transitions", {"action": "开始处理", "opinion": "t"})
++                ctx.admin.post(f"/workorders/{wo}/transitions", {"action": "关闭", "opinion": "t", "rootCause": "测试收尾"})
++            except Exception:  # noqa
++                pass
++        try:
++            ctx.admin.put(f"/workorders/sla-config/{wo_type}/{prio}", restore)
++        except Exception:  # noqa
++            pass
++
++
++@case(S, "CT-15", "SSE 端点契约：无 token 401；建连发 connected 帧；工单事件按频道实时广播", risk="实时推送链路断裂", level="P0")
++def _(ctx):
++    url = f"{ctx.base}/notifications/sse"
++    r = rq.get(url, timeout=10)
++    check(r.status_code == 401, f"未带 token 应 401，实际 {r.status_code}")
++    tok = ctx.admin.s.cookies.get("access_token")
++    check(bool(tok), "登录会话缺少 access_token cookie")
++    with rq.get(url, params={"token": tok}, stream=True, timeout=(10, 15)) as s:
++        check(s.status_code == 200, f"建连 HTTP {s.status_code}")
++        # iter_lines 不可重入：第二次调用会新建生成器，而首个生成器被 GC 时会把
++        # urllib3 底层连接一并关闭，第二段只能读到空流——必须单生成器跨阶段消费
++        lines = s.iter_lines(decode_unicode=True)
++        head, t0 = [], time.time()
++        for line in lines:
++            if line:
++                head.append(line)
++            if any(x.startswith("data:") for x in head) or time.time() - t0 > 8:
++                break
++        check(any("connected" in x for x in head), f"首帧不是 connected：{head[:4]}")
++        st, b = ctx.admin.post("/workorders", {"woType": "巡检", "title": f"CT-15 SSE 广播 {ctx.run_id}"})
++        check(st == 200, f"建单 HTTP {st} {msg(b)}")
++        hit, t0 = False, time.time()
++        for line in lines:
++            if line and line.startswith("data:") and '"channel":"workorder"' in line.replace(" ", ""):
++                hit = True
++                break
++            if time.time() - t0 > 10:
++                break
++        check(hit, "10s 内未在流上收到 workorder 频道广播帧")
++    return "connected 帧 + workorder 频道广播均正常"
+diff --git a/tests/suites/s50_concurrency.py b/tests/suites/s50_concurrency.py
+index d64423a..ee641f9 100644
+--- a/tests/suites/s50_concurrency.py
++++ b/tests/suites/s50_concurrency.py
+@@ -1,6 +1,15 @@
+-"""并发：唯一键、乐观锁、状态流转、编号生成在并发下的正确性（不出现 500、不重复、不丢失）。"""
++"""并发：唯一键、乐观锁、状态流转、编号生成在并发下的正确性（不出现 500、不重复、不丢失）。
++
++v3.5 增补：CC-07 覆盖 SSE 长连接的并发建连 / 心跳 / 广播 / 断开清理。
++"""
++import queue
++import threading
++import time
+ import uuid
+ from concurrent.futures import ThreadPoolExecutor
++
++import requests as rq
++
+ from lib.framework import suite, case, check
+ from lib.context import data, msg
+ 
+@@ -77,3 +86,84 @@ def _(ctx):
+         return f"{len(got)} 条投递记录与 {len(nos)} 张工单一一对应"
+     finally:
+         ctx.admin.delete(f"/webhooks/{hid}")
++
++
++@case(S, "CC-07", "20 路 SSE 并发：全部建连成功、收到心跳与广播、断开后连接可回收再建", risk="SSE 连接泄漏 / 广播丢帧（v3.5）", level="P0")
++def _(ctx):
++    url = f"{ctx.base}/notifications/sse"
++    tok = ctx.admin.s.cookies.get("access_token")
++    check(bool(tok), "登录会话缺少 access_token cookie")
++
++    def open_stream():
++        return rq.get(url, params={"token": tok}, stream=True, timeout=(10, 90))
++
++    def first_line(lines):
++        t0 = time.time()
++        for line in lines:
++            if line:
++                return line
++            if time.time() - t0 > 8:
++                return ""
++        return ""
++
++    streams = _par(20, lambda _: open_stream())
++    try:
++        bad = [s.status_code for s in streams if s.status_code != 200]
++        check(not bad, f"20 路建连存在非 200：{bad[:5]}")
++        # 每条流只建一个 iter_lines 生成器并全程复用：iter_lines 不可重入，
++        # 首个生成器被 GC 时会把 urllib3 底层连接一并关闭，第二次调用只能读到空流
++        lines = [s.iter_lines(decode_unicode=True) for s in streams]
++        heads = _par(20, lambda i: first_line(lines[i]))
++        miss = [i for i, h in enumerate(heads) if "connected" not in h]
++        check(not miss, f"{len(miss)} 条流未收到 connected 帧：{[heads[i] for i in miss[:3]]}")
++
++        # 心跳（默认 25s 一帧 :ping 注释）与「建连-断开」回收循环并行进行
++        hb = queue.Queue()
++
++        def read_heartbeat(lines):
++            try:
++                t0 = time.time()
++                for line in lines:
++                    if line and line.startswith(":"):
++                        hb.put(line)
++                        return
++                    if time.time() - t0 > 40:
++                        hb.put("")
++                        return
++            except Exception as e:  # noqa
++                hb.put(f"EXC:{e}")
++
++        th = threading.Thread(target=read_heartbeat, args=(lines[0],), daemon=True)
++        th.start()
++        for _ in range(2):   # 两轮「20 建连 + 全断开」：连接若未清理，注册表将逼近 200 上限
++            time.sleep(1.5)
++            again = _par(20, lambda _: open_stream())
++            for s in again:
++                s.close()
++        beat = hb.get(timeout=45)
++        check(beat == ":ping", f"心跳帧异常：{beat!r}")
++
++        st, b = ctx.admin.post("/workorders", {"woType": "巡检", "title": f"CC-07 SSE 广播 {ctx.run_id}"})
++        check(st == 200, f"建单 HTTP {st} {msg(b)}")
++
++        def recv_broadcast(lines):
++            t0 = time.time()
++            for line in lines:
++                if line and line.startswith("data:") and '"channel":"workorder"' in line.replace(" ", ""):
++                    return True
++                if time.time() - t0 > 10:
++                    return False
++            return False
++
++        got = _par(3, lambda i: recv_broadcast(lines[1 + i]))
++        check(all(got), f"3 条抽样流仅 {sum(got)} 条收到 workorder 频道广播")
++        return "20 建连 + 心跳 + 2×20 建断回收 + 3/3 广播全部正常"
++    finally:
++        for s in streams:
++            s.close()
++    # 断开全部后：仍可新建（连接已回收，未耗尽实例上限）
++    tail = open_stream()
++    try:
++        check(tail.status_code == 200, f"回收后再建连 HTTP {tail.status_code}")
++    finally:
++        tail.close()
+diff --git a/tests/suites/s60_performance.py b/tests/suites/s60_performance.py
+index 8d737f5..c387e00 100644
+--- a/tests/suites/s60_performance.py
++++ b/tests/suites/s60_performance.py
+@@ -25,7 +25,8 @@ def _measure(ctx, path, params=None, n=10):
+     """测纯服务端延迟：遇到限流（429）先按 Retry-After 等待再重测该样本，不把等待时间计入延迟；
+     样本间隔 80 ms，使压测账号保持在「每秒 20 次」的限流以内。"""
+     c = ctx.admin
+-    c.get(path, params=params)  # 预热
++    for _ in range(5):   # 预热 5 发：套件首项的 JIT/池冷态不应计入稳态预算
++        c.get(path, params=params)
+     ts = []
+     while len(ts) < n:
+         time.sleep(0.08)
+@@ -72,6 +73,9 @@ def _(ctx):
+     def one(i):
+         st, _ = users[i % 10].get("/assets", params={"page": 1 + i % 50, "size": 20}, no_retry=True)
+         return st
++    # 前置触发监控总览的 60s 计数缓存回源（正则 COUNT 全表扫描约数秒）：否则压测中途撞上回源
++    # 会让数据库被占住、吞吐骤降（同机实测 287 req/s → 60 req/s），测不出服务端真实吞吐
++    ctx.admin.get("/monitoring/overview")
+     with ThreadPoolExecutor(20) as ex:
+         list(ex.map(one, range(20)))  # 预热
+         t0 = time.perf_counter()
+@@ -82,3 +86,24 @@ def _(ctx):
+     check(not errs, f"{len(errs)} 次失败：{sorted(set(errs))}")
+     check(rps >= 80 / F, f"吞吐 {rps:.0f} req/s")
+     return f"{rps:.0f} req/s"
++
++
++@case(S, "PERF-21", "20 条活跃 SSE 连接下资产列表 p50 ≤ 60 ms（推送常开不拖累查询）", level="P1")
++def _(ctx):
++    """v3.5：SSE 心跳线程与长连接不应挤占业务请求的处理线程 / 连接池"""
++    import requests as rq
++    tok = ctx.admin.s.cookies.get("access_token")
++    check(bool(tok), "登录会话缺少 access_token cookie")
++    streams = []
++    try:
++        for _ in range(20):
++            r = rq.get(f"{ctx.base}/notifications/sse", params={"token": tok}, stream=True, timeout=(10, 120))
++            check(r.status_code == 200, f"SSE 建连 HTTP {r.status_code}")
++            streams.append(r)
++            time.sleep(0.05)   # 避开限流突发额度
++        p50, p90 = _measure(ctx, "/assets", {"page": 1, "size": 20})
++        check(p50 <= 60 * F, f"p50 {p50:.0f} ms 超出预算 {60 * F:.0f} ms")
++        return f"SSE×20 常开下 p50 {p50:.0f} ms / p90 {p90:.0f} ms"
++    finally:
++        for r in streams:
++            r.close()
+diff --git a/tests/suites/s70_e2e_ui.py b/tests/suites/s70_e2e_ui.py
+index 18f3b16..524abe5 100644
+--- a/tests/suites/s70_e2e_ui.py
++++ b/tests/suites/s70_e2e_ui.py
+@@ -34,7 +34,9 @@ def run_page(ctx, user, pw, fn):
+     async def main():
+         async with async_playwright() as p:
+             b = await p.chromium.launch(executable_path=_exe())
+-            context = await b.new_context(viewport={"width": 1440, "height": 900}, locale="zh-CN",
++            # 视口 1920：看板 6 列（每列 280px）在 1440 宽度下「已关闭」列溢出可视区，
++            # drag_to 的 mouse.move 不会横向滚动 overflow 容器，drop 会落空（UI-08）
++            context = await b.new_context(viewport={"width": 1920, "height": 900}, locale="zh-CN",
+                                           extra_http_headers={"X-Forwarded-For": ctx.ip()})
+             page = await context.new_page()
+             errors = {"console": [], "api": []}
+@@ -173,3 +175,93 @@ def _(ctx):
+         return cls
+     cls = run_page(ctx, ctx.admin_user, ctx.admin_pw, fn)
+     check("dark" in cls, f"html class={cls!r}")
++
++
++@case(S, "UI-07", "通知中心：实时到达、红点、列表、全部已读、点击跳转工单", risk="v3.5 通知链路在界面断裂", level="P0")
++def _(ctx):
++    ctx.role("R35-NOTI", {"workorders": "rw"})
++    u = ctx.user("t34-uinoti", ["R35-NOTI"])
++    wo = ctx.workorder(client=u, wo_type="巡检")
++    # 管理员开始处理 → v3.5 新增：通知 applicant
++    st, b = ctx.admin.post(f"/workorders/{wo}/transitions", {"action": "开始处理", "opinion": "ui"})
++    check(st == 200, f"开始处理 HTTP {st} {msg(b)}")
++
++    async def fn(page, errors):
++        await page.goto(ctx.ui_base + "/notifications")
++        await page.wait_for_timeout(3000)
++        body = await page.inner_text("body")
++        listed = wo in body
++        pre_badge = await page.locator(".layout-bell .el-badge__content").count()
++        # 布局铃铛下拉与通知中心页各有一个「全部已读」：限定到页面工具栏，避免 strict mode violation
++        await page.locator(".noti-toolbar button:has-text('全部已读')").click()
++        await page.wait_for_timeout(2000)
++        post_badge = await page.locator(".layout-bell .el-badge__content").count()
++        await page.locator(f".noti-row:has-text('{wo}')").first.click()
++        await page.wait_for_timeout(2000)
++        return listed, pre_badge, post_badge, page.url, errors["api"]
++    listed, pre_badge, post_badge, url, api = run_page(ctx, "t34-uinoti", u.password, fn)
++    check(listed, "通知列表未出现「开始处理」通知")
++    check(not api, f"接口 5xx：{api[:3]}")
++    check(pre_badge >= 1, "有未读通知时红点未显示")
++    check(post_badge == 0, f"全部已读后红点仍在：{post_badge}")
++    check("/workorders" in url, f"点击通知未跳转工单页：{url}")
++
++
++@case(S, "UI-08", "工单看板：拖拽流转生效，非法移动（处理中→已关闭）卡片回弹并提示", risk="v3.5 看板流转", level="P1")
++def _(ctx):
++    wo1 = ctx.workorder(wo_type="巡检", title="UI-08 拖拽流转")
++    wo2 = ctx.workorder(wo_type="巡检", title="UI-08 非法移动")
++    ctx.admin.post(f"/workorders/{wo2}/transitions", {"action": "开始处理", "opinion": "t"})
++
++    async def fn(page, errors):
++        await page.goto(ctx.ui_base + "/workorders")
++        await page.wait_for_timeout(2000)
++        await page.locator(".el-radio-button:has-text('看板')").click()
++        await page.wait_for_timeout(3000)
++        # 1) 合法流转：待处理 → 处理中
++        card = page.locator(f".kb-card:has-text('{wo1}')").first
++        target = page.locator(".kb-col:has-text('处理中')").first
++        await card.drag_to(target)
++        await page.wait_for_timeout(2500)
++        st1 = await page.locator(f".kb-col:has-text('处理中') .kb-card:has-text('{wo1}')").count()
++        # 2) 非法移动：处理中 → 已关闭（未映射动作，前端提示且卡片留在原列）
++        card2 = page.locator(f".kb-card:has-text('{wo2}')").first
++        target2 = page.locator(".kb-col:has-text('已关闭')").first
++        await card2.drag_to(target2)
++        await page.wait_for_timeout(1500)
++        warn = await page.locator(".el-message:has-text('详情页关闭')").count()
++        stay = await page.locator(f".kb-col:has-text('处理中') .kb-card:has-text('{wo2}')").count()
++        return st1, warn, stay, errors["api"]
++    st1, warn, stay, api = run_page(ctx, ctx.admin_user, ctx.admin_pw, fn)
++    check(not api, f"接口 5xx：{api[:3]}")
++    check(st1 == 1, "拖拽后卡片未出现在「处理中」列")
++    check(warn >= 1, "非法移动未出现提示")
++    check(stay == 1, "非法移动后卡片未回弹到「处理中」列")
++    st, b = ctx.admin.get(f"/workorders/{wo1}")
++    check((data(b) or {}).get("status") == "处理中", f"wo1 后端状态 {(data(b) or {}).get('status')}")
++    st, b = ctx.admin.get(f"/workorders/{wo2}")
++    check((data(b) or {}).get("status") == "处理中", f"wo2 后端状态 {(data(b) or {}).get('status')}")
++
++
++@case(S, "UI-09", "网络拓扑：全量图渲染、图例可勾选、机房过滤不报错", risk="v3.5 拓扑页", level="P1")
++def _(ctx):
++    async def fn(page, errors):
++        await page.goto(ctx.ui_base + "/topology")
++        await page.wait_for_timeout(5000)
++        canvas = await page.locator(".chart canvas").count()
++        body = await page.inner_text("body")
++        legend = await page.locator(".rel-filter .el-checkbox").count()
++        if legend:
++            await page.locator(".rel-filter .el-checkbox").first.click()
++            await page.wait_for_timeout(1500)
++            canvas2 = await page.locator(".chart canvas").count()
++        else:
++            canvas2 = canvas
++        return canvas, canvas2, legend, body, errors["api"], errors["console"]
++    canvas, canvas2, legend, body, api, js = run_page(ctx, ctx.admin_user, ctx.admin_pw, fn)
++    check(canvas > 0, "ECharts canvas 未渲染")
++    check(canvas2 > 0, "切换图例后 canvas 消失")
++    check(legend > 0, "关系类型图例缺失")
++    check("机房" in body and "资产" in body, "节点统计未显示")
++    check(not api, f"接口 5xx：{api[:3]}")
++    check(not js, f"脚本错误：{js[:3]}")
+diff --git a/tests/suites/s80_cluster.py b/tests/suites/s80_cluster.py
+index 4c115be..20b37b6 100644
+--- a/tests/suites/s80_cluster.py
++++ b/tests/suites/s80_cluster.py
+@@ -1,9 +1,14 @@
+ """多实例（ADR-11）：两个后端实例共用同一数据库与 Redis 时，会话吊销、登录计数、限流、定时任务互斥是否在实例间一致。
+ 
+ 需要 BASE2 指向第二个实例（与 BASE 同库同 Redis）。CL-06 需要 SLOW=1 且能直连数据库（PGHOST 等）。
++v3.5 增补：CL-07（SSE 跨实例，需 Redis）、CL-08（低库存补货单跨实例幂等，需 ticket 模式）。
+ """
+ import time
++import uuid
+ from concurrent.futures import ThreadPoolExecutor
++
++import requests as rq
++
+ from lib.framework import suite, case, setup, check, Skip
+ from lib.context import data, msg
+ 
+@@ -103,3 +108,84 @@ def _(ctx):
+     # 两个任务的周期都是 60 秒：185 秒内单实例最多 4 次；两个实例若各跑一次会到 6~7 次
+     check(all(0 < d <= 4 for d in deltas.values()), f"执行次数 {deltas}")
+     return f"185 秒内执行次数 {deltas}"
++
++
++@case(S, "CL-07", "SSE 跨实例：实例 A 产生的工单事件 3 秒内到达实例 B 的连接（Redis pub/sub）", risk="v3.5 跨实例推送缺失", level="P0")
++def _(ctx):
++    st, b = ctx.client().get("/healthz")
++    if (data(b) or {}).get("redis") == "disabled":
++        raise Skip("Redis 未接入（SSE 跨实例依赖 Redis pub/sub 中继）")
++    tok = ctx.admin.s.cookies.get("access_token")
++    check(bool(tok), "登录会话缺少 access_token cookie")
++    with rq.get(f"{ctx.base2}/notifications/sse", params={"token": tok}, stream=True, timeout=(10, 15)) as s:
++        check(s.status_code == 200, f"实例 B 建连 HTTP {s.status_code}")
++        # iter_lines 不可重入（首个生成器被 GC 会关闭 urllib3 连接）：单生成器跨阶段消费
++        lines = s.iter_lines(decode_unicode=True)
++        head, t0 = "", time.time()
++        for line in lines:
++            if line:
++                head = line
++                break
++            if time.time() - t0 > 8:
++                break
++        check("connected" in head, f"实例 B 建连首帧异常：{head!r}")
++        t0 = time.time()
++        st, b = ctx.admin.post("/workorders", {"woType": "巡检", "title": f"CL-07 跨实例 {ctx.run_id}"})
++        check(st == 200, f"实例 A 建单 HTTP {st} {msg(b)}")
++        wo = data(b)["woNo"]
++        hit, elapsed = False, None
++        for line in lines:
++            elapsed = time.time() - t0
++            if line and line.startswith("data:") and wo in line:
++                hit = True
++                break
++            if elapsed > 10:
++                break
++        check(hit, "10s 内实例 B 的连接未收到该工单广播")
++        check(elapsed is not None and elapsed <= 3.0, f"跨实例送达耗时 {elapsed:.1f}s，超过 3s 预算")
++        return f"跨实例送达 {elapsed:.2f}s"
++
++
++@case(S, "CL-08", "双实例并发出库触发低库存：全库仅生成一张补货工单（跨实例幂等）", risk="v3.5 联动跨实例重复建单", level="P0")
++def _(ctx):
++    st, b = ctx.admin.get("/materials/meta")
++    unit = (((data(b) or {}).get("units")) or ["个"])[0]
++    st, b = ctx.admin.get("/warehouses", params={"page": 1, "size": 1})
++    whs = (data(b) or {}).get("records") or []
++    if not whs:
++        raise Skip("库中无仓库")
++    wh = whs[0]["warehouseCode"]
++    code = f"MAT-CL35-{uuid.uuid4().hex[:8].upper()}"
++    st, b = ctx.admin.post("/materials", {"materialCode": code, "name": f"集群物料 {code}", "unit": unit, "safetyStock": 5})
++    check(st == 200, f"创建物料 HTTP {st} {msg(b)}")
++    st, b = ctx.admin.post("/stock-logs", {"logType": "IN", "materialCode": code, "qty": 10, "warehouseCode": wh})
++    check(st == 200, f"入库 HTTP {st} {msg(b)}")
++
++    ab = _b(ctx)
++    st, b = ab.login(ctx.admin_user, ctx.admin_pw)
++    check(st == 200, f"实例 B 管理员登录 HTTP {st} {msg(b)}")
++
++    def out_via(c, qty):
++        return c.post("/stock-logs", {"logType": "OUT", "materialCode": code, "qty": qty, "warehouseCode": wh,
++                                      "remark": "CL-08 双实例触发"})[0]
++    # 两实例几乎同时出库（6+4=10，恰好清空库存）：各自触发低库存联动
++    with ThreadPoolExecutor(2) as ex:
++        codes = list(ex.map(lambda a: out_via(a[0], a[1]), [(ctx.admin, 6), (ab, 4)]))
++    check(codes.count(200) == 2, f"两实例出库状态码 {codes}")
++
++    def open_tickets():
++        st, b = ctx.admin.get("/workorders", params={"page": 1, "size": 50, "keyword": code})
++        return [r for r in (data(b) or {}).get("records") or []
++                if r.get("woType") == "补货" and r.get("status") in ("待处理", "待审批", "处理中")]
++    rows = []
++    for _ in range(15):   # 联动为提交后异步：行锁 + 开放单查重应把并发触发收敛为一张
++        rows = open_tickets()
++        if rows:
++            break
++        time.sleep(1.0)
++    if not rows:
++        raise Skip("未生成补货单（被测实例非 ticket 模式：-Ddcim.linkage.low-stock.mode=ticket）")
++    time.sleep(3.0)   # 等两个异步任务都落地后再计数
++    rows = open_tickets()
++    check(len(rows) == 1, f"双实例并发触发后应只有 1 张未完结补货单，实际 {len(rows)}：{[r['woNo'] for r in rows]}")
++    return f"补货单 {rows[0]['woNo']}，跨实例幂等成立"

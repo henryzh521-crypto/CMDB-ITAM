@@ -1,0 +1,745 @@
+diff --git a/a/platform-web/nginx.conf b/b/platform-web/nginx.conf
+index d59e8a5..8354111 100644
+--- a/a/platform-web/nginx.conf
++++ b/b/platform-web/nginx.conf
+@@ -32,9 +32,17 @@ server {
+ 
+     location = /index.html {
+         add_header Cache-Control "no-cache";
++        # 注意：location 内出现 add_header 会让 server 级的全部 add_header 失效，CSP 须重复声明
++        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+     }
+ 
+     # 安全响应头
+     add_header X-Content-Type-Options "nosniff" always;
+     add_header X-Frame-Options "DENY" always;
++    # CSP 与后端部署（deploy/native/nginx-dcim.conf、Caddy）对齐：
++    # script-src 'self'：Vite 产物为同源 module script，无内联/eval 依赖；
++    # style-src 'unsafe-inline'：Element Plus / 运行时注入的样式需要；
++    # img-src data:：二维码 dataURL 与 favicon；
++    # connect-src 'self'：API/SSE 均为同源 /api 反代。
++    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+ }
+diff --git a/a/platform-web/package-lock.json b/b/platform-web/package-lock.json
+index eafcdfa..5188508 100644
+--- a/a/platform-web/package-lock.json
++++ b/b/platform-web/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "platform-web",
+-  "version": "3.4.0",
++  "version": "3.5.1",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "platform-web",
+-      "version": "3.4.0",
++      "version": "3.5.1",
+       "dependencies": {
+         "@element-plus/icons-vue": "^2.3.1",
+         "axios": "^1.7.7",
+@@ -2391,9 +2391,9 @@
+       "license": "ISC"
+     },
+     "node_modules/source-map-js": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+-      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
++      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
+       "license": "BSD-3-Clause",
+       "engines": {
+         "node": ">=0.10.0"
+diff --git a/a/platform-web/package.json b/b/platform-web/package.json
+index cfd3679..37665a7 100644
+--- a/a/platform-web/package.json
++++ b/b/platform-web/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "platform-web",
+   "private": true,
+-  "version": "3.5.0",
++  "version": "3.5.1",
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+@@ -30,5 +30,8 @@
+     "unplugin-vue-components": "^32.1.0",
+     "vite": "^5.4.8",
+     "vue-tsc": "^2.1.6"
++  },
++  "overrides": {
++    "source-map-js": "1.2.2"
+   }
+ }
+diff --git a/a/platform-web/src/api/client.ts b/b/platform-web/src/api/client.ts
+index e1dce92..9686331 100644
+--- a/a/platform-web/src/api/client.ts
++++ b/b/platform-web/src/api/client.ts
+@@ -31,8 +31,11 @@ function redirectToLogin(): void {
+   const p = window.location.pathname
+   const onMobile = p === '/m' || p.startsWith('/m/')
+   const loginPath = onMobile ? '/m/login' : '/login'
+-  if (!window.location.pathname.startsWith(loginPath)) {
+-    window.location.href = loginPath
++  if (!p.startsWith(loginPath)) {
++    // 携带当前完整路径供登录成功后回跳（登录页已有 redirect query 处理）；
++    // 已在登录页时不再跳转，防止重复重定向。
++    const redirect = encodeURIComponent(p + window.location.search + window.location.hash)
++    window.location.href = `${loginPath}?redirect=${redirect}`
+   }
+ }
+ 
+diff --git a/a/platform-web/src/layout/MainLayout.vue b/b/platform-web/src/layout/MainLayout.vue
+index 54607b1..1ea1669 100644
+--- a/a/platform-web/src/layout/MainLayout.vue
++++ b/b/platform-web/src/layout/MainLayout.vue
+@@ -169,13 +169,19 @@ const searchResults = ref<SearchResultItem[]>([])
+ const showSearch = ref(false)
+ let searchTimer: number | undefined
+ 
++/** 搜索请求序号：连续输入触发多次搜索时，仅接受最后一次的响应（丢弃过期结果） */
++let searchSeq = 0
++
+ async function onSearch() {
+-  if (!searchKeyword.value.trim()) {
++  const kw = searchKeyword.value.trim()
++  if (!kw) {
+     searchResults.value = []
+     return
+   }
++  const seq = ++searchSeq
+   try {
+-    const res = await globalSearch(searchKeyword.value.trim())
++    const res = await globalSearch(kw)
++    if (seq !== searchSeq) return
+     searchResults.value = res ?? []
+     showSearch.value = true
+   } catch {
+diff --git a/a/platform-web/src/main.ts b/b/platform-web/src/main.ts
+index 309179b..66feab2 100644
+--- a/a/platform-web/src/main.ts
++++ b/b/platform-web/src/main.ts
+@@ -1,5 +1,6 @@
+ import { createApp } from 'vue'
+ import { createPinia } from 'pinia'
++import { ElMessage } from 'element-plus'
+ import * as ElementPlusIconsVue from '@element-plus/icons-vue'
+ import 'element-plus/dist/index.css'
+ // Element Plus 暗色变量（html.dark 时生效）；v3.2 只切了自定义变量，表格/弹窗/输入框仍是浅色
+@@ -11,6 +12,25 @@ import './style.css'
+ 
+ const app = createApp(App)
+ 
++// 全局错误边界：未捕获的组件错误只弹一次通用提示（防重复弹窗刷屏），
++// 详细堆栈进 console；后续接入错误上报服务时在此扩展。
++let globalErrorToastShown = false
++app.config.errorHandler = (err, _instance, info) => {
++  console.error('[global-error]', info, err)
++  if (!globalErrorToastShown) {
++    globalErrorToastShown = true
++    ElMessage.error('页面发生异常，请刷新重试')
++    window.setTimeout(() => {
++      globalErrorToastShown = false
++    }, 5000)
++  }
++}
++
++// 未处理的 Promise 拒绝：仅记录日志，不打断用户操作（上报扩展点同上）
++window.addEventListener('unhandledrejection', (e) => {
++  console.error('[unhandled-rejection]', e.reason)
++})
++
+ // 全局注册 Element Plus 图标
+ for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+   app.component(key, component)
+diff --git a/a/platform-web/src/router/index.ts b/b/platform-web/src/router/index.ts
+index 7e7dcd2..fdb41a6 100644
+--- a/a/platform-web/src/router/index.ts
++++ b/b/platform-web/src/router/index.ts
+@@ -443,6 +443,14 @@ router.afterEach((to) => {
+   document.title = t ? `${t} · 智算资产管理平台` : '智算资产管理平台'
+ })
+ 
++/** 登录态补全失败时区分错误来源：
++ *  - 401 由 api 拦截器统一处理（清态 + 整页跳登录），守卫保持原行为即可；
++ *  - 其余（后端不可达 / 网络错误）需清理本地残留登录态，否则 /login 守卫
++ *    看到 isLoggedIn 又把人弹回受保护页，形成「重定向死循环 + 请求风暴」白屏。 */
++function isUnauthorized(e: unknown): boolean {
++  return (e as { response?: { status?: number } } | null)?.response?.status === 401
++}
++
+ router.beforeEach(async (to) => {
+   const auth = useAuthStore()
+ 
+@@ -456,7 +464,8 @@ router.beforeEach(async (to) => {
+     }
+     try {
+       await auth.ensureLoaded()
+-    } catch {
++    } catch (e) {
++      if (!isUnauthorized(e)) auth.reset()
+       return '/m/login'
+     }
+     // 首次登录必须改密（后端 JwtAuthFilter 也已强制，这里只负责把人送到改密页）
+@@ -476,7 +485,9 @@ router.beforeEach(async (to) => {
+   // 已登录但权限未加载：自动调用 /api/auth/me 补全
+   try {
+     await auth.ensureLoaded()
+-  } catch {
++  } catch (e) {
++    // 非 401（后端不可达等）：清残留登录态再去登录页，避免 /login 守卫弹回造成死循环
++    if (!isUnauthorized(e)) auth.reset()
+     return '/login'
+   }
+ 
+diff --git a/b/platform-web/src/utils/escape.ts b/b/platform-web/src/utils/escape.ts
+new file mode 100644
+index 0000000..6daf89c
+--- /dev/null
++++ b/b/platform-web/src/utils/escape.ts
+@@ -0,0 +1,11 @@
++/** HTML 特殊字符转义（& < > " '）：
++ *  用于 ECharts tooltip formatter（renderMode=html，经 innerHTML 插入）等
++ *  会拼 HTML 字符串的场景，防止用户可控字段造成存储型 XSS。 */
++export function escapeHtml(s: string): string {
++  return s
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;')
++    .replace(/'/g, '&#39;')
++}
+diff --git a/a/platform-web/src/utils/qrcode.ts b/b/platform-web/src/utils/qrcode.ts
+index 1409582..fe45f06 100644
+--- a/a/platform-web/src/utils/qrcode.ts
++++ b/b/platform-web/src/utils/qrcode.ts
+@@ -1,4 +1,5 @@
+ import { toCanvas, toDataURL } from 'qrcode'
++import { escapeHtml } from '@/utils/escape'
+ 
+ export interface QrcodeItem {
+   assetNo: string
+@@ -76,12 +77,3 @@ export async function openPrintPage(items: QrcodeItem[]): Promise<void> {
+   win.focus()
+   win.print()
+ }
+-
+-function escapeHtml(s: string): string {
+-  return s
+-    .replace(/&/g, '&amp;')
+-    .replace(/</g, '&lt;')
+-    .replace(/>/g, '&gt;')
+-    .replace(/"/g, '&quot;')
+-    .replace(/'/g, '&#39;')
+-}
+diff --git a/b/platform-web/src/utils/upload.ts b/b/platform-web/src/utils/upload.ts
+new file mode 100644
+index 0000000..9b702fd
+--- /dev/null
++++ b/b/platform-web/src/utils/upload.ts
+@@ -0,0 +1,13 @@
++import { ElMessage } from 'element-plus'
++
++/** CSV 批量导入前端预校验：大小上限 10MB，超限直接提示、不发请求 */
++export const CSV_IMPORT_MAX_SIZE = 10 * 1024 * 1024
++
++/** 导入前校验 CSV 大小，通过返回 true；超限弹提示并返回 false */
++export function checkCsvImportSize(file: File): boolean {
++  if (file.size > CSV_IMPORT_MAX_SIZE) {
++    ElMessage.error('CSV 文件不能超过 10MB，请拆分后分批导入')
++    return false
++  }
++  return true
++}
+diff --git a/a/platform-web/src/views/asset/AssetLifecycleView.vue b/b/platform-web/src/views/asset/AssetLifecycleView.vue
+index 49f8feb..0b2a2ac 100644
+--- a/a/platform-web/src/views/asset/AssetLifecycleView.vue
++++ b/b/platform-web/src/views/asset/AssetLifecycleView.vue
+@@ -14,6 +14,7 @@ import type { AssetDetail, AssetEvent } from '@/api/asset'
+ import AssetPicker from '@/components/AssetPicker.vue'
+ import echarts, { CHART_COLORS } from '@/utils/echarts'
+ import type { EChartsType } from '@/utils/echarts'
++import { escapeHtml } from '@/utils/escape'
+ import { ASSET_EVENT_LABEL, ASSET_EVENT_TAG, assetEventLabel } from '@/utils/assetEvents'
+ 
+ interface Activity {
+@@ -102,7 +103,7 @@ function renderCharts() {
+     statusChart = statusChart || echarts.init(statusEl.value)
+     statusChart.setOption({
+       color: CHART_COLORS,
+-      tooltip: { trigger: 'item', formatter: '{b}：{c} 台（{d}%）' },
++      tooltip: { trigger: 'item', formatter: (p: any) => `${escapeHtml(p.name)}：${p.value} 台（${p.percent}%）` },
+       series: [
+         {
+           type: 'pie',
+diff --git a/a/platform-web/src/views/asset/AssetListView.vue b/b/platform-web/src/views/asset/AssetListView.vue
+index 4cc01fa..ed9a339 100644
+--- a/a/platform-web/src/views/asset/AssetListView.vue
++++ b/b/platform-web/src/views/asset/AssetListView.vue
+@@ -41,6 +41,7 @@ import { fetchRackFreeUnits, fetchRacks, fetchRooms } from '@/api/room'
+ import type { RackItem, RoomItem } from '@/api/room'
+ import { downloadQrcode, openPrintPage, renderToCanvas } from '@/utils/qrcode'
+ import { assetEventLabel } from '@/utils/assetEvents'
++import { checkCsvImportSize } from '@/utils/upload'
+ 
+ const auth = useAuthStore()
+ /** v3.4：字段级权限——隐藏字段不显示，只读字段不可编辑（后端同样校验） */
+@@ -137,7 +138,11 @@ const viewMode = ref<'flat' | 'tree'>('flat')
+ const treeData = ref<import('@/api/asset').AssetTreeItem[]>([])
+ const treeLoading = ref(false)
+ 
++/** 列表请求序号：快速切换筛选/翻页时仅接受最后一次请求的响应（丢弃过期响应） */
++let listSeq = 0
++
+ async function load() {
++  const seq = ++listSeq
+   if (viewMode.value === 'tree') {
+     await loadTree()
+     return
+@@ -153,23 +158,30 @@ async function load() {
+       categoryCode: query.categoryCode || undefined,
+       parentAssetNo: query.parentAssetNo || undefined,
+     })
++    if (seq !== listSeq) return
+     total.value = res.total ?? 0
+     records.value = res.records ?? []
+   } catch {
+     // 拦截器已提示
+   } finally {
+-    listLoading.value = false
++    if (seq === listSeq) listLoading.value = false
+   }
+ }
+ 
++/** 树请求序号：同上（与列表共用场景：视图模式来回切换） */
++let treeSeq = 0
++
+ async function loadTree() {
++  const seq = ++treeSeq
+   treeLoading.value = true
+   try {
+-    treeData.value = (await fetchAssetTree()) || []
++    const t = (await fetchAssetTree()) || []
++    if (seq !== treeSeq) return
++    treeData.value = t
+   } catch {
+-    treeData.value = []
++    if (seq === treeSeq) treeData.value = []
+   } finally {
+-    treeLoading.value = false
++    if (seq === treeSeq) treeLoading.value = false
+   }
+ }
+ 
+@@ -837,6 +849,7 @@ async function submitImport() {
+     ElMessage.warning('请先选择 CSV 文件')
+     return
+   }
++  if (!checkCsvImportSize(importFile.value)) return
+   importing.value = true
+   try {
+     importResult.value = await importAssets(importFile.value)
+diff --git a/a/platform-web/src/views/ci/CiRelationView.vue b/b/platform-web/src/views/ci/CiRelationView.vue
+index c4b6815..be033ec 100644
+--- a/a/platform-web/src/views/ci/CiRelationView.vue
++++ b/b/platform-web/src/views/ci/CiRelationView.vue
+@@ -20,6 +20,7 @@ import {
+   fetchImpactGraph,
+ } from '@/api/ci'
+ import type { CiGraph, CiMeta, CiRelation } from '@/api/ci'
++import { escapeHtml } from '@/utils/escape'
+ 
+ const auth = useAuthStore()
+ const route = useRoute()
+@@ -82,7 +83,7 @@ function renderGraph() {
+     symbolSize: n.depth === 0 ? 46 : Math.max(18, 34 - n.depth * 4),
+     itemStyle: { color: n.depth === 0 ? CHART_COLORS[3] : TYPE_COLOR[n.type] || CHART_COLORS[4] },
+     label: { show: n.depth === 0 || g.nodes.length < 60, position: 'right', formatter: n.name },
+-    tooltip: { formatter: `${CI_TYPE_LABEL[n.type] || n.type}　${n.id}<br/>${n.name}${n.status ? '　' + n.status : ''}<br/>层级 ${n.depth}` },
++    tooltip: { formatter: `${escapeHtml(CI_TYPE_LABEL[n.type] || n.type)}　${escapeHtml(n.id)}<br/>${escapeHtml(n.name)}${n.status ? '　' + escapeHtml(n.status) : ''}<br/>层级 ${n.depth}` },
+   }))
+   const links = g.edges.map((e) => ({
+     source: e.from,
+diff --git a/a/platform-web/src/views/ci/TopologyView.vue b/b/platform-web/src/views/ci/TopologyView.vue
+index 20e1e47..e28046c 100644
+--- a/a/platform-web/src/views/ci/TopologyView.vue
++++ b/b/platform-web/src/views/ci/TopologyView.vue
+@@ -12,6 +12,7 @@ import type { EChartsType } from '@/utils/echarts'
+ import { fetchRooms } from '@/api/room'
+ import { CI_TYPE_LABEL, fetchFullGraph } from '@/api/ci'
+ import type { CiFullGraph } from '@/api/ci'
++import { escapeHtml } from '@/utils/escape'
+ 
+ const router = useRouter()
+ 
+@@ -112,12 +113,12 @@ function render() {
+         formatter: (p: any) => {
+           if (p.dataType === 'node') {
+             const d = p.data
+-            return `${CI_TYPE_LABEL[d.rawType] || d.rawType}　${d.rawId}<br/>${d.name}${d.rawStatus ? '　' + d.rawStatus : ''}<br/><span style="color:#909399">点击节点跳转</span>`
++            return `${escapeHtml(CI_TYPE_LABEL[d.rawType] || d.rawType)}　${escapeHtml(d.rawId)}<br/>${escapeHtml(d.name)}${d.rawStatus ? '　' + escapeHtml(d.rawStatus) : ''}<br/><span style="color:#909399">点击节点跳转</span>`
+           }
+           if (p.dataType === 'edge') {
+             const s = nameOf.get(p.data.source)
+             const t = nameOf.get(p.data.target)
+-            return `${p.data.rawLabel}<br/>${s || p.data.source} → ${t || p.data.target}`
++            return `${escapeHtml(p.data.rawLabel)}<br/>${escapeHtml(s || p.data.source)} → ${escapeHtml(t || p.data.target)}`
+           }
+           return ''
+         },
+diff --git a/a/platform-web/src/views/finance/CostAllocationView.vue b/b/platform-web/src/views/finance/CostAllocationView.vue
+index 31f9399..c65eeda 100644
+--- a/a/platform-web/src/views/finance/CostAllocationView.vue
++++ b/b/platform-web/src/views/finance/CostAllocationView.vue
+@@ -8,6 +8,7 @@ import type { EChartsType } from '@/utils/echarts'
+ import { fetchDepreciationPeriods } from '@/api/finance'
+ import { fetchCostAllocation } from '@/api/upgrade'
+ import type { CostAllocationResult } from '@/api/upgrade'
++import { escapeHtml } from '@/utils/escape'
+ 
+ const DIMS = [
+   { value: 'department', label: '部门' },
+@@ -53,7 +54,7 @@ function render() {
+     pie.setOption(
+       {
+         color: CHART_COLORS,
+-        tooltip: { trigger: 'item', formatter: (p: any) => `${p.name}<br/>¥${money(p.value)}（${p.percent}%）` },
++        tooltip: { trigger: 'item', formatter: (p: any) => `${escapeHtml(p.name)}<br/>¥${money(p.value)}（${p.percent}%）` },
+         series: [{ type: 'pie', radius: ['40%', '70%'], data: d.rows.map((r) => ({ name: r.key, value: Number(r.monthDep) })) }],
+       },
+       true,
+diff --git a/a/platform-web/src/views/masterdata/CategoryView.vue b/b/platform-web/src/views/masterdata/CategoryView.vue
+index b59cc22..b071748 100644
+--- a/a/platform-web/src/views/masterdata/CategoryView.vue
++++ b/b/platform-web/src/views/masterdata/CategoryView.vue
+@@ -13,6 +13,7 @@ import {
+ import type { CategoryNode } from '@/api/masterdata'
+ import type { CsvImportResult } from '@/api/types'
+ import { saveBlob } from '@/api/asset'
++import { checkCsvImportSize } from '@/utils/upload'
+ 
+ /* ---------------- 分类树 ---------------- */
+ const tree = ref<CategoryNode[]>([])
+@@ -200,6 +201,7 @@ async function submitImport() {
+     ElMessage.warning('请先选择 CSV 文件')
+     return
+   }
++  if (!checkCsvImportSize(importFile.value)) return
+   importing.value = true
+   try {
+     importResult.value = await importCategories(importFile.value)
+diff --git a/a/platform-web/src/views/monitoring/AlertCenterView.vue b/b/platform-web/src/views/monitoring/AlertCenterView.vue
+index 34c3aa0..aed2ed8 100644
+--- a/a/platform-web/src/views/monitoring/AlertCenterView.vue
++++ b/b/platform-web/src/views/monitoring/AlertCenterView.vue
+@@ -57,7 +57,11 @@ function duration(a: AlertItem) {
+   return `${Math.floor(m / 1440)} 天 ${Math.floor((m % 1440) / 60)} 小时`
+ }
+ 
++/** 列表请求序号：筛选/翻页与 30s 自动刷新并发时，仅接受最后一次请求的响应 */
++let loadSeq = 0
++
+ async function load() {
++  const seq = ++loadSeq
+   loading.value = true
+   try {
+     const res = await fetchAlerts({
+@@ -69,12 +73,13 @@ async function load() {
+       assetNo: query.assetNo || undefined,
+       suppressed: query.view === 'all' ? undefined : query.view === 'suppressed',
+     })
++    if (seq !== loadSeq) return
+     records.value = res.records ?? []
+     total.value = res.total ?? 0
+   } catch {
+     // ignore
+   } finally {
+-    loading.value = false
++    if (seq === loadSeq) loading.value = false
+   }
+ }
+ 
+diff --git a/a/platform-web/src/views/report/DashboardView.vue b/b/platform-web/src/views/report/DashboardView.vue
+index a9fc2bb..e6f80d4 100644
+--- a/a/platform-web/src/views/report/DashboardView.vue
++++ b/b/platform-web/src/views/report/DashboardView.vue
+@@ -3,6 +3,7 @@ import { ASSET_EVENT_LABEL } from '@/utils/assetEvents'
+ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+ import { useAuthStore } from '@/stores/auth'
+ import echarts, { CHART_COLORS, axisColor, surfaceColor, type EChartsType } from '@/utils/echarts'
++import { escapeHtml } from '@/utils/escape'
+ import { fetchDashboard, fetchWorkorderSla, fetchRepairCost, fetchRepairDuration, fetchAssetFinanceSummary, fetchOpexStructure, fetchSupplierPerformance, fetchCapacityPlanning, fetchAssetTco } from '@/api/report'
+ import type { CategoryStatusItem, DashboardData, GroupCountItem, RoomUsageItem, AssetFinanceSummary, OpexStructureData, AssetRoiData, SupplierPerformanceData, CapacityPlanningData, AssetTcoData } from '@/api/report'
+ 
+@@ -163,7 +164,7 @@ function donutOption(
+     tooltip: {
+       trigger: 'item',
+       formatter: (p: { name: string; value: number; percent: number }) =>
+-        `${p.name}：${fmt(p.value)} ${unit}（${p.percent}%）`,
++        `${escapeHtml(p.name)}：${fmt(p.value)} ${unit}（${p.percent}%）`,
+     },
+     legend: { bottom: 0, type: 'scroll', icon: 'circle', itemWidth: 8, itemHeight: 8, itemGap: 12 },
+     series: [
+@@ -193,7 +194,7 @@ function hBarOption(items: GroupCountItem[], title: string, unit: string): Chart
+       trigger: 'axis',
+       axisPointer: { type: 'shadow' },
+       formatter: (rows: { name: string; value: number }[]) =>
+-        `${rows[0]?.name ?? ''}：${fmt(rows[0]?.value)} ${unit}`,
++        `${escapeHtml(rows[0]?.name ?? '')}：${fmt(rows[0]?.value)} ${unit}`,
+     },
+     grid: { left: 8, right: 44, top: 40, bottom: 20, containLabel: true },
+     xAxis: {
+@@ -231,7 +232,7 @@ function barOption(items: { name: string; value: number }[], title: string, unit
+       trigger: 'axis',
+       axisPointer: { type: 'shadow' },
+       formatter: (rows: { name: string; value: number }[]) =>
+-        `${rows[0]?.name ?? ''}：${fmt(rows[0]?.value)} ${unit}`,
++        `${escapeHtml(rows[0]?.name ?? '')}：${fmt(rows[0]?.value)} ${unit}`,
+     },
+     legend: { bottom: 0, type: 'scroll', itemGap: 12 },
+     grid: { left: 8, right: 16, top: 44, bottom: 56, containLabel: true },
+@@ -266,7 +267,7 @@ function trendOption(
+     tooltip: {
+       trigger: 'axis',
+       formatter: (rows: { name: string; value: number }[]) =>
+-        `${rows[0]?.name ?? ''}：${fmt(rows[0]?.value)} ${unit}`,
++        `${escapeHtml(rows[0]?.name ?? '')}：${fmt(rows[0]?.value)} ${unit}`,
+     },
+     grid: { left: 8, right: 24, top: 44, bottom: 52, containLabel: true },
+     xAxis: {
+@@ -327,8 +328,8 @@ function catStatusOption(
+       trigger: 'axis',
+       axisPointer: { type: 'shadow' },
+       formatter: (rows2: { name: string; seriesName: string; value: number; axisValue: string }[]) =>
+-        `${rows2[0]?.axisValue ?? ''}<br/>` +
+-        rows2.map((r) => `${r.seriesName}：${fmt(r.value)} ${unit}`).join('<br/>'),
++        `${escapeHtml(rows2[0]?.axisValue ?? '')}<br/>` +
++        rows2.map((r) => `${escapeHtml(r.seriesName)}：${fmt(r.value)} ${unit}`).join('<br/>'),
+     },
+     legend: { bottom: 0, type: 'scroll', itemGap: 12 },
+     grid: { left: 8, right: 16, top: 44, bottom: 56, containLabel: true },
+@@ -456,8 +457,8 @@ function assetValueOption(data: any): ChartOption {
+       trigger: 'axis',
+       axisPointer: { type: 'shadow' },
+       formatter: (rows: { name: string; seriesName: string; value: number }[]) =>
+-        `${rows[0]?.name ?? ''}<br/>` +
+-        rows.map((r) => `${r.seriesName}：${fmt(r.value)} 元`).join('<br/>'),
++        `${escapeHtml(rows[0]?.name ?? '')}<br/>` +
++        rows.map((r) => `${escapeHtml(r.seriesName)}：${fmt(r.value)} 元`).join('<br/>'),
+     },
+     legend: { bottom: 0, type: 'scroll', itemGap: 12 },
+     grid: { left: 8, right: 16, top: 44, bottom: 56, containLabel: true },
+@@ -505,8 +506,8 @@ function repairCostOption(data: any): ChartOption {
+     tooltip: {
+       trigger: 'axis',
+       formatter: (rows: { name: string; seriesName: string; value: number }[]) =>
+-        `${rows[0]?.name ?? ''}<br/>` +
+-        rows.map((r) => `${r.seriesName}：${fmt(r.value)} 元`).join('<br/>'),
++        `${escapeHtml(rows[0]?.name ?? '')}<br/>` +
++        rows.map((r) => `${escapeHtml(r.seriesName)}：${fmt(r.value)} 元`).join('<br/>'),
+     },
+     legend: { bottom: 0, type: 'scroll', itemGap: 12 },
+     grid: { left: 8, right: 24, top: 44, bottom: 52, containLabel: true },
+@@ -600,8 +601,8 @@ function expiryAlertOption(data: any): ChartOption {
+     tooltip: {
+       trigger: 'axis',
+       formatter: (rows: { name: string; seriesName: string; value: number }[]) =>
+-        `${rows[0]?.name ?? ''}<br/>` +
+-        rows.map((r) => `${r.seriesName}：${fmt(r.value)}`).join('<br/>'),
++        `${escapeHtml(rows[0]?.name ?? '')}<br/>` +
++        rows.map((r) => `${escapeHtml(r.seriesName)}：${fmt(r.value)}`).join('<br/>'),
+     },
+     legend: { bottom: 0, type: 'scroll', itemGap: 12 },
+     grid: { left: 8, right: 16, top: 44, bottom: 56, containLabel: true },
+@@ -698,7 +699,7 @@ function assetRoiOption(data: AssetRoiData | null): ChartOption {
+     tooltip: {
+       trigger: 'item',
+       formatter: (p: { name: string; data: any }) =>
+-        `${p.name}<br/>投资额：${fmt(p.data.value[2])} 元<br/>利用率：${(p.data.value[0] * 100).toFixed(1)}%<br/>ROI：${(p.data.value[1] * 100).toFixed(1)}%<br/>回本周期：${p.data.paybackMonths?.toFixed(1) || '-'} 月`,
++        `${escapeHtml(p.name)}<br/>投资额：${fmt(p.data.value[2])} 元<br/>利用率：${(p.data.value[0] * 100).toFixed(1)}%<br/>ROI：${(p.data.value[1] * 100).toFixed(1)}%<br/>回本周期：${p.data.paybackMonths?.toFixed(1) || '-'} 月`,
+     },
+     legend: { bottom: 0, type: 'scroll', itemGap: 12 },
+     grid: { left: 8, right: 24, top: 44, bottom: 52, containLabel: true },
+@@ -749,9 +750,9 @@ function opexStructureOption(data: OpexStructureData | null): ChartOption {
+       trigger: hasTrend ? 'axis' : 'item',
+       formatter: hasTrend
+         ? (rows: { name: string; seriesName: string; value: number }[]) =>
+-            `${rows[0]?.name ?? ''}<br/>` + rows.map((r) => `${r.seriesName}：${fmt(r.value)} 元`).join('<br/>')
++            `${escapeHtml(rows[0]?.name ?? '')}<br/>` + rows.map((r) => `${escapeHtml(r.seriesName)}：${fmt(r.value)} 元`).join('<br/>')
+         : (p: { name: string; value: number; percent: number }) =>
+-            `${p.name}：${fmt(p.value)} 元（${p.percent}%）`,
++            `${escapeHtml(p.name)}：${fmt(p.value)} 元（${p.percent}%）`,
+     },
+     legend: { bottom: 0, type: 'scroll', itemGap: 12, orient: 'horizontal' },
+     grid: hasTrend ? { left: 8, right: 24, top: 44, bottom: 52, containLabel: true } : { left: 'center', top: 40, bottom: 60, containLabel: true },
+@@ -842,8 +843,8 @@ function assetTcoOption(data: AssetTcoData | null): ChartOption {
+       trigger: 'axis',
+       axisPointer: { type: 'shadow' },
+       formatter: (rows: { name: string; seriesName: string; value: number }[]) =>
+-        `${rows[0]?.name ?? ''}<br/>` +
+-        rows.map((r) => `${r.seriesName}：${fmt(r.value)} 元`).join('<br/>'),
++        `${escapeHtml(rows[0]?.name ?? '')}<br/>` +
++        rows.map((r) => `${escapeHtml(r.seriesName)}：${fmt(r.value)} 元`).join('<br/>'),
+     },
+     legend: { bottom: 0, type: 'scroll', itemGap: 12 },
+     grid: { left: 8, right: 16, top: 44, bottom: 56, containLabel: true },
+diff --git a/a/platform-web/src/views/rfid/RfidBatchListView.vue b/b/platform-web/src/views/rfid/RfidBatchListView.vue
+index 3adfa67..7489d6a 100644
+--- a/a/platform-web/src/views/rfid/RfidBatchListView.vue
++++ b/b/platform-web/src/views/rfid/RfidBatchListView.vue
+@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
+ import type { FormInstance, FormRules, InputInstance, UploadFile } from 'element-plus'
+ import { fetchAssetMeta, saveBlob } from '@/api/asset'
+ import type { AssetMeta } from '@/api/asset'
++import { checkCsvImportSize } from '@/utils/upload'
+ import { fetchCategoryTree } from '@/api/masterdata'
+ import type { CategoryNode } from '@/api/masterdata'
+ import { fetchMaterialOptions } from '@/api/warehouse'
+@@ -371,6 +372,7 @@ async function submitImport() {
+     ElMessage.warning('请先选择 CSV 文件')
+     return
+   }
++  if (!checkCsvImportSize(importFile.value)) return
+   importing.value = true
+   try {
+     importResult.value = await importRfidBatchLines(currentBatchNo.value, importFile.value)
+diff --git a/a/platform-web/src/views/room/RackListView.vue b/b/platform-web/src/views/room/RackListView.vue
+index 8375fd2..0c2de92 100644
+--- a/a/platform-web/src/views/room/RackListView.vue
++++ b/b/platform-web/src/views/room/RackListView.vue
+@@ -16,6 +16,7 @@ import {
+ import type { RackItem, RackUnit, RoomItem } from '@/api/room'
+ import { saveBlob } from '@/api/asset'
+ import type { CsvImportResult } from '@/api/types'
++import { checkCsvImportSize } from '@/utils/upload'
+ 
+ const router = useRouter()
+ 
+@@ -285,6 +286,7 @@ async function submitImport() {
+     ElMessage.warning('请先选择 CSV 文件')
+     return
+   }
++  if (!checkCsvImportSize(importFile.value)) return
+   importing.value = true
+   try {
+     importResult.value = await importRacks(importFile.value)
+diff --git a/a/platform-web/src/views/room/RoomListView.vue b/b/platform-web/src/views/room/RoomListView.vue
+index d3d3ad8..59f8696 100644
+--- a/a/platform-web/src/views/room/RoomListView.vue
++++ b/b/platform-web/src/views/room/RoomListView.vue
+@@ -14,6 +14,7 @@ import {
+ import { saveBlob } from '@/api/asset'
+ import type { RoomItem } from '@/api/room'
+ import type { CsvImportResult } from '@/api/types'
++import { checkCsvImportSize } from '@/utils/upload'
+ 
+ const router = useRouter()
+ 
+@@ -208,6 +209,7 @@ async function submitImport() {
+     ElMessage.warning('请先选择 CSV 文件')
+     return
+   }
++  if (!checkCsvImportSize(importFile.value)) return
+   importing.value = true
+   try {
+     importResult.value = await importRooms(importFile.value)
+diff --git a/a/platform-web/src/views/system/NotificationCenterView.vue b/b/platform-web/src/views/system/NotificationCenterView.vue
+index 31e8b35..1f7f8d6 100644
+--- a/a/platform-web/src/views/system/NotificationCenterView.vue
++++ b/b/platform-web/src/views/system/NotificationCenterView.vue
+@@ -74,7 +74,11 @@ const transportTag = computed(() => {
+   }
+ })
+ 
++/** 列表请求序号：SSE 到达刷新与翻页/切 tab 并发时，仅接受最后一次请求的响应 */
++let loadSeq = 0
++
+ async function load() {
++  const seq = ++loadSeq
+   loading.value = true
+   try {
+     const res = await fetchMyNotifications({
+@@ -82,12 +86,13 @@ async function load() {
+       size: PAGE_SIZE,
+       unread: tab.value === 'unread' ? true : undefined,
+     })
++    if (seq !== loadSeq) return
+     list.value = res.records ?? []
+     total.value = res.total ?? 0
+   } catch {
+     // 拦截器已提示
+   } finally {
+-    loading.value = false
++    if (seq === loadSeq) loading.value = false
+   }
+ }
+ 
+diff --git a/a/platform-web/src/views/system/UsersView.vue b/b/platform-web/src/views/system/UsersView.vue
+index 8ea0c9c..11675ff 100644
+--- a/a/platform-web/src/views/system/UsersView.vue
++++ b/b/platform-web/src/views/system/UsersView.vue
+@@ -8,6 +8,7 @@ import { saveBlob } from '@/api/asset'
+ import type { CsvImportResult, PageResult, RoleItem, UserItem } from '@/api/types'
+ import { useAuthStore } from '@/stores/auth'
+ import { passwordRule } from '@/utils/password'
++import { checkCsvImportSize } from '@/utils/upload'
+ 
+ const auth = useAuthStore()
+ 
+@@ -289,6 +290,7 @@ async function submitImport() {
+     ElMessage.warning('请先选择 CSV 文件')
+     return
+   }
++  if (!checkCsvImportSize(importFile.value)) return
+   importing.value = true
+   try {
+     const form = new FormData()
+diff --git a/a/platform-web/src/views/warehouse/MaterialListView.vue b/b/platform-web/src/views/warehouse/MaterialListView.vue
+index 4608f2e..59cf279 100644
+--- a/a/platform-web/src/views/warehouse/MaterialListView.vue
++++ b/b/platform-web/src/views/warehouse/MaterialListView.vue
+@@ -17,6 +17,7 @@ import {
+ } from '@/api/warehouse'
+ import type { MaterialItem, MaterialMeta, WarehouseLayerItem, WarehouseOption } from '@/api/warehouse'
+ import { saveBlob } from '@/api/asset'
++import { checkCsvImportSize } from '@/utils/upload'
+ 
+ type TagType = 'primary' | 'success' | 'warning' | 'info' | 'danger'
+ 
+@@ -362,6 +363,7 @@ async function submitImport() {
+     ElMessage.warning('请先选择 CSV 文件')
+     return
+   }
++  if (!checkCsvImportSize(importFile.value)) return
+   importing.value = true
+   try {
+     importResult.value = await importMaterials(importFile.value)
+diff --git a/a/platform-web/src/views/workorder/WorkorderDetailView.vue b/b/platform-web/src/views/workorder/WorkorderDetailView.vue
+index 8e4660e..7f21101 100644
+--- a/a/platform-web/src/views/workorder/WorkorderDetailView.vue
++++ b/b/platform-web/src/views/workorder/WorkorderDetailView.vue
+@@ -335,8 +335,21 @@ function onAttFileChange(f: UploadFile) {
+   if (f.raw) void doUploadAtt(f.raw)
+ }
+ 
++/** 附件前端预校验（与后端 WorkorderAttachmentService 对齐）：大小 ≤ 50MB + 扩展名白名单 */
++const ATT_MAX_SIZE = 50 * 1024 * 1024
++const ATT_OK_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf', 'zip', 'rar', 'doc', 'docx', 'xls', 'xlsx', 'txt']
++
+ async function doUploadAtt(file: File) {
+   if (!currentWoNo.value) return
++  if (file.size > ATT_MAX_SIZE) {
++    ElMessage.error('附件大小不能超过 50MB')
++    return
++  }
++  const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
++  if (!ATT_OK_EXT.includes(ext)) {
++    ElMessage.error('不支持的附件类型，允许：图片 / PDF / zip / rar / Word / Excel / txt')
++    return
++  }
+   attUploading.value = true
+   try {
+     await uploadWorkorderAttachment(currentWoNo.value, file)

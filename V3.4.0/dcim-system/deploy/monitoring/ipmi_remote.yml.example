@@ -1,0 +1,17 @@
+# ipmi_exporter 远程模式配置：通过 BMC 带外网读取硬件传感器（温度/风扇/电源/功率）
+# 使用：cp ipmi_remote.yml.example ipmi_remote.yml，填写只读 BMC 账号，然后 COMPOSE_PROFILES 加 ipmi
+# 建议在 BMC 上专门创建 USER 级（只读）账号，不要使用 ADMINISTRATOR 账号
+modules:
+  default:
+    user: "monitor"
+    pass: "CHANGEME"
+    driver: "LAN_2_0"
+    privilege: "user"
+    timeout: 20000
+    collectors:
+      - bmc
+      - ipmi
+      - chassis
+      - dcmi
+      - sel
+    exclude_sensor_ids: []

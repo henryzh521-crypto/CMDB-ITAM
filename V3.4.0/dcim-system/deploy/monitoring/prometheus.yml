@@ -1,0 +1,127 @@
+# ============================================================
+# Prometheus 配置 —— 监控对象全部来自平台 CMDB（http_sd），不手工维护 targets
+#
+#   资产上架 / 状态变化 / IP 变更 → 平台服务发现 → 2 分钟内自动生效
+#   哪类资产走哪个任务：平台「监控告警 → 监控设置 → 监控模板」
+#   单台排除监控：资产扩展属性 monitor=false
+#
+# 访问令牌文件 secrets/monitoring_token 由 install.sh 生成（与 deploy/.env 的 MONITORING_TOKEN 一致）
+# ============================================================
+global:
+  scrape_interval: 60s
+  scrape_timeout: 15s
+  evaluation_interval: 30s
+  external_labels:
+    cluster: dcim
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # ── 监控栈自身 ──
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+  - job_name: alertmanager
+    static_configs:
+      - targets: ['alertmanager:9093']
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ['blackbox-exporter:9115']
+
+  # ── 平台自身可用性（HTTP 探测 /api/healthz：数据库不可用时返回 503）──
+  - job_name: platform
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: ['http://platform-be:8081/api/healthz']
+        labels:
+          service: dcim-platform
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ── Ping 存活：所有在用资产的业务 IP / 管理 IP（无需在被监控端安装任何代理）──
+  - job_name: icmp
+    metrics_path: /probe
+    params:
+      module: [icmp]
+    http_sd_configs:
+      - url: http://platform-be:8081/api/monitoring/sd/icmp
+        refresh_interval: 2m
+        authorization:
+          credentials_file: /etc/prometheus/secrets/monitoring_token
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ── 操作系统指标（服务器部署 node_exporter，见 tools/monitoring/install-node-exporter.sh）──
+  - job_name: node
+    http_sd_configs:
+      - url: http://platform-be:8081/api/monitoring/sd/node
+        refresh_interval: 2m
+        authorization:
+          credentials_file: /etc/prometheus/secrets/monitoring_token
+
+  # ── GPU 指标（GPU 服务器部署 NVIDIA dcgm-exporter，默认端口 9400）──
+  - job_name: dcgm
+    http_sd_configs:
+      - url: http://platform-be:8081/api/monitoring/sd/dcgm
+        refresh_interval: 2m
+        authorization:
+          credentials_file: /etc/prometheus/secrets/monitoring_token
+
+  # ── 带外硬件传感器（ipmi_exporter 远程模式，compose profile: ipmi）──
+  - job_name: ipmi
+    scrape_interval: 2m
+    scrape_timeout: 60s
+    metrics_path: /ipmi
+    params:
+      module: [default]
+    http_sd_configs:
+      - url: http://platform-be:8081/api/monitoring/sd/ipmi
+        refresh_interval: 5m
+        authorization:
+          credentials_file: /etc/prometheus/secrets/monitoring_token
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: __address__
+        replacement: ipmi-exporter:9290
+
+  # ── 网络设备 / PDU / UPS（snmp_exporter，compose profile: snmp）──
+  - job_name: snmp
+    scrape_interval: 2m
+    scrape_timeout: 60s
+    metrics_path: /snmp
+    params:
+      module: [if_mib]
+      auth: [public_v2]
+    http_sd_configs:
+      - url: http://platform-be:8081/api/monitoring/sd/snmp
+        refresh_interval: 5m
+        authorization:
+          credentials_file: /etc/prometheus/secrets/monitoring_token
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: __address__
+        replacement: snmp-exporter:9116

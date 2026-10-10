@@ -1,0 +1,42 @@
+diff --git a/a/tests/README.md b/b/tests/README.md
+index 7000c9f..ab050bc 100644
+--- a/a/tests/README.md
++++ b/b/tests/README.md
+@@ -1,6 +1,6 @@
+ # 回归测试套件（v3.5）
+ 
+-一条命令跑完 9 层、92 个用例，输出控制台结果和三种报告（`report.md` 给人看，`junit.xml` 给 CI，`report.json` 给脚本）。
++一条命令跑完 9 层、93 个用例，输出控制台结果和三种报告（`report.md` 给人看，`junit.xml` 给 CI，`report.json` 给脚本）。
+ 只依赖 Python 3.9+ 和 `requests`；浏览器用例另需 `playwright`，数据库相关用例另需 `psql`。条件不满足的套件或用例会**跳过**，不会报错。
+ 
+ ```bash
+diff --git a/a/tests/suites/s20_contract.py b/b/tests/suites/s20_contract.py
+index a06bd25..3a8dceb 100644
+--- a/a/tests/suites/s20_contract.py
++++ b/b/tests/suites/s20_contract.py
+@@ -364,3 +364,25 @@ def _(ctx):
+                 break
+         check(hit, "10s 内未在流上收到 workorder 频道广播帧")
+     return "connected 帧 + workorder 频道广播均正常"
++
++
++@case(S, "CT-16", "资产删除财务校验：已进入折旧流程（转固计提）的资产拒绝删除 409，未入账可删", risk="删除资产静默抹掉财务台账（F4）", level="P1")
++def _(ctx):
++    a = ctx.asset()
++    # 财务状态链：未入账 → 已入账 → 转固计提（状态机允许的两步流转）
++    for fin in ("已入账", "转固计提"):
++        st, b = ctx.admin.post(f"/assets/{a}/transitions", {"targetFin": fin, "reason": f"CT-16 {ctx.run_id}"})
++        check(st == 200, f"流转 {fin} HTTP {st} {msg(b)}")
++    st, b = ctx.admin.delete(f"/assets/{a}")
++    check(st == 409, f"转固计提资产删除应 409，实际 {st}")
++    check("财务" in msg(b), f"提示应说明财务状态：{msg(b)}")
++    # 批量删除同资产：计入错误行而非整批失败
++    st, b = ctx.admin.post("/assets/batch-delete", {"assetNos": [a]})
++    rows = (data(b) or {}).get("skipped") or []
++    check(st == 200 and len(rows) == 1, f"batch-delete 应 200 且 1 行错误，实际 {st} {rows}")
++    check("财务" in str(rows), f"错误行应含财务提示：{rows}")
++    # 对照组：未入账（初始财务状态）的资产仍可正常删除
++    a2 = ctx.asset()
++    st, b = ctx.admin.delete(f"/assets/{a2}")
++    check(st == 200, f"未入账资产删除应 200，实际 {st} {msg(b)}")
++    return "财务删除守卫生效：转固计提 409 / batch 错误行 / 未入账放行"

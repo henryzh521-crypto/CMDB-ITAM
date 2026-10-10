@@ -1,0 +1,3276 @@
+diff --git a/backend-resources/application.yml b/backend-resources/application.yml
+index 8e3938c..db17249 100644
+--- a/backend-resources/application.yml
++++ b/backend-resources/application.yml
+@@ -15,6 +15,14 @@ spring:
+   # 造一个 user 账号并把随机口令 WARN 进生产日志。
+   autoconfigure:
+     exclude: org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration,org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
++  # 数据库连接池（v3.4 可配置）：默认 20 条 / 实例；借不到连接最多等 10 秒，随后返回 503 + Retry-After，
++  # 而不是让请求线程挂 30 秒。多实例部署时：实例数 × DB_POOL_MAX 须小于 PostgreSQL max_connections（编排里为 200）。
++  datasource:
++    hikari:
++      maximum-pool-size: ${DB_POOL_MAX:20}
++      minimum-idle: ${DB_POOL_MIN_IDLE:5}
++      connection-timeout: ${DB_POOL_TIMEOUT_MS:10000}
++      leak-detection-threshold: ${DB_POOL_LEAK_MS:0}
+   # JdbcTemplate 查询兜底超时：报表 / 分析类大查询异常时不至于长期占用连接与锁（单位秒）
+   jdbc:
+     template:
+@@ -102,9 +110,20 @@ dcim:
+     login-max-fail-per-account: ${LOGIN_MAX_FAIL_PER_ACCOUNT:10}
+     login-max-fail-per-ip: ${LOGIN_MAX_FAIL_PER_IP:30}
+     login-fail-window-minutes: ${LOGIN_FAIL_WINDOW_MINUTES:15}
+-  # 全局接口限流（每客户端 IP 每分钟请求数；0=关闭；需配置 Redis 才生效）
++    # v3.4：账号级（跨 IP）失败上限与锁定时长；近 N 天登录成功过的 IP 不受账号锁定影响
++    login-max-fail-per-account-global: ${LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL:30}
++    login-account-lock-minutes: ${LOGIN_ACCOUNT_LOCK_MINUTES:15}
++    login-trusted-ip-days: ${LOGIN_TRUSTED_IP_DAYS:30}
++  # 接口限流（v3.4）：per-minute 为「每 IP 每分钟」粗粒度防洪闸（0 = 关闭全部限流）；
++  # 其余为按用户的令牌桶：普通接口、匿名接口、重操作（导出 / 导入 / 批量）
+   rate-limit:
+-    per-minute: ${RATE_LIMIT_PER_MINUTE:600}
++    per-minute: ${RATE_LIMIT_PER_MINUTE:3000}
++    enabled: ${RATE_LIMIT_ENABLED:true}
++    user-rps: ${RATE_LIMIT_USER_RPS:20}
++    user-burst: ${RATE_LIMIT_USER_BURST:40}
++    anon-rps: ${RATE_LIMIT_ANON_RPS:10}
++    anon-burst: ${RATE_LIMIT_ANON_BURST:20}
++    heavy-per-minute: ${RATE_LIMIT_HEAVY_PER_MINUTE:10}
+   # 可信反向代理（逗号分隔，支持「单个IP」与「网段/前缀」）：
+   # 仅当 TCP 对端落在这些网段内时，才采信 X-Forwarded-For 作为客户端真实 IP。
+   # 本项目入口是 Caddy，它与 platform-be 同处 Docker 网络，对端地址是容器 IP
+diff --git a/backend-resources/db/migration/V45__v34_permissions_perf.sql b/backend-resources/db/migration/V45__v34_permissions_perf.sql
+new file mode 100644
+index 0000000..5c71be3
+--- /dev/null
++++ b/backend-resources/db/migration/V45__v34_permissions_perf.sql
+@@ -0,0 +1,60 @@
++-- ============================================================
++-- v3.4.0
++--   1) 删除权限改为显式授予（ADR-02）
++--   2) 资产功率视图：分类功率按分类预算一次再关联（ADR-09，10 万资产下约快 30%）
++--   3) job_lock 增加执行次数，便于核对多实例下每个定时任务每周期只执行一次（ADR-11）
++-- ============================================================
++
++ALTER TABLE job_lock ADD COLUMN IF NOT EXISTS run_count BIGINT NOT NULL DEFAULT 0;
++
++-- 1) v3.3 及以前后端写死「仅管理员可删除」，非管理员角色上勾选的 delete 从未生效。
++--    v3.4 起勾选即生效；为避免升级即放大权限，统一复位为不允许，并写一条审计记录列出受影响的角色，供管理员复核后重新授予。
++DO $$
++DECLARE
++  affected text;
++BEGIN
++  SELECT string_agg(role_code || ':' || module, ', ' ORDER BY role_code, module) INTO affected
++  FROM role_action_perm
++  WHERE role_code <> 'ADMIN' AND actions ->> 'delete' = 'true';
++
++  IF affected IS NOT NULL THEN
++    UPDATE role_action_perm
++       SET actions = jsonb_set(actions, '{delete}', 'false'::jsonb)
++     WHERE role_code <> 'ADMIN' AND actions ->> 'delete' = 'true';
++
++    INSERT INTO audit_log (actor, action, module, obj_type, obj_id, detail, created_at)
++    VALUES ('system-upgrade', 'RESET_DELETE_PERM', 'system', 'role', NULL,
++            jsonb_build_object('reason', 'v3.4 删除权限改为显式授予；以下角色的删除勾选此前从未生效，已复位，请按需重新授予',
++                               'roles', affected),
++            now());
++  END IF;
++END $$;
++
++-- 2) 功率视图改写：列名、类型、语义与原视图完全一致
++CREATE OR REPLACE VIEW v_asset_power AS
++WITH cat_power AS (
++  SELECT c.category_code,
++         (SELECT p.rated_w
++            FROM power_profile p
++            JOIN category pc2 ON pc2.category_code::text = p.match_value::text
++           WHERE p.match_type::text = 'CATEGORY'
++             AND c.path::text ~~ (pc2.path::text || '%')
++           ORDER BY length(pc2.path::text) DESC
++           LIMIT 1) AS rated_w
++    FROM category c
++)
++SELECT a.asset_no,
++       a.rack_code,
++       a.room_code,
++       a.status_biz,
++       COALESCE(a.rated_power_w, pm.rated_w, cp.rated_w) AS power_w,
++       CASE
++         WHEN a.rated_power_w IS NOT NULL THEN 'ASSET'::text
++         WHEN pm.rated_w IS NOT NULL THEN 'MODEL'::text
++         WHEN cp.rated_w IS NOT NULL THEN 'CATEGORY'::text
++         ELSE NULL::text
++       END AS power_source
++  FROM asset a
++  LEFT JOIN power_profile pm ON pm.match_type::text = 'MODEL'::text AND pm.match_value::text = a.model_code::text
++  LEFT JOIN cat_power cp ON cp.category_code::text = a.category_code::text
++ WHERE a.deleted_at IS NULL;
+diff --git a/backend-resources/dcim-build.properties b/backend-resources/dcim-build.properties
+new file mode 100644
+index 0000000..85b85ad
+--- /dev/null
++++ b/backend-resources/dcim-build.properties
+@@ -0,0 +1,3 @@
++# 后端构建信息（/api/healthz 与启动日志展示）
++version=3.4.0
++built=2026-10-07
+diff --git a/backend-src/com/dcim/asset/controller/AssetController.java b/backend-src/com/dcim/asset/controller/AssetController.java
+index 4d08fe4..64b9c0a 100644
+--- a/backend-src/com/dcim/asset/controller/AssetController.java
++++ b/backend-src/com/dcim/asset/controller/AssetController.java
+@@ -73,6 +73,14 @@ public class AssetController {
+     private static final String INIT_BIZ = "待上架";
+     private static final String INIT_FIN = "未入账";
+     private static final List<String> DELETABLE_BIZ = List.of("待上架");
++    /** v3.4：与 CSV_HEADERS 一一对应的字段名（导出时按字段权限过滤列） */
++    private static final String[] CSV_FIELDS = {
++        "assetNo", "parentAssetNo", "name", "sn", "categoryCode", "modelCode", "ownerType", "statusBiz", "statusFin",
++        "regionCode", "roomCode", "rackCode", "unitNo", "uHeight", "department", "owner", "mgmtIp", "bizIp",
++        "purchaseDate", "purchasePrice", "warrantyEnd", "rackDate", "contractNo", "attrs"
++    };
++    @org.springframework.beans.factory.annotation.Autowired
++    private com.dcim.security.field.FieldPolicyService fieldPolicies;
+     private static final List<String> CSV_HEADERS = List.of(
+         "资产编号",
+         "父资产编号",
+@@ -832,8 +840,8 @@ public class AssetController {
+             throw BusinessException.badRequest("当前业务状态「" + cur.getStatusBiz() + "」不允许删除，仅" + String.join("/", DELETABLE_BIZ) + "可删除");
+         } else {
+             LoginUser current = CurrentUser.get();
+-            if (!this.rbacService.isAdmin(current)) {
+-                throw BusinessException.forbidden("仅管理员可删除资产");
++            if (!this.rbacService.canDelete(current, "assets")) {
++                throw BusinessException.forbidden("当前角色未授予「资产」的删除权限");
+             } else {
+                 long childCount = this.assetMapper.selectCount(Wrappers.<AssetEntity>lambdaQuery().eq(AssetEntity::getParentAssetNo, assetNo));
+                 if (childCount > 0L) {
+@@ -1093,8 +1101,8 @@ public class AssetController {
+     )
+     public ApiResult<Map<String, Object>> batchDelete(@RequestBody @Valid AssetController.BatchNosReq req) {
+         LoginUser current = CurrentUser.get();
+-        if (!this.rbacService.isAdmin(current)) {
+-            throw BusinessException.forbidden("仅管理员可批量删除资产");
++        if (!this.rbacService.canDelete(current, "assets")) {
++            throw BusinessException.forbidden("当前角色未授予「资产」的删除权限");
+         } else {
+             List<String> nos = this.normalizeBatchNos(req.getAssetNos());
+             List<Map<String, Object>> changed = new ArrayList<>();
+@@ -1192,13 +1200,17 @@ public class AssetController {
+                 }
+             }
+ 
+-            rows = nos.isEmpty() ? List.of() : this.assetMapper.selectBatchIds(nos);
++            // v3.4：按编号导出也要受数据范围约束（v3.3 直接 selectBatchIds，绕过了数据范围）
++            LambdaQueryWrapper<AssetEntity> byNos = Wrappers.<AssetEntity>lambdaQuery().in(AssetEntity::getAssetNo, nos);
++            this.dataScope.applyAssetScope(byNos, com.dcim.security.CurrentUser.get());
++            rows = nos.isEmpty() ? List.of() : this.assetMapper.selectList(byNos);
+         } else {
+             rows = this.assetMapper.selectList(this.buildListWrapper(keyword, statusBiz, categoryCode, regionCode, roomCode, parentAssetNo));
+         }
+ 
++        int[] keep = this.fieldPolicies.keepColumns(com.dcim.security.CurrentUser.get(), "assets", CSV_FIELDS);
+         StringBuilder csv = new StringBuilder();
+-        csv.append('\ufeff').append(CsvSupport.line(CSV_HEADERS)).append('\n');
++        csv.append('\ufeff').append(CsvSupport.line(com.dcim.security.field.FieldPolicyService.pick(CSV_HEADERS, keep))).append('\n');
+ 
+         for (AssetEntity a : rows) {
+             Map<String, Object> attrs = a.getAttrs() == null ? Map.of() : a.getAttrs();
+@@ -1228,7 +1240,7 @@ public class AssetController {
+                 a.getContractNo(),
+                 attrs.get("remark")
+             );
+-            csv.append(CsvSupport.line(cells)).append('\n');
++            csv.append(CsvSupport.line(com.dcim.security.field.FieldPolicyService.pick(cells, keep))).append('\n');
+         }
+ 
+         this.writeCsv(response, "资产-" + LocalDate.now() + ".csv", csv.toString());
+@@ -1239,8 +1251,9 @@ public class AssetController {
+         module = "assets"
+     )
+     public void template(HttpServletResponse response) throws IOException {
++        int[] keep = this.fieldPolicies.keepColumns(com.dcim.security.CurrentUser.get(), "assets", CSV_FIELDS);
+         StringBuilder csv = new StringBuilder();
+-        csv.append('\ufeff').append(CsvSupport.line(CSV_HEADERS)).append('\n');
++        csv.append('\ufeff').append(CsvSupport.line(com.dcim.security.field.FieldPolicyService.pick(CSV_HEADERS, keep))).append('\n');
+         csv.append(
+                 CsvSupport.line(
+                     List.of(
+@@ -1501,13 +1514,24 @@ public class AssetController {
+         String keyword, String statusBiz, String categoryCode, String regionCode, String roomCode, String parentAssetNo
+     ) {
+         LambdaQueryWrapper<AssetEntity> qw = Wrappers.lambdaQuery();
++        LoginUser who = com.dcim.security.CurrentUser.get();
++        // v3.4：不能按隐藏字段筛选 / 搜索，否则可借此反推隐藏字段的值
++        Map<String, Object> filters = new java.util.HashMap<>();
++        filters.put("statusBiz", statusBiz);
++        filters.put("categoryCode", categoryCode);
++        filters.put("regionCode", regionCode);
++        filters.put("roomCode", roomCode);
++        filters.put("parentAssetNo", parentAssetNo);
++        this.fieldPolicies.assertFilterAllowed(who, "assets", filters);
++        boolean snVisible = !this.fieldPolicies.isHidden(who, "assets", "sn");
+         if (keyword != null && !keyword.isBlank()) {
+-            qw.and(
+-                w -> ((((w.like(AssetEntity::getAssetNo, keyword.trim())).or())
+-                                .like(AssetEntity::getSn, keyword.trim()))
+-                            .or())
+-                        .like(AssetEntity::getName, keyword.trim())
+-            );
++            String kw = keyword.trim();
++            qw.and(w -> {
++                w.like(AssetEntity::getAssetNo, kw).or().like(AssetEntity::getName, kw);
++                if (snVisible) {
++                    w.or().like(AssetEntity::getSn, kw);
++                }
++            });
+         }
+ 
+         if (statusBiz != null && !statusBiz.isBlank()) {
+diff --git a/backend-src/com/dcim/capacity/CapacityController.java b/backend-src/com/dcim/capacity/CapacityController.java
+index 30cb627..73092aa 100644
+--- a/backend-src/com/dcim/capacity/CapacityController.java
++++ b/backend-src/com/dcim/capacity/CapacityController.java
+@@ -38,6 +38,21 @@ public class CapacityController {
+         module = "racks"
+     )
+     public ApiResult<Map<String, Object>> rooms() {
++        // v3.4：机房容量是全量聚合（10 万资产约 120 ms），且与用户无关；30 秒内复用结果（ADR-09）
++        Object[] c = this.roomsCache;
++        long now = System.currentTimeMillis();
++        if (c != null && now - (Long)c[0] < ROOMS_CACHE_MS) {
++            return ApiResult.ok((Map<String, Object>)c[1]);
++        }
++        Map<String, Object> fresh = this.computeRooms();
++        this.roomsCache = new Object[]{now, fresh};
++        return ApiResult.ok(fresh);
++    }
++
++    private static final long ROOMS_CACHE_MS = 30_000L;
++    private volatile Object[] roomsCache;
++
++    private Map<String, Object> computeRooms() {
+         Map<String, Object> out = new LinkedHashMap<>();
+         out.put("rooms", this.capacity.rooms());
+         out.put("warnPct", this.capacity.warnPct());
+@@ -45,7 +60,8 @@ public class CapacityController {
+         out.put(
+             "assetsWithoutPower", this.jdbc.queryForObject("SELECT COUNT(*) FROM v_asset_power WHERE rack_code IS NOT NULL AND power_w IS NULL", Long.class)
+         );
+-        return ApiResult.ok(out);
++        out.put("cachedAt", java.time.LocalDateTime.now().withNano(0).toString());
++        return out;
+     }
+ 
+     @GetMapping({"/racks"})
+diff --git a/backend-src/com/dcim/change/service/ChangeService.java b/backend-src/com/dcim/change/service/ChangeService.java
+index bb12947..05a4836 100644
+--- a/backend-src/com/dcim/change/service/ChangeService.java
++++ b/backend-src/com/dcim/change/service/ChangeService.java
+@@ -254,8 +254,8 @@ public class ChangeService {
+     @Transactional
+     public void delete(Long id, LoginUser user) {
+         ChangeRequest cr = this.require(id);
+-        if (!this.rbac.isAdmin(user)) {
+-            throw BusinessException.forbidden("仅管理员可删除变更记录");
++        if (!this.rbac.canDelete(user, "changes")) {
++            throw BusinessException.forbidden("当前角色未授予「变更」的删除权限");
+         } else if (!"DRAFT".equals(cr.getStatus()) && !"CANCELLED".equals(cr.getStatus())) {
+             throw BusinessException.badRequest("仅草稿或已取消的变更可删除，其余请保留审计轨迹");
+         } else {
+diff --git a/backend-src/com/dcim/common/BuildInfo.java b/backend-src/com/dcim/common/BuildInfo.java
+new file mode 100644
+index 0000000..5759174
+--- /dev/null
++++ b/backend-src/com/dcim/common/BuildInfo.java
+@@ -0,0 +1,55 @@
++package com.dcim.common;
++
++import java.io.InputStream;
++import java.util.Properties;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.context.event.ApplicationReadyEvent;
++import org.springframework.context.ApplicationListener;
++import org.springframework.stereotype.Component;
++
++/**
++ * 构建版本信息（v3.3.1 新增）。
++ *
++ * <p>v3.3.0 及以前后端不报告自身版本：把新包解压覆盖到旧目录后，启动脚本按文件名排序选中了旧的
++ * dcim-platform-3.2.0.jar，运行的仍是旧代码，却无从察觉。现在启动日志第一行和 /api/healthz 都带版本号，
++ * 版本取自 jar 内 dcim-build.properties。
++ */
++@Component
++public class BuildInfo implements ApplicationListener<ApplicationReadyEvent> {
++    private static final Logger log = LoggerFactory.getLogger(BuildInfo.class);
++    private static final Properties PROPS = load();
++
++    private static Properties load() {
++        Properties p = new Properties();
++        try (InputStream in = BuildInfo.class.getResourceAsStream("/dcim-build.properties")) {
++            if (in != null) {
++                p.load(new java.io.InputStreamReader(in, java.nio.charset.StandardCharsets.UTF_8));
++            }
++        } catch (Exception ignored) {
++            // 缺文件时报 unknown，不影响启动
++        }
++        return p;
++    }
++
++    public static String version() {
++        return PROPS.getProperty("version", "unknown");
++    }
++
++    public static String buildTime() {
++        return PROPS.getProperty("built", "unknown");
++    }
++
++    public static String jarLocation() {
++        try {
++            return String.valueOf(BuildInfo.class.getProtectionDomain().getCodeSource().getLocation().getPath());
++        } catch (Exception e) {
++            return "unknown";
++        }
++    }
++
++    @Override
++    public void onApplicationEvent(ApplicationReadyEvent event) {
++        log.info("DCIM Platform {} 已就绪（构建 {}，jar：{}）", version(), buildTime(), jarLocation());
++    }
++}
+diff --git a/backend-src/com/dcim/common/GlobalExceptionHandler.java b/backend-src/com/dcim/common/GlobalExceptionHandler.java
+index dc9b701..0686e33 100644
+--- a/backend-src/com/dcim/common/GlobalExceptionHandler.java
++++ b/backend-src/com/dcim/common/GlobalExceptionHandler.java
+@@ -133,7 +133,8 @@ public class GlobalExceptionHandler {
+         org.springframework.dao.PessimisticLockingFailureException.class,
+         org.springframework.dao.QueryTimeoutException.class,
+         org.springframework.dao.TransientDataAccessResourceException.class,
+-        org.springframework.jdbc.CannotGetJdbcConnectionException.class
++        org.springframework.jdbc.CannotGetJdbcConnectionException.class,
++        org.springframework.transaction.CannotCreateTransactionException.class
+     })
+     public ResponseEntity<ApiResult<Void>> busy(Exception e) {
+         log.warn("[db] 并发冲突或超时 [{}]：{}", requestId(), e.getMessage());
+diff --git a/backend-src/com/dcim/common/cluster/ClusterJobLock.java b/backend-src/com/dcim/common/cluster/ClusterJobLock.java
+index 0748af5..1744b34 100644
+--- a/backend-src/com/dcim/common/cluster/ClusterJobLock.java
++++ b/backend-src/com/dcim/common/cluster/ClusterJobLock.java
+@@ -47,8 +47,9 @@ public class ClusterJobLock {
+         long lease = leaseSeconds > 0 ? leaseSeconds : this.defaultLeaseSeconds;
+         try {
+             int n = this.jdbc.update(
+-                "INSERT INTO job_lock (name, locked_until, locked_at, locked_by) VALUES (?, clock_timestamp() + make_interval(secs => ?), clock_timestamp(), ?) "
+-                    + "ON CONFLICT (name) DO UPDATE SET locked_until = EXCLUDED.locked_until, locked_at = EXCLUDED.locked_at, locked_by = EXCLUDED.locked_by "
++                "INSERT INTO job_lock (name, locked_until, locked_at, locked_by, run_count) VALUES (?, clock_timestamp() + make_interval(secs => ?), clock_timestamp(), ?, 1) "
++                    + "ON CONFLICT (name) DO UPDATE SET locked_until = EXCLUDED.locked_until, locked_at = EXCLUDED.locked_at, locked_by = EXCLUDED.locked_by, "
++                    + "run_count = job_lock.run_count + 1 "
+                     + "WHERE job_lock.locked_until <= clock_timestamp()",
+                 name, (double) lease, this.instanceId
+             );
+@@ -67,6 +68,22 @@ public class ClusterJobLock {
+         }
+     }
+ 
++    /**
++     * v3.4：执行完不立即释放，而是把租约保持到 {@code untilEpochMs}（至少到当前时刻）。
++     * 同一周期内其它实例的触发因此会跳过——v3.3 执行完即释放，只防住了「同时执行」，
++     * 两个实例的触发时刻错开时同一任务每个周期会各跑一次（ShedLock 的 lockAtLeastFor 语义）。
++     */
++    public void holdUntil(String name, long untilEpochMs) {
++        try {
++            this.jdbc.update(
++                "UPDATE job_lock SET locked_until = GREATEST(clock_timestamp(), to_timestamp(? / 1000.0)) WHERE name = ? AND locked_by = ?",
++                (double) untilEpochMs, name, this.instanceId
++            );
++        } catch (RuntimeException e) {
++            log.warn("[cluster-lock] 设置任务锁保持期失败 {}：{}（租约到期后自动释放）", name, e.getMessage());
++        }
++    }
++
+     private static String resolveInstanceId() {
+         String host;
+         try {
+diff --git a/backend-src/com/dcim/common/cluster/ScheduledJobLockAspect.java b/backend-src/com/dcim/common/cluster/ScheduledJobLockAspect.java
+index 0f4f8d8..cde8aff 100644
+--- a/backend-src/com/dcim/common/cluster/ScheduledJobLockAspect.java
++++ b/backend-src/com/dcim/common/cluster/ScheduledJobLockAspect.java
+@@ -17,6 +17,7 @@ import org.springframework.stereotype.Component;
+  * <p>v3.2 有 12 个定时任务（SLA 升级、告警自动派单、巡检生成、Webhook 投递、折旧计提……），
+  * 均无分布式锁；后端扩到 2 个及以上实例时会重复执行（重复升级通知、重复派单、重复投递）。
+  * 现在同一任务同一时刻只会在一个实例上运行，单实例部署下行为不变。
++ * v3.4：执行完把锁保持到「开始时刻 + 周期 × 0.9」，同一周期内其它实例的触发跳过（v3.3 只防并发、不防同周期重复）。
+  */
+ @Aspect
+ @Component
+@@ -24,9 +25,50 @@ import org.springframework.stereotype.Component;
+ public class ScheduledJobLockAspect {
+     private static final Logger log = LoggerFactory.getLogger(ScheduledJobLockAspect.class);
+     private final ClusterJobLock lock;
++    private final org.springframework.core.env.Environment env;
++    private final java.util.concurrent.ConcurrentHashMap<String, Long> holdMs = new java.util.concurrent.ConcurrentHashMap<>();
++    /** cron 任务的保持期上限：各实例按同一 cron 几乎同时触发，10 分钟足以让慢一步的实例跳过 */
++    private static final long CRON_HOLD_CAP_MS = 600_000L;
+ 
+-    public ScheduledJobLockAspect(ClusterJobLock lock) {
++    public ScheduledJobLockAspect(ClusterJobLock lock, org.springframework.core.env.Environment env) {
+         this.lock = lock;
++        this.env = env;
++    }
++
++    /** 保持期 = 周期 × 0.9（cron 取相邻两次触发的间隔，且不超过 10 分钟） */
++    long holdFor(String name, org.springframework.scheduling.annotation.Scheduled s) {
++        return this.holdMs.computeIfAbsent(name, k -> {
++            try {
++                long period = 0L;
++                if (s.fixedDelay() > 0) {
++                    period = s.fixedDelay();
++                } else if (s.fixedRate() > 0) {
++                    period = s.fixedRate();
++                } else if (!s.fixedDelayString().isEmpty()) {
++                    period = java.time.Duration.parse(normalize(this.env.resolvePlaceholders(s.fixedDelayString()))).toMillis();
++                } else if (!s.fixedRateString().isEmpty()) {
++                    period = java.time.Duration.parse(normalize(this.env.resolvePlaceholders(s.fixedRateString()))).toMillis();
++                } else if (!s.cron().isEmpty()) {
++                    org.springframework.scheduling.support.CronExpression cron =
++                        org.springframework.scheduling.support.CronExpression.parse(this.env.resolvePlaceholders(s.cron()));
++                    java.time.LocalDateTime a = cron.next(java.time.LocalDateTime.now());
++                    java.time.LocalDateTime b = a == null ? null : cron.next(a);
++                    if (a != null && b != null) {
++                        period = Math.min(java.time.Duration.between(a, b).toMillis(), CRON_HOLD_CAP_MS * 10 / 9);
++                    }
++                }
++                return Math.max(0L, period * 9 / 10);
++            } catch (RuntimeException e) {
++                log.debug("[cluster-lock] 无法推算 {} 的执行周期：{}", name, e.getMessage());
++                return 0L;
++            }
++        });
++    }
++
++    /** "5000" → "PT5S"（毫秒数）；已是 ISO-8601 时原样返回 */
++    private static String normalize(String v) {
++        String t = v.trim();
++        return t.matches("\\d+") ? "PT" + (Long.parseLong(t) / 1000.0) + "S" : t;
+     }
+ 
+     @Around("@annotation(org.springframework.scheduling.annotation.Scheduled)")
+@@ -41,10 +83,16 @@ public class ScheduledJobLockAspect {
+             log.debug("[cluster-lock] {} 正由其它实例执行，本轮跳过", name);
+             return null;
+         }
++        long started = System.currentTimeMillis();
++        long hold = this.holdFor(name, m.getAnnotation(org.springframework.scheduling.annotation.Scheduled.class));
+         try {
+             return pjp.proceed();
+         } finally {
+-            this.lock.release(name);
++            if (hold > 0L) {
++                this.lock.holdUntil(name, started + hold);
++            } else {
++                this.lock.release(name);
++            }
+         }
+     }
+ }
+diff --git a/backend-src/com/dcim/masterdata/controller/CategoryController.java b/backend-src/com/dcim/masterdata/controller/CategoryController.java
+index d143488..79be23a 100644
+--- a/backend-src/com/dcim/masterdata/controller/CategoryController.java
++++ b/backend-src/com/dcim/masterdata/controller/CategoryController.java
+@@ -50,11 +50,19 @@ public class CategoryController {
+     private final TransactionTemplate rowTx;
+     private static final List<String> CSV_HEADERS = List.of("分类编码", "分类名称", "父分类编码", "排序", "备注");
+ 
++    @org.springframework.beans.factory.annotation.Autowired
++    private com.dcim.security.RbacService rbacForTree;
++
++    /**
++     * v3.4：分类树是资产、物料页面显示分类名所需的参考数据，能读分类 / 资产 / 物料任一模块即可读取
++     * （v3.3 只认分类模块：只授予资产权限的角色打开资产页会报「没有执行该操作的权限」）。
++     */
+     @GetMapping({"/tree"})
+-    @RequirePerm(
+-        module = "categories"
+-    )
+     public ApiResult<List<Map<String, Object>>> tree() {
++        com.dcim.security.LoginUser u = com.dcim.security.CurrentUser.get();
++        if (!this.rbacForTree.canRead(u, "categories") && !this.rbacForTree.canRead(u, "assets") && !this.rbacForTree.canRead(u, "materials")) {
++            throw new org.springframework.security.access.AccessDeniedException("没有执行该操作的权限");
++        }
+         List<CategoryEntity> all = this.categoryMapper.selectList(null);
+         Map<String, List<CategoryEntity>> byParent = all.stream().collect(Collectors.groupingBy(c -> c.getParentCode() == null ? "" : c.getParentCode()));
+         List<Map<String, Object>> roots = byParent.getOrDefault("", List.of())
+diff --git a/backend-src/com/dcim/search/controller/GlobalSearchController.java b/backend-src/com/dcim/search/controller/GlobalSearchController.java
+index b6e3c41..0f81cb1 100644
+--- a/backend-src/com/dcim/search/controller/GlobalSearchController.java
++++ b/backend-src/com/dcim/search/controller/GlobalSearchController.java
+@@ -17,6 +17,8 @@ import org.springframework.web.bind.annotation.RestController;
+ @RestController
+ @RequestMapping({"/api/search"})
+ public class GlobalSearchController {
++    @org.springframework.beans.factory.annotation.Autowired
++    private com.dcim.security.field.FieldPolicyService fieldPolicies;
+     private final JdbcTemplate jdbcTemplate;
+     private final RbacService rbacService;
+     private final com.dcim.security.DataScopeService dataScope;
+@@ -34,14 +36,31 @@ public class GlobalSearchController {
+             String like = "%" + escapeLike(kw) + "%";
+             List<Map<String, Object>> results = new ArrayList<>();
+             if (this.rbacService.canRead(user, "assets")) {
+-                List<Object> args = new ArrayList<>(List.of(like, like, like, like, like));
++                // v3.4：隐藏字段不参与匹配，也不回显（否则可用看不到的 SN / IP 反查资产）
++                List<String> cols = new ArrayList<>(List.of("asset_no", "name"));
++                if (!this.fieldPolicies.isHidden(user, "assets", "sn")) {
++                    cols.add("sn");
++                }
++                if (!this.fieldPolicies.isHidden(user, "assets", "mgmtIp")) {
++                    cols.add("mgmt_ip");
++                }
++                if (!this.fieldPolicies.isHidden(user, "assets", "bizIp")) {
++                    cols.add("biz_ip");
++                }
++                String statusCol = this.fieldPolicies.isHidden(user, "assets", "statusBiz") ? "NULL" : "status_biz";
++                List<Object> args = new ArrayList<>();
++                List<String> preds = new ArrayList<>();
++                for (String c : cols) {
++                    preds.add(c + " ILIKE ? ESCAPE '\\'");
++                    args.add(like);
++                }
+                 String scope = this.dataScope.assetSql(user, "", args);
+                 args.add(like);
+                 args.add(capped);
+                 results.addAll(
+                     this.jdbcTemplate
+                         .queryForList(
+-                            "SELECT 'asset' AS type, asset_no AS id, name AS title, status_biz AS status\nFROM asset\nWHERE deleted_at IS NULL\n  AND (asset_no ILIKE ? ESCAPE '\\' OR name ILIKE ? ESCAPE '\\' OR sn ILIKE ? ESCAPE '\\'\n       OR mgmt_ip ILIKE ? ESCAPE '\\' OR biz_ip ILIKE ? ESCAPE '\\')"
++                            "SELECT 'asset' AS type, asset_no AS id, name AS title, " + statusCol + " AS status\nFROM asset\nWHERE deleted_at IS NULL\n  AND (" + String.join(" OR ", preds) + ")"
+                                 + scope
+                                 + "\nORDER BY (asset_no ILIKE ? ESCAPE '\\') DESC, asset_no\nLIMIT ?\n",
+                             args.toArray()
+diff --git a/backend-src/com/dcim/security/LoginThrottle.java b/backend-src/com/dcim/security/LoginThrottle.java
+index bfa3e58..ec995a3 100644
+--- a/backend-src/com/dcim/security/LoginThrottle.java
++++ b/backend-src/com/dcim/security/LoginThrottle.java
+@@ -114,6 +114,140 @@ public class LoginThrottle {
+         }
+     }
+ 
++    // ───────────── v3.4：账号级锁定（跨 IP）与可信 IP ─────────────
++
++    private static final String ACCT_GLOBAL = "login:fail:acctg:";
++    private static final String TRUST_PREFIX = "dcim:login-trusted:";
++    private static final RedisScript<Long> ACCT_INCR = new DefaultRedisScript<>(
++        "local c = redis.call('INCR', KEYS[1]) if c == 1 or redis.call('PTTL', KEYS[1]) < 0 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end "
++            + "if c == tonumber(ARGV[2]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end return c",
++        Long.class
++    );
++    private final ConcurrentHashMap<String, Long> memLockedUntil = new ConcurrentHashMap<>();
++    private final ConcurrentHashMap<String, Long> memTrusted = new ConcurrentHashMap<>();
++
++    private static String acctKey(String username) {
++        String u = username == null ? "" : username.trim();
++        return ACCT_GLOBAL + (u.length() > 64 ? u.substring(0, 64) : u);
++    }
++
++    /** 记一次账号级失败；达到阈值时把锁定期设为 lock。返回当前计数 */
++    public long recordAccountFailure(String username, Duration window, int threshold, Duration lock) {
++        if (username == null || threshold <= 0) {
++            return 0L;
++        }
++        String key = acctKey(username);
++        StringRedisTemplate redis = this.redisProvider.getIfAvailable();
++        if (redis != null) {
++            try {
++                Long c = redis.execute(ACCT_INCR, List.of(PREFIX + key), String.valueOf(window.toMillis()), String.valueOf(threshold), String.valueOf(lock.toMillis()));
++                return c == null ? 0L : c;
++            } catch (RuntimeException e) {
++                log.debug("[login-throttle] Redis 写入失败，退回内存计数：{}", e.getMessage());
++            }
++        }
++        this.recordFailure(key, window);
++        Window w = this.counters.get(key);
++        int c = w == null ? 0 : w.count.get();
++        if (c == threshold) {
++            this.memLockedUntil.put(key, System.currentTimeMillis() + lock.toMillis());
++        }
++        return c;
++    }
++
++    public boolean isAccountLocked(String username, int threshold, Duration window) {
++        if (username == null || threshold <= 0) {
++            return false;
++        }
++        String key = acctKey(username);
++        Long until = this.memLockedUntil.get(key);
++        if (until != null) {
++            if (until > System.currentTimeMillis()) {
++                return true;
++            }
++            this.memLockedUntil.remove(key, until);
++        }
++        return this.isBlocked(key, threshold, window);
++    }
++
++    /** 剩余锁定秒数（未锁定或无法得知时为 0） */
++    public long accountLockSeconds(String username) {
++        String key = acctKey(username);
++        StringRedisTemplate redis = this.redisProvider.getIfAvailable();
++        if (redis != null) {
++            try {
++                Long ms = redis.getExpire(PREFIX + key, java.util.concurrent.TimeUnit.MILLISECONDS);
++                return ms == null || ms < 0 ? 0L : (ms + 999) / 1000;
++            } catch (RuntimeException ignored) {
++                // fall through
++            }
++        }
++        Long until = this.memLockedUntil.get(key);
++        return until == null ? 0L : Math.max(0L, (until - System.currentTimeMillis() + 999) / 1000);
++    }
++
++    /** 管理员解锁：清掉该账号的跨 IP 计数与各「账号+IP」计数 */
++    public void unlockAccount(String username) {
++        String key = acctKey(username);
++        this.memLockedUntil.remove(key);
++        this.counters.keySet().removeIf(k -> k.equals(key) || k.startsWith("login:fail:acct:" + username + ":ip:"));
++        StringRedisTemplate redis = this.redisProvider.getIfAvailable();
++        if (redis != null) {
++            try {
++                redis.delete(PREFIX + key);
++                org.springframework.data.redis.core.ScanOptions opts = org.springframework.data.redis.core.ScanOptions.scanOptions()
++                    .match(PREFIX + "login:fail:acct:" + username + ":ip:*").count(500).build();
++                List<String> keys = new java.util.ArrayList<>();
++                try (org.springframework.data.redis.core.Cursor<String> cur = redis.scan(opts)) {
++                    cur.forEachRemaining(keys::add);
++                }
++                if (!keys.isEmpty()) {
++                    redis.delete(keys);
++                }
++            } catch (RuntimeException e) {
++                log.warn("[login-throttle] 解锁时清理 Redis 失败：{}", e.getMessage());
++            }
++        }
++    }
++
++    /** 登录成功的 IP 记为该账号的可信来源；账号级锁定不影响可信 IP */
++    public void trust(String username, String ip, Duration ttl) {
++        if (username == null || ip == null) {
++            return;
++        }
++        StringRedisTemplate redis = this.redisProvider.getIfAvailable();
++        if (redis != null) {
++            try {
++                redis.opsForSet().add(TRUST_PREFIX + username, ip);
++                redis.expire(TRUST_PREFIX + username, ttl);
++                return;
++            } catch (RuntimeException e) {
++                log.debug("[login-throttle] Redis 记录可信 IP 失败：{}", e.getMessage());
++            }
++        }
++        if (this.memTrusted.size() > MAX_TRACKED) {
++            long now = System.currentTimeMillis();
++            this.memTrusted.entrySet().removeIf(e -> e.getValue() < now);
++        }
++        this.memTrusted.put(username + "|" + ip, System.currentTimeMillis() + ttl.toMillis());
++    }
++
++    public boolean isTrusted(String username, String ip) {
++        if (username == null || ip == null) {
++            return false;
++        }
++        StringRedisTemplate redis = this.redisProvider.getIfAvailable();
++        if (redis != null) {
++            try {
++                return Boolean.TRUE.equals(redis.opsForSet().isMember(TRUST_PREFIX + username, ip));
++            } catch (RuntimeException e) {
++                log.debug("[login-throttle] Redis 读取可信 IP 失败：{}", e.getMessage());
++            }
++        }
++        Long until = this.memTrusted.get(username + "|" + ip);
++        return until != null && until > System.currentTimeMillis();
++    }
++
+     public int trackedKeys() {
+         return this.counters.size();
+     }
+diff --git a/backend-src/com/dcim/security/LoginUserLoader.java b/backend-src/com/dcim/security/LoginUserLoader.java
+index eb5758f..a5fb99d 100644
+--- a/backend-src/com/dcim/security/LoginUserLoader.java
++++ b/backend-src/com/dcim/security/LoginUserLoader.java
+@@ -182,7 +182,8 @@ public class LoginUserLoader {
+             Map<String, LoginUser.ModulePerm> modulePerms = new HashMap<>();
+             Map<String, Map<String, Boolean>> actionPerms = new HashMap<>();
+             Map<String, Map<String, Object>> dataScopes = new LinkedHashMap<>();
+-            Map<String, Map<String, Object>> fieldPerms = new LinkedHashMap<>();
++            Map<String, Map<String, boolean[]>> roleAccess = new HashMap<>();
++            Map<String, Map<String, Map<String, Object>>> roleFields = new HashMap<>();
+ 
+             for (String roleCode : roles) {
+                 for (RoleModulePermEntity p : this.modulePermMapper.selectList(Wrappers.<RoleModulePermEntity>lambdaQuery().eq(RoleModulePermEntity::getRoleCode, roleCode))) {
+@@ -191,6 +192,8 @@ public class LoginUserLoader {
+                         LoginUser.ModulePerm.of(Boolean.TRUE.equals(p.getCanRead()), Boolean.TRUE.equals(p.getCanWrite())),
+                         (a, b) -> LoginUser.ModulePerm.of(a.read() || b.read(), a.write() || b.write())
+                     );
++                    roleAccess.computeIfAbsent(roleCode, k -> new HashMap<>())
++                        .put(p.getModule(), new boolean[]{Boolean.TRUE.equals(p.getCanRead()), Boolean.TRUE.equals(p.getCanWrite())});
+                 }
+ 
+                 for (RoleActionPermEntity a : this.actionPermMapper.selectList(Wrappers.<RoleActionPermEntity>lambdaQuery().eq(RoleActionPermEntity::getRoleCode, roleCode))) {
+@@ -203,20 +206,17 @@ public class LoginUserLoader {
+                 }
+ 
+                 for (RoleFieldPermEntity f : this.fieldPermMapper.selectList(Wrappers.<RoleFieldPermEntity>lambdaQuery().eq(RoleFieldPermEntity::getRoleCode, roleCode))) {
+-                    fieldPerms.merge(f.getModule(), f.getFields() == null ? Map.of() : f.getFields(), (a, b) -> {
+-                        Map<String, Object> merged = new LinkedHashMap<>((Map<? extends String, ? extends Object>)a);
+-                        b.forEach((k, v) -> merged.merge(k, v, (x, y) -> {
+-                                if (x instanceof List<?> xl && y instanceof List<?> yl) {
+-                                    return this.union(xl, yl);
+-                                }
+-
+-                                return (Object)x;
+-                            }));
+-                        return merged;
+-                    });
++                    if (f.getFields() != null) {
++                        roleFields.computeIfAbsent(roleCode, k -> new HashMap<>()).put(f.getModule(), f.getFields());
++                    }
+                 }
+             }
+ 
++            // v3.4：字段权限按「可见 / 可编辑取最宽」合并（v3.3 取并集＝最严，且只存不用），管理员不受限
++            Map<String, Map<String, Object>> fieldPerms = isAdmin
++                ? new LinkedHashMap<>()
++                : new LinkedHashMap<>(com.dcim.security.field.FieldPolicyService.merge(roleAccess, roleFields));
++
+             if (isAdmin) {
+                 for (ModuleRegistry.ModuleDef m : this.moduleRegistry.list()) {
+                     modulePerms.put(m.code(), LoginUser.ModulePerm.of(true, true));
+diff --git a/backend-src/com/dcim/security/PermissionAspect.java b/backend-src/com/dcim/security/PermissionAspect.java
+index 0b073b8..287c5a4 100644
+--- a/backend-src/com/dcim/security/PermissionAspect.java
++++ b/backend-src/com/dcim/security/PermissionAspect.java
+@@ -22,6 +22,9 @@ public class PermissionAspect {
+             ? this.rbacService.canWrite(user, requirePerm.module(), requirePerm.action())
+             : this.rbacService.canRead(user, requirePerm.module());
+         if (!allowed) {
++            if (requirePerm.write() && "delete".equals(requirePerm.action()) && user != null && this.rbacService.canWrite(user, requirePerm.module(), "")) {
++                throw com.dcim.common.BusinessException.forbidden("当前角色未授予「" + this.rbacService.moduleName(requirePerm.module()) + "」的删除权限，请联系管理员");
++            }
+             throw new AccessDeniedException("没有执行该操作的权限");
+         } else {
+             if (!requirePerm.action().isEmpty()) {
+diff --git a/backend-src/com/dcim/security/PrivilegeGuard.java b/backend-src/com/dcim/security/PrivilegeGuard.java
+index 13b7338..ea9287b 100644
+--- a/backend-src/com/dcim/security/PrivilegeGuard.java
++++ b/backend-src/com/dcim/security/PrivilegeGuard.java
+@@ -1,5 +1,6 @@
+ package com.dcim.security;
+ 
++import java.util.LinkedHashMap;
+ import com.dcim.common.BusinessException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+@@ -69,10 +70,113 @@ public class PrivilegeGuard {
+             List<Map<String, Object>> perms = this.jdbc.queryForList(
+                 "SELECT module, can_read, can_write FROM role_module_perm WHERE role_code = ?", rc.trim()
+             );
++            Map<String, Map<String, Object>> rolePerms = new LinkedHashMap<>();
+             for (Map<String, Object> p : perms) {
+                 this.assertModuleWithin(actor, String.valueOf(p.get("module")),
+                     Boolean.TRUE.equals(p.get("can_read")), Boolean.TRUE.equals(p.get("can_write")), "角色 " + rc);
++                rolePerms.put(String.valueOf(p.get("module")), Map.of("read", Boolean.TRUE.equals(p.get("can_read")), "write", Boolean.TRUE.equals(p.get("can_write"))));
+             }
++            // v3.4：授予已有角色时，操作（删除）、数据范围、字段规则也不能超出自己
++            for (Map<String, Object> a : this.jdbc.queryForList("SELECT module, actions::text AS actions FROM role_action_perm WHERE role_code = ?", rc.trim())) {
++                String module = String.valueOf(a.get("module"));
++                String json = String.valueOf(a.get("actions"));
++                if (json.replace(" ", "").contains("\"delete\":true") && !actorCanDelete(actor, module)) {
++                    throw BusinessException.forbidden("角色 " + rc + " 含有你未拥有的「" + module + "」删除权限，需管理员授予");
++                }
++            }
++            this.assertScopesAndFieldsWithin(actor, "角色 " + rc, rolePerms, this.loadScopes(rc.trim()), this.loadFields(rc.trim()));
++        }
++    }
++
++    private Map<String, Map<String, Object>> loadScopes(String roleCode) {
++        Map<String, Map<String, Object>> out = new LinkedHashMap<>();
++        for (Map<String, Object> r : this.jdbc.queryForList("SELECT module, scope->>'type' AS t FROM role_data_scope WHERE role_code = ?", roleCode)) {
++            out.put(String.valueOf(r.get("module")), Map.of("type", String.valueOf(r.get("t"))));
++        }
++        return out;
++    }
++
++    private Map<String, Map<String, Object>> loadFields(String roleCode) {
++        Map<String, Map<String, Object>> out = new LinkedHashMap<>();
++        for (Map<String, Object> r : this.jdbc.queryForList(
++            "SELECT module, COALESCE(fields->'hidden', '[]'::jsonb)::text AS h, COALESCE(fields->'readonly', '[]'::jsonb)::text AS r FROM role_field_perm WHERE role_code = ?",
++            roleCode
++        )) {
++            out.put(String.valueOf(r.get("module")), Map.of("hidden", jsonList(String.valueOf(r.get("h"))), "readonly", jsonList(String.valueOf(r.get("r")))));
++        }
++        return out;
++    }
++
++    private static List<String> jsonList(String json) {
++        List<String> out = new ArrayList<>();
++        for (String part : json.replace("[", "").replace("]", "").split(",")) {
++            String v = part.trim().replace("\"", "");
++            if (!v.isEmpty()) {
++                out.add(v);
++            }
++        }
++        return out;
++    }
++
++    private static boolean actorCanDelete(LoginUser actor, String module) {
++        if (actor == null) {
++            return false;
++        }
++        if (actor.isAdmin()) {
++            return true;
++        }
++        LoginUser.ModulePerm p = actor.modulePerms().get(module);
++        Map<String, Boolean> acts = actor.actionPerms() == null ? null : actor.actionPerms().get(module);
++        return p != null && p.write() && acts != null && Boolean.TRUE.equals(acts.get("delete"));
++    }
++
++    /**
++     * 数据范围与字段规则的天花板：
++     * <ul>
++     *   <li>角色在某模块上的数据范围不能比操作者宽（未配置视为「全部」）；</li>
++     *   <li>操作者在某模块上隐藏 / 只读的字段，角色也必须隐藏 / 不可写（字段层只能更严）。</li>
++     * </ul>
++     */
++    public void assertScopesAndFieldsWithin(LoginUser actor, String what, Map<String, Map<String, Object>> modulePerms,
++                                            Map<String, ? extends Object> dataScopes, Map<String, Map<String, Object>> fieldPerms) {
++        if (actor == null || actor.isAdmin() || modulePerms == null) {
++            return;
++        }
++        List<String> over = new ArrayList<>();
++        modulePerms.forEach((module, m) -> {
++            boolean access = m != null && (Boolean.TRUE.equals(m.get("read")) || Boolean.TRUE.equals(m.get("write")));
++            if (!access) {
++                return;
++            }
++            Object cfg = dataScopes == null ? null : dataScopes.get(module);
++            Object type = cfg instanceof Map<?, ?> cm ? cm.get("type") : null;
++            DataScopeService.Scope roleScope = DataScopeService.parse(type);
++            Map<String, Object> mine = actor.dataScopes() == null ? null : actor.dataScopes().get(module);
++            DataScopeService.Scope actorScope = DataScopeService.parse(mine == null ? null : mine.get("type"));
++            if (roleScope.ordinal() > actorScope.ordinal()) {
++                over.add("「" + module + "」数据范围 " + roleScope + "（你的范围是 " + actorScope + "）");
++            }
++            Map<String, Object> myFields = actor.fieldPerms() == null ? null : actor.fieldPerms().get(module);
++            if (myFields != null) {
++                com.dcim.security.field.FieldPolicy minePolicy = com.dcim.security.field.FieldPolicy.of(
++                    (java.util.Collection<?>)myFields.getOrDefault("hidden", List.of()), (java.util.Collection<?>)myFields.getOrDefault("readonly", List.of()));
++                Map<String, Object> rf = fieldPerms == null ? null : fieldPerms.get(module);
++                com.dcim.security.field.FieldPolicy rolePolicy = rf == null ? com.dcim.security.field.FieldPolicy.NONE
++                    : com.dcim.security.field.FieldPolicy.of((java.util.Collection<?>)rf.getOrDefault("hidden", List.of()), (java.util.Collection<?>)rf.getOrDefault("readonly", List.of()));
++                for (String f : minePolicy.hidden()) {
++                    if (!rolePolicy.isHidden(f)) {
++                        over.add("「" + module + "」字段 " + f + " 对你隐藏，角色里也须隐藏");
++                    }
++                }
++                for (String f : minePolicy.readonly()) {
++                    if (!rolePolicy.isLocked(f)) {
++                        over.add("「" + module + "」字段 " + f + " 对你只读，角色里也须只读或隐藏");
++                    }
++                }
++            }
++        });
++        if (!over.isEmpty()) {
++            throw BusinessException.forbidden(what + " 超出你自身的权限：" + String.join("；", over));
+         }
+     }
+ 
+@@ -112,8 +216,9 @@ public class PrivilegeGuard {
+                 Map<String, Boolean> mine = actor.actionPerms().get(module);
+                 acts.forEach((act, v) -> {
+                     boolean granted = Boolean.TRUE.equals(v) || "true".equals(String.valueOf(v));
+-                    // delete 只有管理员能做（RbacService.canWrite），非管理员不能把它授予他人
+-                    if (granted && ("delete".equals(act) || (mine != null && Boolean.FALSE.equals(mine.get(act))))) {
++                    // v3.4：删除可配置，但只能授出自己拥有的删除权限
++                    boolean overDelete = "delete".equals(act) && !actorCanDelete(actor, module);
++                    if (granted && (overDelete || (mine != null && Boolean.FALSE.equals(mine.get(act))))) {
+                         over.add(module + "." + act);
+                     }
+                 });
+diff --git a/backend-src/com/dcim/security/RbacService.java b/backend-src/com/dcim/security/RbacService.java
+index d0ad400..e4716d9 100644
+--- a/backend-src/com/dcim/security/RbacService.java
++++ b/backend-src/com/dcim/security/RbacService.java
+@@ -41,13 +41,32 @@ public class RbacService {
+         } else if (user.isAdmin()) {
+             return true;
+         } else if ("delete".equals(action)) {
+-            return false;
++            return this.canDelete(user, module);
+         } else {
+             LoginUser.ModulePerm p = user.modulePerms().get(module);
+             return p != null && p.write();
+         }
+     }
+ 
++    /**
++     * v3.4：删除需显式授予——模块写权限 + 角色操作权限里 delete=true。
++     * v3.3 及以前非管理员一律不能删除，角色页上的「删除」勾选不起作用。
++     */
++    public boolean canDelete(LoginUser user, String module) {
++        if (user == null) {
++            return false;
++        } else if (user.isAdmin()) {
++            return true;
++        }
++        LoginUser.ModulePerm p = user.modulePerms().get(module);
++        Map<String, Boolean> acts = user.actionPerms() == null ? null : user.actionPerms().get(module);
++        return p != null && p.write() && acts != null && Boolean.TRUE.equals(acts.get("delete"));
++    }
++
++    public String moduleName(String module) {
++        return this.moduleRegistry.nameOf(module);
++    }
++
+     public void assertAction(LoginUser user, String module, String action) {
+         if (user != null && !user.isAdmin()) {
+             Map<String, Boolean> cfg = user.actionPerms().get(module);
+diff --git a/backend-src/com/dcim/security/UserRateLimitFilter.java b/backend-src/com/dcim/security/UserRateLimitFilter.java
+new file mode 100644
+index 0000000..ac98e1f
+--- /dev/null
++++ b/backend-src/com/dcim/security/UserRateLimitFilter.java
+@@ -0,0 +1,174 @@
++package com.dcim.security;
++
++import com.dcim.common.ApiResult;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import jakarta.servlet.FilterChain;
++import jakarta.servlet.ServletException;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.regex.Pattern;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.ObjectProvider;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.core.annotation.Order;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.data.redis.core.script.DefaultRedisScript;
++import org.springframework.data.redis.core.script.RedisScript;
++import org.springframework.stereotype.Component;
++import org.springframework.web.filter.OncePerRequestFilter;
++
++/**
++ * 接口限流（v3.4，ADR-05）：令牌桶，已登录按用户、未登录按 IP 计，状态放 Redis（多实例共享）。
++ *
++ * <p>排在 Spring Security 之后（order -90 &gt; -100），此时已能拿到当前用户。原有的 {@link RateLimitFilter}
++ * 保留为「每 IP 每分钟」的粗粒度防洪闸（默认 3000），本过滤器负责按人细分：
++ * <ul>
++ *   <li>普通：每用户每秒 20 次、突发 40；</li>
++ *   <li>匿名：每 IP 每秒 10 次、突发 20；</li>
++ *   <li>重操作（导出、导入、批量）：每用户每分钟 10 次。</li>
++ * </ul>
++ * Redis 不可用时退回本机内存计数；{@code RATE_LIMIT_PER_MINUTE=0} 时与原过滤器一起关闭。
++ */
++@Component
++@Order(-90)
++public class UserRateLimitFilter extends OncePerRequestFilter {
++    private static final Logger log = LoggerFactory.getLogger(UserRateLimitFilter.class);
++    private static final String PREFIX = "dcim:rl2:";
++    private static final Pattern HEAVY = Pattern.compile("^/api/.*/(export|import|template)(/.*)?$|^/api/.*/batch-[a-z-]+$");
++    private static final RedisScript<List> BUCKET = new DefaultRedisScript<>(
++        "if redis.replicate_commands then pcall(redis.replicate_commands) end "
++            + "local rate = tonumber(ARGV[1]) local burst = tonumber(ARGV[2]) "
++            + "local t = redis.call('TIME') local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) "
++            + "local d = redis.call('HMGET', KEYS[1], 'tk', 'ts') local tk = tonumber(d[1]) local ts = tonumber(d[2]) "
++            + "if tk == nil or ts == nil then tk = burst ts = now end "
++            + "tk = math.min(burst, tk + math.max(0, now - ts) * rate) "
++            + "local ok = 0 local wait = 0 "
++            + "if tk >= 1 then tk = tk - 1 ok = 1 else wait = math.ceil((1 - tk) / rate) end "
++            + "redis.call('HSET', KEYS[1], 'tk', tostring(tk), 'ts', tostring(now)) "
++            + "redis.call('PEXPIRE', KEYS[1], math.ceil(burst / rate) + 1000) "
++            + "return {ok, wait, math.floor(tk)}",
++        List.class
++    );
++
++    @Value("${dcim.rate-limit.per-minute:3000}")
++    private int legacyPerMinute = 3000;
++    @Value("${dcim.rate-limit.enabled:true}")
++    private boolean enabled = true;
++    @Value("${dcim.rate-limit.user-rps:20}")
++    private double userRps = 20;
++    @Value("${dcim.rate-limit.user-burst:40}")
++    private int userBurst = 40;
++    @Value("${dcim.rate-limit.anon-rps:10}")
++    private double anonRps = 10;
++    @Value("${dcim.rate-limit.anon-burst:20}")
++    private int anonBurst = 20;
++    @Value("${dcim.rate-limit.heavy-per-minute:10}")
++    private int heavyPerMinute = 10;
++
++    private final ObjectProvider<StringRedisTemplate> redisProvider;
++    private final ObjectMapper objectMapper;
++    private final ClientIp clientIp;
++    private final ConcurrentHashMap<String, double[]> memBuckets = new ConcurrentHashMap<>();
++    private final ConcurrentHashMap<String, Long> lastWarn = new ConcurrentHashMap<>();
++
++    public UserRateLimitFilter(ObjectProvider<StringRedisTemplate> redisProvider, ObjectMapper objectMapper, ClientIp clientIp) {
++        this.redisProvider = redisProvider;
++        this.objectMapper = objectMapper;
++        this.clientIp = clientIp;
++    }
++
++    /** 判定结果：allowed、需等待毫秒 */
++    record Decision(boolean allowed, long waitMs, int limit) {
++    }
++
++    @Override
++    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain) throws ServletException, IOException {
++        if (!this.enabled || this.legacyPerMinute == 0) {
++            chain.doFilter(request, response);
++            return;
++        }
++        LoginUser user = CurrentUser.get();
++        String path = request.getRequestURI();
++        boolean heavy = HEAVY.matcher(path).matches();
++        String who = user != null ? "u:" + user.username() : "ip:" + this.clientIp.resolve(request);
++        Decision d;
++        if (heavy && user != null) {
++            d = this.take(who + ":heavy", this.heavyPerMinute / 60_000.0, this.heavyPerMinute);
++        } else if (user != null) {
++            d = this.take(who, this.userRps / 1000.0, this.userBurst);
++        } else {
++            d = this.take(who, this.anonRps / 1000.0, this.anonBurst);
++        }
++        if (d.allowed()) {
++            chain.doFilter(request, response);
++            return;
++        }
++        long now = System.currentTimeMillis();
++        Long prev = this.lastWarn.get(who);
++        if (prev == null || now - prev > 60_000L) {
++            this.lastWarn.put(who, now);
++            if (this.lastWarn.size() > 10_000) {
++                this.lastWarn.clear();
++            }
++            log.warn("[rate-limit] {} 超出{}限流，{} {}", who, heavy ? "重操作" : "", request.getMethod(), path);
++        }
++        long retry = Math.max(1L, (d.waitMs() + 999L) / 1000L);
++        response.setStatus(429);
++        response.setHeader("Retry-After", String.valueOf(retry));
++        response.setHeader("X-RateLimit-Limit", String.valueOf(d.limit()));
++        response.setContentType("application/json");
++        response.setCharacterEncoding(StandardCharsets.UTF_8.name());
++        String msg = heavy ? "导出 / 导入 / 批量操作过于频繁，请 " + retry + " 秒后再试" : "请求过于频繁，请 " + retry + " 秒后再试";
++        response.getWriter().write(this.objectMapper.writeValueAsString(ApiResult.error(429, msg)));
++    }
++
++    Decision take(String key, double ratePerMs, int burst) {
++        if (ratePerMs <= 0 || burst <= 0) {
++            return new Decision(true, 0, burst);
++        }
++        StringRedisTemplate redis = this.redisProvider.getIfAvailable();
++        if (redis != null) {
++            try {
++                List<?> r = redis.execute(BUCKET, List.of(PREFIX + key), String.valueOf(ratePerMs), String.valueOf(burst));
++                if (r != null && r.size() >= 2) {
++                    return new Decision(((Number)r.get(0)).longValue() == 1L, ((Number)r.get(1)).longValue(), burst);
++                }
++            } catch (RuntimeException e) {
++                log.debug("[rate-limit] Redis 不可用，退回本机计数：{}", e.getMessage());
++            }
++        }
++        return this.takeLocal(key, ratePerMs, burst);
++    }
++
++    private Decision takeLocal(String key, double ratePerMs, int burst) {
++        if (this.memBuckets.size() > 50_000) {
++            this.memBuckets.clear();
++        }
++        long now = System.currentTimeMillis();
++        double[] b = this.memBuckets.computeIfAbsent(key, k -> new double[]{burst, now});
++        synchronized (b) {
++            b[0] = Math.min(burst, b[0] + Math.max(0, now - b[1]) * ratePerMs);
++            b[1] = now;
++            if (b[0] >= 1) {
++                b[0] -= 1;
++                return new Decision(true, 0, burst);
++            }
++            return new Decision(false, (long)Math.ceil((1 - b[0]) / ratePerMs), burst);
++        }
++    }
++
++    @Override
++    protected boolean shouldNotFilter(HttpServletRequest request) {
++        String path = request.getRequestURI();
++        return !path.startsWith("/api/")
++            || path.startsWith("/api/healthz")
++            || path.startsWith("/api/collector/")
++            || path.startsWith("/api/monitoring/sd")
++            || path.startsWith("/api/monitoring/ingest/");
++    }
++}
+diff --git a/backend-src/com/dcim/security/field/FieldAccessInterceptor.java b/backend-src/com/dcim/security/field/FieldAccessInterceptor.java
+new file mode 100644
+index 0000000..cf7c2b1
+--- /dev/null
++++ b/backend-src/com/dcim/security/field/FieldAccessInterceptor.java
+@@ -0,0 +1,56 @@
++package com.dcim.security.field;
++
++import com.dcim.common.BusinessException;
++import com.dcim.security.CurrentUser;
++import com.dcim.security.LoginUser;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.web.servlet.HandlerInterceptor;
++import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
++import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
++
++/**
++ * 字段级权限·整接口依赖（v3.4）：工单附件接口依赖「附件」字段、工单资产行接口依赖「关联资产」字段、
++ * 批量导入要求无任何字段限制。这些接口没有可逐字段比对的 JSON 请求体，放在拦截器里统一判断。
++ */
++@Configuration
++public class FieldAccessInterceptor implements HandlerInterceptor, WebMvcConfigurer {
++    private final FieldPolicyService policies;
++
++    public FieldAccessInterceptor(FieldPolicyService policies) {
++        this.policies = policies;
++    }
++
++    @Override
++    public void addInterceptors(InterceptorRegistry registry) {
++        registry.addInterceptor(this).addPathPatterns("/api/assets/**", "/api/workorders/**");
++    }
++
++    @Override
++    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
++        FieldRouteRules.Rule rule = FieldRouteRules.match(request.getMethod(), request.getRequestURI());
++        if (rule == null) {
++            return true;
++        }
++        LoginUser user = CurrentUser.get();
++        if (rule.unrestrictedOnly()) {
++            this.policies.assertUnrestricted(user, rule.module(), "批量导入");
++        }
++        FieldPolicy p = this.policies.policy(user, rule.module());
++        if (p.isEmpty()) {
++            return true;
++        }
++        for (String f : rule.requireVisible()) {
++            if (p.isHidden(f)) {
++                throw BusinessException.forbidden("无权查看「" + FieldCatalog.label(rule.module(), f) + "」");
++            }
++        }
++        for (String f : rule.requireWritable()) {
++            if (p.isLocked(f)) {
++                throw BusinessException.forbidden("无权修改字段：" + FieldCatalog.label(rule.module(), f));
++            }
++        }
++        return true;
++    }
++}
+diff --git a/backend-src/com/dcim/security/field/FieldCatalog.java b/backend-src/com/dcim/security/field/FieldCatalog.java
+new file mode 100644
+index 0000000..09064db
+--- /dev/null
++++ b/backend-src/com/dcim/security/field/FieldCatalog.java
+@@ -0,0 +1,115 @@
++package com.dcim.security.field;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * 可配置字段权限的字段目录（v3.4）。
++ *
++ * <p>只收录「业务上可能需要对部分角色隐藏 / 只读」的字段；编号、名称、状态时间戳等身份类字段不可配置，
++ * 否则列表失去可读性。{@link FieldDef#extraKeys()} 是同一信息在响应里的派生键，隐藏时一并剔除
++ * （例如隐藏「关联资产」时，工单详情里的 items 也要去掉）。
++ */
++public final class FieldCatalog {
++    public record FieldDef(String field, String label, List<String> extraKeys) {
++        public FieldDef(String field, String label) {
++            this(field, label, List.of());
++        }
++    }
++
++    public static final String ASSETS = "assets";
++    public static final String WORKORDERS = "workorders";
++
++    private static final Map<String, List<FieldDef>> CATALOG = new LinkedHashMap<>();
++    /** 响应里嵌套着同模块对象的键（剔除时递归进入） */
++    private static final Map<String, Set<String>> NESTED = Map.of(
++        ASSETS, Set.of("children", "parent", "before", "after", "snapshot"),
++        WORKORDERS, Set.of("childWos")
++    );
++
++    static {
++        CATALOG.put(ASSETS, List.of(
++            new FieldDef("sn", "序列号"),
++            new FieldDef("categoryCode", "分类"),
++            new FieldDef("modelCode", "型号"),
++            new FieldDef("ownerType", "归属类型"),
++            new FieldDef("statusBiz", "业务状态"),
++            new FieldDef("statusFin", "财务状态"),
++            new FieldDef("regionCode", "区域"),
++            new FieldDef("roomCode", "机房"),
++            new FieldDef("rackCode", "机柜"),
++            new FieldDef("unitNo", "U 位"),
++            new FieldDef("uHeight", "高度（U）"),
++            new FieldDef("department", "使用部门"),
++            new FieldDef("owner", "责任人"),
++            new FieldDef("mgmtIp", "管理 IP"),
++            new FieldDef("bizIp", "业务 IP"),
++            new FieldDef("purchaseDate", "采购日期"),
++            new FieldDef("purchasePrice", "采购价格"),
++            new FieldDef("warrantyEnd", "维保到期"),
++            new FieldDef("rackDate", "上架日期"),
++            new FieldDef("contractNo", "合同号"),
++            new FieldDef("ratedPowerW", "额定功率（W）"),
++            new FieldDef("parentAssetNo", "父资产", List.of("parent")),
++            new FieldDef("attrs", "扩展属性"),
++            new FieldDef("finance", "财务信息（原值、净值、折旧）")
++        ));
++        CATALOG.put(WORKORDERS, List.of(
++            new FieldDef("description", "描述"),
++            new FieldDef("priority", "优先级"),
++            new FieldDef("expectFinish", "期望完成"),
++            new FieldDef("applicant", "申请人", List.of("applicantUsername")),
++            new FieldDef("handler", "处理人"),
++            new FieldDef("relatedAssets", "关联资产", List.of("items")),
++            new FieldDef("relatedMaterials", "关联物料", List.of("details")),
++            new FieldDef("targetLocation", "目标位置", List.of("targetRack", "targetUnit")),
++            new FieldDef("rootCause", "根因"),
++            new FieldDef("process", "处理过程"),
++            new FieldDef("completeNote", "完成说明"),
++            new FieldDef("acceptNote", "验收说明", List.of("acceptResult", "acceptor", "acceptTime")),
++            new FieldDef("costLabor", "人工费用"),
++            new FieldDef("costService", "服务费用"),
++            new FieldDef("costOther", "其他费用"),
++            new FieldDef("attachments", "附件")
++        ));
++    }
++
++    private FieldCatalog() {
++    }
++
++    public static Map<String, List<FieldDef>> all() {
++        return CATALOG;
++    }
++
++    public static boolean supports(String module) {
++        return CATALOG.containsKey(module);
++    }
++
++    public static List<FieldDef> of(String module) {
++        return CATALOG.getOrDefault(module, List.of());
++    }
++
++    public static FieldDef find(String module, String field) {
++        for (FieldDef d : of(module)) {
++            if (d.field().equalsIgnoreCase(field)) {
++                return d;
++            }
++        }
++        return null;
++    }
++
++    public static String label(String module, String field) {
++        FieldDef d = find(module, field);
++        return d == null ? field : d.label();
++    }
++
++    public static String moduleLabel(String module) {
++        return ASSETS.equals(module) ? "资产" : WORKORDERS.equals(module) ? "工单" : module;
++    }
++
++    public static Set<String> nestedKeys(String module) {
++        return NESTED.getOrDefault(module, Set.of());
++    }
++}
+diff --git a/backend-src/com/dcim/security/field/FieldMaskingAdvice.java b/backend-src/com/dcim/security/field/FieldMaskingAdvice.java
+new file mode 100644
+index 0000000..abd7418
+--- /dev/null
++++ b/backend-src/com/dcim/security/field/FieldMaskingAdvice.java
+@@ -0,0 +1,58 @@
++package com.dcim.security.field;
++
++import com.dcim.common.ApiResult;
++import com.dcim.security.CurrentUser;
++import com.dcim.security.LoginUser;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.util.Set;
++import org.springframework.core.MethodParameter;
++import org.springframework.http.MediaType;
++import org.springframework.http.converter.HttpMessageConverter;
++import org.springframework.http.converter.json.AbstractJackson2HttpMessageConverter;
++import org.springframework.http.server.ServerHttpRequest;
++import org.springframework.http.server.ServerHttpResponse;
++import org.springframework.web.bind.annotation.ControllerAdvice;
++import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
++
++/**
++ * 字段级权限·读（v3.4）：在响应统一出口剔除当前用户不可见的字段，并在响应头 X-Field-Hidden 声明剔除了哪些。
++ * 管理员、无字段限制的用户不做任何处理（零开销）。
++ */
++@ControllerAdvice
++public class FieldMaskingAdvice implements ResponseBodyAdvice<Object> {
++    private final FieldPolicyService policies;
++    private final ObjectMapper objectMapper;
++
++    public FieldMaskingAdvice(FieldPolicyService policies, ObjectMapper objectMapper) {
++        this.policies = policies;
++        this.objectMapper = objectMapper;
++    }
++
++    @Override
++    public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
++        return AbstractJackson2HttpMessageConverter.class.isAssignableFrom(converterType);
++    }
++
++    @Override
++    public Object beforeBodyWrite(Object body, MethodParameter returnType, MediaType contentType,
++                                  Class<? extends HttpMessageConverter<?>> converterType, ServerHttpRequest request, ServerHttpResponse response) {
++        if (!(body instanceof ApiResult<?> api) || api.getData() == null) {
++            return body;
++        }
++        FieldRouteRules.Rule rule = FieldRouteRules.match(request.getMethod().name(), request.getURI().getPath());
++        if (rule == null || rule.mode() != FieldRouteRules.Mode.MASK) {
++            return body;
++        }
++        LoginUser user = CurrentUser.get();
++        FieldPolicy policy = this.policies.policy(user, rule.module());
++        if (policy.hidden().isEmpty()) {
++            return body;
++        }
++        Set<String> hiddenLower = policy.hiddenKeysLower(rule.module());
++        JsonNode data = this.objectMapper.valueToTree(api.getData());
++        FieldPolicyService.mask(data, rule.module(), hiddenLower);
++        response.getHeaders().set("X-Field-Hidden", String.join(",", new java.util.TreeSet<>(policy.hidden())));
++        return new ApiResult<>(api.getCode(), api.getMsg(), data);
++    }
++}
+diff --git a/backend-src/com/dcim/security/field/FieldPolicy.java b/backend-src/com/dcim/security/field/FieldPolicy.java
+new file mode 100644
+index 0000000..96b080d
+--- /dev/null
++++ b/backend-src/com/dcim/security/field/FieldPolicy.java
+@@ -0,0 +1,81 @@
++package com.dcim.security.field;
++
++import java.util.Collection;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++
++/**
++ * 某用户在某模块上的有效字段策略：隐藏字段（不可见、不可写）与只读字段（可见、不可写）。
++ * 字段名大小写不敏感（实体经 Jackson 序列化时 uHeight 会变成 uheight）。
++ */
++public record FieldPolicy(Set<String> hidden, Set<String> readonly) {
++    public static final FieldPolicy NONE = new FieldPolicy(Set.of(), Set.of());
++
++    public static FieldPolicy of(Collection<?> hidden, Collection<?> readonly) {
++        Set<String> h = norm(hidden);
++        Set<String> r = norm(readonly);
++        r.removeAll(h);
++        return new FieldPolicy(Set.copyOf(h), Set.copyOf(r));
++    }
++
++    private static Set<String> norm(Collection<?> in) {
++        Set<String> out = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
++        if (in != null) {
++            for (Object o : in) {
++                if (o != null && !String.valueOf(o).isBlank()) {
++                    out.add(String.valueOf(o).trim());
++                }
++            }
++        }
++        return out;
++    }
++
++    public boolean isEmpty() {
++        return this.hidden.isEmpty() && this.readonly.isEmpty();
++    }
++
++    public boolean isHidden(String field) {
++        return contains(this.hidden, field);
++    }
++
++    /** 隐藏或只读 = 当前用户不能写 */
++    public boolean isLocked(String field) {
++        return contains(this.hidden, field) || contains(this.readonly, field);
++    }
++
++    private static boolean contains(Set<String> set, String field) {
++        if (field == null) {
++            return false;
++        }
++        for (String s : set) {
++            if (s.equalsIgnoreCase(field)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /** 隐藏字段及其派生键（小写），用于剔除响应 */
++    public Set<String> hiddenKeysLower(String module) {
++        Set<String> out = new TreeSet<>();
++        for (String f : this.hidden) {
++            out.add(f.toLowerCase(Locale.ROOT));
++            FieldCatalog.FieldDef d = FieldCatalog.find(module, f);
++            if (d != null) {
++                d.extraKeys().forEach(k -> out.add(k.toLowerCase(Locale.ROOT)));
++            }
++        }
++        return out;
++    }
++
++    public Map<String, Object> toMap() {
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("hidden", List.copyOf(new TreeSet<>(this.hidden)));
++        m.put("readonly", List.copyOf(new TreeSet<>(this.readonly)));
++        return m;
++    }
++}
+diff --git a/backend-src/com/dcim/security/field/FieldPolicyService.java b/backend-src/com/dcim/security/field/FieldPolicyService.java
+new file mode 100644
+index 0000000..82017e6
+--- /dev/null
++++ b/backend-src/com/dcim/security/field/FieldPolicyService.java
+@@ -0,0 +1,352 @@
++package com.dcim.security.field;
++
++import com.dcim.common.BusinessException;
++import com.dcim.security.LoginUser;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.node.ObjectNode;
++import java.math.BigDecimal;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Map.Entry;
++import java.util.Set;
++import org.springframework.stereotype.Service;
++
++/**
++ * 字段级权限（v3.4）：策略合并、响应剔除、写入比对、导出列过滤。
++ *
++ * <p>v3.3 及以前字段权限「只存不用」：角色里能配置，任何接口都不读取；多角色合并取并集（最严），
++ * 与数据范围的「取最宽」矛盾。这里统一为：
++ * <ul>
++ *   <li>可见：任一授予该模块访问权（读或写）的角色未隐藏该字段，即可见；</li>
++ *   <li>可编辑：任一拥有该模块写权限的角色既未隐藏、也未设只读，即可编辑；</li>
++ *   <li>管理员不受字段规则约束。</li>
++ * </ul>
++ */
++@Service
++public class FieldPolicyService {
++
++    /**
++     * 多角色合并。
++     * @param roleModuleAccess 角色 → 模块 → [可读, 可写]
++     * @param roleFieldCfg     角色 → 模块 → {hidden:[...], readonly:[...]}
++     * @return 模块 → {hidden, readonly}（仅包含有限制的模块）
++     */
++    public static Map<String, Map<String, Object>> merge(
++        Map<String, Map<String, boolean[]>> roleModuleAccess, Map<String, Map<String, Map<String, Object>>> roleFieldCfg
++    ) {
++        Map<String, Map<String, Object>> out = new LinkedHashMap<>();
++        for (String module : FieldCatalog.all().keySet()) {
++            Set<String> hidden = null;
++            Set<String> locked = null;
++            for (Entry<String, Map<String, boolean[]>> e : roleModuleAccess.entrySet()) {
++                boolean[] rw = e.getValue().get(module);
++                if (rw == null || !(rw[0] || rw[1])) {
++                    continue;
++                }
++                Map<String, Object> cfg = roleFieldCfg.getOrDefault(e.getKey(), Map.of()).get(module);
++                Set<String> h = lower(cfg == null ? null : cfg.get("hidden"));
++                Set<String> r = lower(cfg == null ? null : cfg.get("readonly"));
++                hidden = hidden == null ? new HashSet<>(h) : intersect(hidden, h);
++                if (rw[1]) {
++                    Set<String> hr = new HashSet<>(h);
++                    hr.addAll(r);
++                    locked = locked == null ? hr : intersect(locked, hr);
++                }
++            }
++            if (hidden == null) {
++                continue;
++            }
++            Set<String> readonly = locked == null ? new HashSet<>() : new HashSet<>(locked);
++            readonly.removeAll(hidden);
++            if (!hidden.isEmpty() || !readonly.isEmpty()) {
++                out.put(module, FieldPolicy.of(canonical(module, hidden), canonical(module, readonly)).toMap());
++            }
++        }
++        return out;
++    }
++
++    private static Set<String> intersect(Set<String> a, Set<String> b) {
++        Set<String> out = new HashSet<>(a);
++        out.retainAll(b);
++        return out;
++    }
++
++    private static Set<String> lower(Object v) {
++        Set<String> out = new HashSet<>();
++        if (v instanceof Collection<?> c) {
++            for (Object o : c) {
++                if (o != null && !String.valueOf(o).isBlank()) {
++                    out.add(String.valueOf(o).trim().toLowerCase(Locale.ROOT));
++                }
++            }
++        }
++        return out;
++    }
++
++    /** 小写字段名还原为目录里的规范写法；目录外的字段丢弃 */
++    private static List<String> canonical(String module, Set<String> lowerNames) {
++        List<String> out = new ArrayList<>();
++        for (FieldCatalog.FieldDef d : FieldCatalog.of(module)) {
++            if (lowerNames.contains(d.field().toLowerCase(Locale.ROOT))) {
++                out.add(d.field());
++            }
++        }
++        return out;
++    }
++
++    /**
++     * 角色保存前规整字段配置：模块须在目录里、字段须已知；同一字段既隐藏又只读时按隐藏处理。
++     */
++    public static Map<String, Map<String, Object>> normalizeRoleConfig(Map<String, Map<String, Object>> in) {
++        Map<String, Map<String, Object>> out = new LinkedHashMap<>();
++        if (in == null) {
++            return out;
++        }
++        in.forEach((module, cfg) -> {
++            if (cfg == null) {
++                return;
++            }
++            if (!FieldCatalog.supports(module)) {
++                throw BusinessException.badRequest("模块「" + module + "」不支持字段级权限；目前支持：" + String.join("、", FieldCatalog.all().keySet()));
++            }
++            for (String k : cfg.keySet()) {
++                if (!"hidden".equals(k) && !"readonly".equals(k)) {
++                    throw BusinessException.badRequest("字段权限只支持 hidden / readonly：" + module + "." + k);
++                }
++            }
++            Set<String> h = lower(cfg.get("hidden"));
++            Set<String> r = lower(cfg.get("readonly"));
++            for (String f : union(h, r)) {
++                if (FieldCatalog.find(module, f) == null) {
++                    throw BusinessException.badRequest("模块「" + module + "」没有可配置的字段：" + f);
++                }
++            }
++            r.removeAll(h);
++            if (!h.isEmpty() || !r.isEmpty()) {
++                out.put(module, FieldPolicy.of(canonical(module, h), canonical(module, r)).toMap());
++            }
++        });
++        return out;
++    }
++
++    private static Set<String> union(Set<String> a, Set<String> b) {
++        Set<String> out = new LinkedHashSet<>(a);
++        out.addAll(b);
++        return out;
++    }
++
++    public FieldPolicy policy(LoginUser user, String module) {
++        if (user == null || user.isAdmin() || user.fieldPerms() == null || !FieldCatalog.supports(module)) {
++            return FieldPolicy.NONE;
++        }
++        Map<String, Object> cfg = user.fieldPerms().get(module);
++        if (cfg == null) {
++            return FieldPolicy.NONE;
++        }
++        return FieldPolicy.of(asList(cfg.get("hidden")), asList(cfg.get("readonly")));
++    }
++
++    private static List<?> asList(Object v) {
++        return v instanceof List<?> l ? l : List.of();
++    }
++
++    public boolean isHidden(LoginUser user, String module, String field) {
++        return this.policy(user, module).isHidden(field);
++    }
++
++    /** 批量导入、整表覆盖等无法逐字段比对的操作：有任何字段限制就拒绝 */
++    public void assertUnrestricted(LoginUser user, String module, String what) {
++        FieldPolicy p = this.policy(user, module);
++        if (!p.isEmpty()) {
++            throw BusinessException.forbidden("当前角色在「" + FieldCatalog.moduleLabel(module) + "」上有字段限制，不能" + what + "，请联系管理员处理");
++        }
++    }
++
++    /** 列表筛选条件用到了隐藏字段 → 403（否则可借筛选反推隐藏字段的值） */
++    public void assertFilterAllowed(LoginUser user, String module, Map<String, Object> filters) {
++        FieldPolicy p = this.policy(user, module);
++        if (p.hidden().isEmpty() || filters == null) {
++            return;
++        }
++        for (Entry<String, Object> e : filters.entrySet()) {
++            Object v = e.getValue();
++            if (v != null && !String.valueOf(v).isBlank() && p.isHidden(e.getKey())) {
++                throw BusinessException.forbidden("无权按「" + FieldCatalog.label(module, e.getKey()) + "」筛选");
++            }
++        }
++    }
++
++    // ───────────────────────── 读：剔除 ─────────────────────────
++
++    /** 原地剔除隐藏键：对象本身、PageResult.records、数组元素，以及同模块的嵌套对象（children / parent ...） */
++    public static void mask(JsonNode node, String module, Set<String> hiddenLower) {
++        if (node == null || hiddenLower.isEmpty()) {
++            return;
++        }
++        if (node.isArray()) {
++            for (JsonNode e : node) {
++                mask(e, module, hiddenLower);
++            }
++        } else if (node.isObject()) {
++            ObjectNode obj = (ObjectNode)node;
++            JsonNode records = obj.get("records");
++            if (records != null && records.isArray() && obj.has("total")) {
++                mask(records, module, hiddenLower);
++                return;
++            }
++            List<String> drop = new ArrayList<>();
++            Iterator<String> it = obj.fieldNames();
++            while (it.hasNext()) {
++                String k = it.next();
++                if (hiddenLower.contains(k.toLowerCase(Locale.ROOT))) {
++                    drop.add(k);
++                }
++            }
++            obj.remove(drop);
++            for (String nk : FieldCatalog.nestedKeys(module)) {
++                JsonNode n = obj.get(nk);
++                if (n != null && (n.isObject() || n.isArray())) {
++                    mask(n, module, hiddenLower);
++                }
++            }
++        }
++    }
++
++    // ───────────────────────── 写：比对 ─────────────────────────
++
++    /**
++     * @param body    请求体（对象）
++     * @param current 当前值（更新时）；新建或无法取当前值时为 null，此时受限字段只要有值即拒绝
++     * @param aliases 请求键 → 字段名（如状态流转的 targetBiz → statusBiz）
++     */
++    public static void checkWrite(String module, FieldPolicy policy, JsonNode body, JsonNode current, Map<String, String> aliases) {
++        if (policy.isEmpty() || body == null || !body.isObject()) {
++            return;
++        }
++        List<String> denied = new ArrayList<>();
++        Iterator<Entry<String, JsonNode>> it = body.fields();
++        while (it.hasNext()) {
++            Entry<String, JsonNode> e = it.next();
++            String field = aliases == null ? e.getKey() : aliases.getOrDefault(e.getKey(), e.getKey());
++            if (!policy.isLocked(field)) {
++                continue;
++            }
++            JsonNode before = current == null ? null : getIgnoreCase(current, field);
++            boolean changed = current == null ? !isEmpty(e.getValue()) : !looseEquals(e.getValue(), before);
++            if (changed) {
++                denied.add(FieldCatalog.label(module, field));
++            }
++        }
++        if (!denied.isEmpty()) {
++            throw BusinessException.forbidden("无权修改字段：" + String.join("、", denied));
++        }
++    }
++
++    static JsonNode getIgnoreCase(JsonNode obj, String key) {
++        JsonNode v = obj.get(key);
++        if (v != null) {
++            return v;
++        }
++        Iterator<Entry<String, JsonNode>> it = obj.fields();
++        while (it.hasNext()) {
++            Entry<String, JsonNode> e = it.next();
++            if (e.getKey().equalsIgnoreCase(key)) {
++                return e.getValue();
++            }
++        }
++        return null;
++    }
++
++    static boolean isEmpty(JsonNode v) {
++        return v == null || v.isNull() || v.isMissingNode()
++            || (v.isTextual() && v.asText().isBlank())
++            || ((v.isArray() || v.isObject()) && v.isEmpty());
++    }
++
++    static boolean looseEquals(JsonNode a, JsonNode b) {
++        if (isEmpty(a) && isEmpty(b)) {
++            return true;
++        }
++        if (isEmpty(a) || isEmpty(b)) {
++            return false;
++        }
++        BigDecimal na = num(a);
++        BigDecimal nb = num(b);
++        if (na != null && nb != null) {
++            return na.compareTo(nb) == 0;
++        }
++        // 数组 vs 逗号分隔字符串（工单关联资产：请求传数组，库里存 CSV）
++        if ((a.isArray() && b.isTextual()) || (a.isTextual() && b.isArray())) {
++            return csvSet(a).equals(csvSet(b));
++        }
++        if (a.isValueNode() && b.isValueNode()) {
++            String sa = a.asText().trim();
++            String sb = b.asText().trim();
++            // 日期时间：前端常传 "2026-01-02"，实体序列化可能是 "2026-01-02T00:00:00"
++            return sa.equals(sb) || (sa.length() >= 10 && sb.length() >= 10 && (sa.startsWith(sb) || sb.startsWith(sa)) && sa.charAt(4) == '-');
++        }
++        return a.equals(b);
++    }
++
++    private static Set<String> csvSet(JsonNode v) {
++        Set<String> out = new java.util.TreeSet<>();
++        if (v.isArray()) {
++            for (JsonNode e : v) {
++                String s = e.isObject() && e.has("assetNo") ? e.get("assetNo").asText() : e.asText();
++                if (!s.isBlank()) {
++                    out.add(s.trim());
++                }
++            }
++        } else {
++            for (String s : v.asText().split("[,，;；、\\s]+")) {
++                if (!s.isBlank()) {
++                    out.add(s.trim());
++                }
++            }
++        }
++        return out;
++    }
++
++    private static BigDecimal num(JsonNode v) {
++        if (v.isNumber()) {
++            return v.decimalValue();
++        }
++        if (v.isTextual()) {
++            String s = v.asText().trim();
++            if (!s.isEmpty() && s.matches("-?\\d+(\\.\\d+)?")) {
++                return new BigDecimal(s);
++            }
++        }
++        return null;
++    }
++
++    // ───────────────────────── 导出：过滤列 ─────────────────────────
++
++    /** 返回应保留的列下标 */
++    public int[] keepColumns(LoginUser user, String module, String[] fields) {
++        FieldPolicy p = this.policy(user, module);
++        Set<String> hiddenLower = p.hiddenKeysLower(module);
++        List<Integer> keep = new ArrayList<>();
++        for (int i = 0; i < fields.length; i++) {
++            if (fields[i] == null || !hiddenLower.contains(fields[i].toLowerCase(Locale.ROOT))) {
++                keep.add(i);
++            }
++        }
++        return keep.stream().mapToInt(Integer::intValue).toArray();
++    }
++
++    public static <T> List<T> pick(List<T> row, int[] keep) {
++        List<T> out = new ArrayList<>(keep.length);
++        for (int i : keep) {
++            out.add(i < row.size() ? row.get(i) : null);
++        }
++        return out;
++    }
++}
+diff --git a/backend-src/com/dcim/security/field/FieldRouteRules.java b/backend-src/com/dcim/security/field/FieldRouteRules.java
+new file mode 100644
+index 0000000..2243653
+--- /dev/null
++++ b/backend-src/com/dcim/security/field/FieldRouteRules.java
+@@ -0,0 +1,117 @@
++package com.dcim.security.field;
++
++import java.util.List;
++import java.util.Map;
++import org.springframework.util.AntPathMatcher;
++
++/**
++ * 字段级权限的路由登记表（v3.4）：哪些接口的响应要剔除隐藏字段、哪些写接口要比对请求体、
++ * 哪些接口整体依赖某个字段（例如工单附件接口依赖「附件」字段）。
++ *
++ * <p>新增返回资产 / 工单字段的接口需在此登记；测试套件的字段权限用例会逐个接口验证。
++ */
++public final class FieldRouteRules {
++    public enum Mode {
++        /** 响应剔除隐藏字段 */
++        MASK,
++        /** 新建：受限字段有值即拒绝 */
++        CREATE,
++        /** 更新：与当前值比对，改动受限字段才拒绝 */
++        UPDATE,
++        /** 只看请求体里出现的受限字段（批量 / 流转 / 费用等） */
++        PRESENCE
++    }
++
++    public record Rule(String method, String pattern, String module, Mode mode, Map<String, String> aliases,
++                       List<String> requireVisible, List<String> requireWritable, boolean unrestrictedOnly) {
++    }
++
++    private static final Map<String, String> WO_ASSET_ALIASES = Map.of(
++        "assets", "relatedAssets",
++        "assetNos", "relatedAssets",
++        "assetNoList", "relatedAssets",
++        "assetList", "relatedAssets",
++        "assetNo", "relatedAssets",
++        "relatedAssetNos", "relatedAssets",
++        "asset_nos", "relatedAssets",
++        "related_assets", "relatedAssets",
++        "targetRack", "targetLocation",
++        "targetUnit", "targetLocation"
++    );
++    private static final Map<String, String> ASSET_TRANSITION_ALIASES = Map.of("targetBiz", "statusBiz", "targetFin", "statusFin");
++
++    private static final List<Rule> RULES = List.of(
++        // ── 资产：读
++        read("/api/assets", "assets"),
++        read("/api/assets/tree", "assets"),
++        read("/api/assets/lookup", "assets"),
++        read("/api/assets/{assetNo}", "assets"),
++        read("/api/assets/{assetNo}/children", "assets"),
++        read("/api/assets/{assetNo}/events", "assets"),
++        // ── 资产：写
++        new Rule("POST", "/api/assets", "assets", Mode.CREATE, Map.of(), List.of(), List.of(), false),
++        new Rule("PUT", "/api/assets/{assetNo}", "assets", Mode.UPDATE, Map.of(), List.of(), List.of(), false),
++        new Rule("POST", "/api/assets/batch-update", "assets", Mode.PRESENCE, Map.of(), List.of(), List.of(), false),
++        new Rule("POST", "/api/assets/batch-transitions", "assets", Mode.PRESENCE, ASSET_TRANSITION_ALIASES, List.of(), List.of(), false),
++        new Rule("POST", "/api/assets/{assetNo}/transitions", "assets", Mode.PRESENCE, ASSET_TRANSITION_ALIASES, List.of(), List.of(), false),
++        new Rule("POST", "/api/assets/import", "assets", null, Map.of(), List.of(), List.of(), true),
++        // ── 工单：读
++        read("/api/workorders", "workorders"),
++        read("/api/workorders/{woNo}", "workorders"),
++        new Rule("GET", "/api/workorders/{woNo}/attachments", "workorders", null, Map.of(), List.of("attachments"), List.of(), false),
++        new Rule("GET", "/api/workorders/{woNo}/attachments/**", "workorders", null, Map.of(), List.of("attachments"), List.of(), false),
++        // ── 工单：写
++        new Rule("POST", "/api/workorders", "workorders", Mode.CREATE, WO_ASSET_ALIASES, List.of(), List.of(), false),
++        new Rule("PUT", "/api/workorders/{woNo}", "workorders", Mode.UPDATE, WO_ASSET_ALIASES, List.of(), List.of(), false),
++        new Rule("PUT", "/api/workorders/{woNo}/repair-cost", "workorders", Mode.PRESENCE, Map.of(), List.of(), List.of(), false),
++        new Rule("POST", "/api/workorders/{woNo}/transitions", "workorders", Mode.PRESENCE, Map.of(), List.of(), List.of(), false),
++        new Rule("POST", "/api/workorders/{woNo}/items", "workorders", null, Map.of(), List.of(), List.of("relatedAssets"), false),
++        new Rule("PUT", "/api/workorders/{woNo}/items/{itemNo}", "workorders", null, Map.of(), List.of(), List.of("relatedAssets"), false),
++        new Rule("DELETE", "/api/workorders/{woNo}/items/{itemNo}", "workorders", null, Map.of(), List.of(), List.of("relatedAssets"), false),
++        new Rule("PUT", "/api/workorders/{woNo}/replacements", "workorders", null, Map.of(), List.of(), List.of("relatedAssets"), false),
++        new Rule("POST", "/api/workorders/{woNo}/attachments", "workorders", null, Map.of(), List.of(), List.of("attachments"), false),
++        new Rule("DELETE", "/api/workorders/{woNo}/attachments/{id}", "workorders", null, Map.of(), List.of(), List.of("attachments"), false)
++    );
++
++    private static final AntPathMatcher MATCHER = new AntPathMatcher();
++    /** 与 {assetNo} 等变量同形、但实际是固定子路径的段，避免把 /api/assets/meta 当成某资产详情 */
++    private static final List<String> RESERVED = List.of(
++        "meta", "export", "template", "model-codes", "lookup", "tree", "import", "batch-update", "batch-delete", "batch-transitions",
++        "sla-config", "workflow-config", "approver-options", "transfer-locations"
++    );
++
++    private FieldRouteRules() {
++    }
++
++    private static Rule read(String pattern, String module) {
++        return new Rule("GET", pattern, module, Mode.MASK, Map.of(), List.of(), List.of(), false);
++    }
++
++    public static Rule match(String method, String path) {
++        if (path == null || method == null) {
++            return null;
++        }
++        String p = path.length() > 1 && path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
++        for (Rule r : RULES) {
++            if (!r.method().equalsIgnoreCase(method) || !MATCHER.match(r.pattern(), p)) {
++                continue;
++            }
++            if (r.pattern().contains("{")) {
++                Map<String, String> vars = MATCHER.extractUriTemplateVariables(r.pattern(), p);
++                if (vars.values().stream().anyMatch(RESERVED::contains)) {
++                    continue;
++                }
++            }
++            return r;
++        }
++        return null;
++    }
++
++    public static Map<String, String> vars(Rule r, String path) {
++        return MATCHER.extractUriTemplateVariables(r.pattern(), path);
++    }
++
++    public static List<Rule> all() {
++        return RULES;
++    }
++}
+diff --git a/backend-src/com/dcim/security/field/FieldWriteGuardAdvice.java b/backend-src/com/dcim/security/field/FieldWriteGuardAdvice.java
+new file mode 100644
+index 0000000..0348b41
+--- /dev/null
++++ b/backend-src/com/dcim/security/field/FieldWriteGuardAdvice.java
+@@ -0,0 +1,117 @@
++package com.dcim.security.field;
++
++import com.dcim.asset.entity.AssetEntity;
++import com.dcim.asset.mapper.AssetMapper;
++import com.dcim.security.CurrentUser;
++import com.dcim.workorder.entity.WorkorderEntity;
++import com.dcim.workorder.mapper.WorkorderMapper;
++import com.baomidou.mybatisplus.core.toolkit.Wrappers;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import jakarta.servlet.http.HttpServletRequest;
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.lang.reflect.Type;
++import java.util.Map;
++import org.springframework.core.MethodParameter;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpInputMessage;
++import org.springframework.http.converter.HttpMessageConverter;
++import org.springframework.http.converter.json.AbstractJackson2HttpMessageConverter;
++import org.springframework.web.bind.annotation.ControllerAdvice;
++import org.springframework.web.context.request.RequestContextHolder;
++import org.springframework.web.context.request.ServletRequestAttributes;
++import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAdapter;
++
++/**
++ * 字段级权限·写（v3.4）：JSON 请求体进入控制器前，与当前值比对；改动了当前用户隐藏 / 只读的字段即 403。
++ * 前端编辑表单把整条记录原样回传（含只读字段的原值）不算改动，不受影响。
++ */
++@ControllerAdvice
++public class FieldWriteGuardAdvice extends RequestBodyAdviceAdapter {
++    private final FieldPolicyService policies;
++    private final ObjectMapper objectMapper;
++    private final AssetMapper assetMapper;
++    private final WorkorderMapper workorderMapper;
++
++    public FieldWriteGuardAdvice(FieldPolicyService policies, ObjectMapper objectMapper, AssetMapper assetMapper, WorkorderMapper workorderMapper) {
++        this.policies = policies;
++        this.objectMapper = objectMapper;
++        this.assetMapper = assetMapper;
++        this.workorderMapper = workorderMapper;
++    }
++
++    @Override
++    public boolean supports(MethodParameter methodParameter, Type targetType, Class<? extends HttpMessageConverter<?>> converterType) {
++        return AbstractJackson2HttpMessageConverter.class.isAssignableFrom(converterType);
++    }
++
++    @Override
++    public HttpInputMessage beforeBodyRead(HttpInputMessage inputMessage, MethodParameter parameter, Type targetType,
++                                           Class<? extends HttpMessageConverter<?>> converterType) throws IOException {
++        HttpServletRequest req = currentRequest();
++        if (req == null) {
++            return inputMessage;
++        }
++        String path = req.getRequestURI();
++        FieldRouteRules.Rule rule = FieldRouteRules.match(req.getMethod(), path);
++        if (rule == null || rule.mode() == null || rule.mode() == FieldRouteRules.Mode.MASK) {
++            return inputMessage;
++        }
++        FieldPolicy policy = this.policies.policy(CurrentUser.get(), rule.module());
++        if (policy.isEmpty()) {
++            return inputMessage;
++        }
++        byte[] bytes = inputMessage.getBody().readAllBytes();
++        JsonNode body;
++        try {
++            body = this.objectMapper.readTree(bytes);
++        } catch (IOException e) {
++            return replay(inputMessage.getHeaders(), bytes); // 交给后续 Jackson 报格式错误
++        }
++        JsonNode current = null;
++        if (rule.mode() == FieldRouteRules.Mode.UPDATE) {
++            current = this.loadCurrent(rule, path);
++        }
++        if (body != null && body.isArray()) {
++            for (JsonNode e : body) {
++                FieldPolicyService.checkWrite(rule.module(), policy, e, null, rule.aliases());
++            }
++        } else {
++            FieldPolicyService.checkWrite(rule.module(), policy, body, current, rule.aliases());
++        }
++        return replay(inputMessage.getHeaders(), bytes);
++    }
++
++    private JsonNode loadCurrent(FieldRouteRules.Rule rule, String path) {
++        Map<String, String> vars = FieldRouteRules.vars(rule, path);
++        Object entity = null;
++        if (FieldCatalog.ASSETS.equals(rule.module()) && vars.get("assetNo") != null) {
++            AssetEntity a = (AssetEntity)this.assetMapper.selectById(vars.get("assetNo"));
++            entity = a;
++        } else if (FieldCatalog.WORKORDERS.equals(rule.module()) && vars.get("woNo") != null) {
++            entity = this.workorderMapper.selectOne(Wrappers.<WorkorderEntity>lambdaQuery().eq(WorkorderEntity::getWoNo, vars.get("woNo")));
++        }
++        // 记录不存在时按「新建」处理：受限字段有值即拒绝；随后控制器会返回 404
++        return entity == null ? null : this.objectMapper.valueToTree(entity);
++    }
++
++    private static HttpInputMessage replay(HttpHeaders headers, byte[] bytes) {
++        return new HttpInputMessage() {
++            @Override
++            public InputStream getBody() {
++                return new ByteArrayInputStream(bytes);
++            }
++
++            @Override
++            public HttpHeaders getHeaders() {
++                return headers;
++            }
++        };
++    }
++
++    private static HttpServletRequest currentRequest() {
++        return RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes a ? a.getRequest() : null;
++    }
++}
+diff --git a/backend-src/com/dcim/system/audit/AuditAspect.java b/backend-src/com/dcim/system/audit/AuditAspect.java
+index 7e60ae3..5deedc3 100644
+--- a/backend-src/com/dcim/system/audit/AuditAspect.java
++++ b/backend-src/com/dcim/system/audit/AuditAspect.java
+@@ -40,7 +40,14 @@ public class AuditAspect {
+     private static final Pattern SENSITIVE_KEY = Pattern.compile("password|passwd|pwd|token|secret|credential|api[-_]?key|private[-_]?key|authorization", 2);
+     private final AuditService auditService;
+     private final ClientIp clientIpResolver;
+-    private final ObjectMapper objectMapper = new ObjectMapper();
++    /** v3.4：注册 Java 时间类型模块。原来的裸 ObjectMapper 不认识 LocalDateTime，带时间字段的返回值全部记为「无法序列化」 */
++    private final ObjectMapper objectMapper = new ObjectMapper()
++        .findAndRegisterModules()
++        .disable(com.fasterxml.jackson.databind.SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
++    /** 未声明 objIdSpEL 时，从返回值里按这些键推断对象号（新建类操作此前没有对象号） */
++    private static final java.util.List<String> ID_KEYS = java.util.List.of(
++        "woNo", "assetNo", "prbNo", "chgNo", "changeNo", "kbNo", "planNo", "roleCode", "username", "code", "id"
++    );
+     private final ExpressionParser spelParser = new SpelExpressionParser();
+     private final ParameterNameDiscoverer parameterNameDiscoverer = new DefaultParameterNameDiscoverer();
+ 
+@@ -57,6 +64,9 @@ public class AuditAspect {
+         try {
+             LoginUser user = CurrentUser.get();
+             String objId = this.evaluateObjId(jp, audit.objIdSpEL());
++            if (objId == null) {
++                objId = inferObjId(ret);
++            }
+             this.auditService
+                 .record(
+                     user == null ? "anonymous" : user.username(),
+@@ -72,6 +82,20 @@ public class AuditAspect {
+         }
+     }
+ 
++    static String inferObjId(Object ret) {
++        Object data = ret instanceof ApiResult<?> api ? api.getData() : ret;
++        if (data instanceof Map<?, ?> m) {
++            for (String k : ID_KEYS) {
++                Object v = m.get(k);
++                if (v instanceof String || v instanceof Number) {
++                    String s = String.valueOf(v);
++                    return s.length() > 100 ? s.substring(0, 100) : s;
++                }
++            }
++        }
++        return null;
++    }
++
+     private String evaluateObjId(JoinPoint jp, String expression) {
+         if (expression != null && !expression.isBlank()) {
+             try {
+diff --git a/backend-src/com/dcim/system/controller/AuthController.java b/backend-src/com/dcim/system/controller/AuthController.java
+index 9d71da8..cfe0ceb 100644
+--- a/backend-src/com/dcim/system/controller/AuthController.java
++++ b/backend-src/com/dcim/system/controller/AuthController.java
+@@ -27,6 +27,7 @@ import jakarta.validation.constraints.NotBlank;
+ import java.time.Duration;
+ import java.time.LocalDateTime;
+ import java.util.LinkedHashMap;
++import java.util.List;
+ import java.util.Map;
+ import java.util.UUID;
+ import org.springframework.beans.factory.annotation.Value;
+@@ -69,6 +70,13 @@ public class AuthController {
+     private int loginMaxFailPerIp;
+     @Value("${dcim.auth.login-fail-window-minutes:15}")
+     private int loginFailWindowMinutes;
++    /** v3.4：账号级（跨 IP）失败上限，达到即锁定；可信 IP 不受影响 */
++    @Value("${dcim.auth.login-max-fail-per-account-global:30}")
++    private int loginMaxFailPerAccountGlobal;
++    @Value("${dcim.auth.login-account-lock-minutes:15}")
++    private int loginAccountLockMinutes;
++    @Value("${dcim.auth.login-trusted-ip-days:30}")
++    private int loginTrustedIpDays;
+ 
+     @PostMapping({"/login"})
+     public ApiResult<Map<String, Object>> login(@RequestBody @Valid AuthController.LoginReq req, HttpServletRequest request, HttpServletResponse response) {
+@@ -76,6 +84,11 @@ public class AuthController {
+         Duration blockWindow = Duration.ofMinutes((long)Math.max(1, this.loginFailWindowMinutes));
+         String ipKey = "login:fail:ip:" + ip;
+         String acctKey = "login:fail:acct:" + req.username() + ":ip:" + ip;
++        boolean trusted = this.loginThrottle.isTrusted(req.username(), ip);
++        if (!trusted && this.loginThrottle.isAccountLocked(req.username(), this.loginMaxFailPerAccountGlobal, blockWindow)) {
++            this.auditService.record(req.username(), "LOGIN_BLOCKED", "auth", "user", req.username(), Map.of("result", "拒绝", "reason", "账号已临时锁定"), ip);
++            throw BusinessException.tooManyRequests("登录尝试次数过多，请稍后再试");
++        }
+         if (!this.loginThrottle.isBlocked(ipKey, this.loginMaxFailPerIp, blockWindow)
+             && !this.loginThrottle.isBlocked(acctKey, this.loginMaxFailPerAccount, blockWindow)) {
+             UserEntity user = this.selectByUsername(req.username());
+@@ -104,6 +117,7 @@ public class AuthController {
+ 
+             if (ok) {
+                 this.loginThrottle.reset(acctKey);
++                this.loginThrottle.trust(user.getUsername(), ip, Duration.ofDays(Math.max(1, this.loginTrustedIpDays)));
+                 LoginUser lu = this.loginUserLoader.load(user.getUsername());
+                 Map<String, Object> data = this.issueTokens(user.getUsername(), user.getName(), lu, request, response);
+                 this.userMapper
+@@ -117,6 +131,13 @@ public class AuthController {
+             } else {
+                 this.loginThrottle.recordFailure(ipKey, blockWindow);
+                 this.loginThrottle.recordFailure(acctKey, blockWindow);
++                long acctFails = this.loginThrottle.recordAccountFailure(
++                    req.username(), blockWindow, this.loginMaxFailPerAccountGlobal, Duration.ofMinutes(Math.max(1, this.loginAccountLockMinutes))
++                );
++                if (acctFails == this.loginMaxFailPerAccountGlobal && user != null) {
++                    this.auditService.record(req.username(), "ACCOUNT_LOCKED", "auth", "user", req.username(),
++                        Map.of("result", "锁定", "reason", "跨 IP 登录失败达到 " + acctFails + " 次", "minutes", this.loginAccountLockMinutes), ip);
++                }
+                 boolean allowWrite = this.auditThrottle.allow("login-fail:user:" + req.username(), this.loginFailUserPerMinute, Duration.ofMinutes(1L))
+                     && this.auditThrottle.allow("login-fail:ip:" + ip, this.loginFailIpPerMinute, Duration.ofMinutes(1L));
+                 if (allowWrite) {
+@@ -200,6 +221,24 @@ public class AuthController {
+         data.put("mustChangePwd", lu.mustChangePwd());
+         data.put("roles", lu.roles());
+         data.put("modules", modules);
++        // v3.4：前端按这些信息决定按钮与字段的显示（后端仍会逐一校验）
++        Map<String, Object> actions = new LinkedHashMap<>();
++        lu.modulePerms().forEach((k, v) -> {
++            Map<String, Boolean> cfg = lu.actionPerms() == null ? null : lu.actionPerms().get(k);
++            Map<String, Object> a = new LinkedHashMap<>();
++            a.put("delete", lu.isAdmin() || (v.write() && cfg != null && Boolean.TRUE.equals(cfg.get("delete"))));
++            for (String act : List.of("create", "update", "import", "export", "approve")) {
++                a.put(act, lu.isAdmin() || cfg == null || !Boolean.FALSE.equals(cfg.get(act)));
++            }
++            actions.put(k, a);
++        });
++        data.put("actions", actions);
++        data.put("fields", lu.fieldPerms() == null ? Map.of() : lu.fieldPerms());
++        Map<String, Object> scopes = new LinkedHashMap<>();
++        if (lu.dataScopes() != null && !lu.isAdmin()) {
++            lu.dataScopes().forEach((k, v) -> scopes.put(k, v == null ? "ALL" : String.valueOf(v.getOrDefault("type", "ALL"))));
++        }
++        data.put("dataScopes", scopes);
+         return ApiResult.ok(data);
+     }
+ 
+diff --git a/backend-src/com/dcim/system/controller/HealthController.java b/backend-src/com/dcim/system/controller/HealthController.java
+index acbf2f2..9938d44 100644
+--- a/backend-src/com/dcim/system/controller/HealthController.java
++++ b/backend-src/com/dcim/system/controller/HealthController.java
+@@ -30,7 +30,8 @@ import org.springframework.web.bind.annotation.RestController;
+  *   <li>只有数据库不可用才返回 503。Redis（会话 / 限流 / 缓存，均有降级路径）不可用或连接池排队
+  *       只标记 degraded 并返回 200——v3.2 中 Redis 一抖动，Caddy 就把后端整体摘除，全站 502；</li>
+  *   <li>JVM 内存、连接池等明细只对本机探针（容器内 healthcheck）与已登录用户返回，匿名外部访问只给状态；</li>
+- *   <li>Redis 探测连接用完即关。</li>
++ *   <li>Redis 探测连接用完即关；</li>
++ *   <li>v3.3.1：返回后端版本号（明细里另有构建日期与 jar 路径），用于核对实际运行的是哪个包。</li>
+  * </ul>
+  */
+ @RestController
+@@ -62,6 +63,7 @@ public class HealthController {
+         boolean degraded = Boolean.FALSE.equals(redisOk) || !poolOk;
+ 
+         data.put("status", !dbOk ? "down" : (degraded ? "degraded" : "up"));
++        data.put("version", com.dcim.common.BuildInfo.version());
+         data.put("db", dbOk ? "up" : "down");
+         data.put("redis", redisOk == null ? "disabled" : (redisOk ? "up" : "down"));
+         data.put("connectionPool", poolOk ? "up" : "saturated");
+@@ -73,6 +75,8 @@ public class HealthController {
+             data.put("jvmMemoryUsedMB", (runtime.totalMemory() - runtime.freeMemory()) / 1024L / 1024L);
+             data.put("jvmMemoryMaxMB", runtime.maxMemory() / 1024L / 1024L);
+             data.put("storage", this.storageType);
++            data.put("build", com.dcim.common.BuildInfo.buildTime());
++            data.put("jar", com.dcim.common.BuildInfo.jarLocation());
+         }
+         if (!dbOk) {
+             ApiResult<Map<String, Object>> body = new ApiResult<>(503, "服务不可用：数据库连接失败", data);
+diff --git a/backend-src/com/dcim/system/controller/RoleController.java b/backend-src/com/dcim/system/controller/RoleController.java
+index 7c7b78d..6a69191 100644
+--- a/backend-src/com/dcim/system/controller/RoleController.java
++++ b/backend-src/com/dcim/system/controller/RoleController.java
+@@ -53,9 +53,18 @@ public class RoleController {
+     @RequirePerm(
+         module = "system"
+     )
+-    public ApiResult<PageResult<Map<String, Object>>> list(@RequestParam(defaultValue = "1") long page, @RequestParam(defaultValue = "20") long size) {
+-        Page<RoleEntity> p = (Page<RoleEntity>)this.roleMapper
+-            .selectPage(new Page(page, size), new LambdaQueryWrapper<RoleEntity>().orderByAsc(RoleEntity::getId));
++    public ApiResult<PageResult<Map<String, Object>>> list(
++        @RequestParam(defaultValue = "1") long page,
++        @RequestParam(defaultValue = "20") long size,
++        @RequestParam(required = false) String keyword
++    ) {
++        LambdaQueryWrapper<RoleEntity> qw = new LambdaQueryWrapper<RoleEntity>().orderByAsc(RoleEntity::getId);
++        if (keyword != null && !keyword.isBlank()) {
++            // v3.4：按编码 / 名称模糊搜索（不区分大小写；转义 LIKE 通配符）
++            String kw = "%" + keyword.trim().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%";
++            qw.apply("(role_code ILIKE {0} OR name ILIKE {0})", kw);
++        }
++        Page<RoleEntity> p = (Page<RoleEntity>)this.roleMapper.selectPage(new Page(page, Math.min(Math.max(size, 1L), 200L)), qw);
+         List<String> codes = p.getRecords().stream().map(RoleEntity::getRoleCode).toList();
+         Map<String, Map<String, Map<String, Object>>> modulePerms = new HashMap<>();
+         Map<String, Map<String, Map<String, Object>>> dataScopes = new HashMap<>();
+@@ -103,6 +112,22 @@ public class RoleController {
+         return ApiResult.ok(new PageResult<>(p.getTotal(), records));
+     }
+ 
++    /** v3.4：可配置字段权限的字段目录（角色编辑页使用） */
++    @GetMapping({"/api/roles/field-catalog"})
++    @RequirePerm(
++        module = "system"
++    )
++    public ApiResult<Map<String, Object>> fieldCatalog() {
++        Map<String, Object> out = new LinkedHashMap<>();
++        com.dcim.security.field.FieldCatalog.all().forEach((module, defs) -> out.put(module, defs.stream().map(d -> {
++            Map<String, Object> m = new LinkedHashMap<>();
++            m.put("field", d.field());
++            m.put("label", d.label());
++            return m;
++        }).toList()));
++        return ApiResult.ok(out);
++    }
++
+     @PostMapping({"/api/roles"})
+     @RequirePerm(
+         module = "system",
+@@ -112,12 +137,14 @@ public class RoleController {
+         action = "CREATE",
+         module = "system",
+         objType = "role",
+-        objIdSpEL = "#req.roleCode()"
++        objIdSpEL = "#req.roleCode"
+     )
+     public ApiResult<Void> create(@RequestBody RoleController.SaveRoleReqBody req) {
+         this.validatePermModules(req);
+         this.privilegeGuard.assertCanSaveRole(CurrentUser.get(), req.getRoleCode(), req.getModulePerms(), req.getActionPerms(), false);
+-        this.roleService.create(req.getRoleCode(), req.toSaveRoleReq());
++        RoleService.SaveRoleReq sr = req.toSaveRoleReq();
++        this.privilegeGuard.assertScopesAndFieldsWithin(CurrentUser.get(), "角色 " + req.getRoleCode(), sr.modulePerms(), sr.dataScopes(), sr.fieldPerms());
++        this.roleService.create(req.getRoleCode(), sr);
+         return ApiResult.ok();
+     }
+ 
+@@ -135,7 +162,9 @@ public class RoleController {
+     public ApiResult<Void> update(@PathVariable String roleCode, @RequestBody RoleController.SaveRoleReqBody req) {
+         this.validatePermModules(req);
+         this.privilegeGuard.assertCanSaveRole(CurrentUser.get(), roleCode, req.getModulePerms(), req.getActionPerms(), true);
+-        this.roleService.update(roleCode, req.toSaveRoleReq());
++        RoleService.SaveRoleReq sr = req.toSaveRoleReq();
++        this.privilegeGuard.assertScopesAndFieldsWithin(CurrentUser.get(), "角色 " + roleCode, sr.modulePerms(), sr.dataScopes(), sr.fieldPerms());
++        this.roleService.update(roleCode, sr);
+         return ApiResult.ok();
+     }
+ 
+@@ -238,7 +267,10 @@ public class RoleController {
+                 });
+             }
+ 
+-            return new RoleService.SaveRoleReq(this.name, this.description, this.modulePerms, scopes, this.fieldPerms, this.actionPerms);
++            // v3.4：字段权限规整为 {hidden, readonly}，未知模块 / 字段直接 400
++            Map<String, Map<String, Object>> fields = this.fieldPerms == null ? null
++                : com.dcim.security.field.FieldPolicyService.normalizeRoleConfig(this.fieldPerms);
++            return new RoleService.SaveRoleReq(this.name, this.description, this.modulePerms, scopes, fields, this.actionPerms);
+         }
+ 
+         private static boolean isFlatScope(Map<String, Object> raw) {
+diff --git a/backend-src/com/dcim/system/controller/UserController.java b/backend-src/com/dcim/system/controller/UserController.java
+index 66381f0..48c07db 100644
+--- a/backend-src/com/dcim/system/controller/UserController.java
++++ b/backend-src/com/dcim/system/controller/UserController.java
+@@ -62,6 +62,13 @@ import org.springframework.web.multipart.MultipartFile;
+ @RestController
+ @RequestMapping({"/api/users"})
+ public class UserController {
++    @org.springframework.beans.factory.annotation.Autowired
++    private com.dcim.security.LoginThrottle loginThrottle;
++    @org.springframework.beans.factory.annotation.Value("${dcim.auth.login-max-fail-per-account-global:30}")
++    private int loginMaxFailPerAccountGlobal;
++    @org.springframework.beans.factory.annotation.Value("${dcim.auth.login-fail-window-minutes:15}")
++    private int loginFailWindowMinutes;
++
+     private static final String BUILTIN_ADMIN = "admin";
+     private static final List<String> CSV_HEADERS = List.of("用户名", "姓名", "部门", "手机号", "邮箱", "角色", "状态", "初始密码");
+     private final UserMapper userMapper;
+@@ -112,6 +119,13 @@ public class UserController {
+             row.put("mustChangePwd", u.getMustChangePwd());
+             row.put("roles", roleMap.getOrDefault(u.getId(), List.of()));
+             row.put("createdAt", u.getCreatedAt());
++            // v3.4：账号级登录锁定状态（跨 IP 多次失败），管理员可解锁
++            boolean locked = this.loginThrottle.isAccountLocked(u.getUsername(), this.loginMaxFailPerAccountGlobal,
++                java.time.Duration.ofMinutes(Math.max(1, this.loginFailWindowMinutes)));
++            row.put("loginLocked", locked);
++            if (locked) {
++                row.put("loginLockedSeconds", this.loginThrottle.accountLockSeconds(u.getUsername()));
++            }
+             return row;
+         }).toList();
+         return ApiResult.ok(new PageResult<>(p.getTotal(), records));
+@@ -265,6 +279,28 @@ public class UserController {
+         }
+     }
+ 
++    /** v3.4：解除账号级登录锁定（跨 IP 多次失败触发） */
++    @PostMapping({"/{username}/unlock"})
++    @RequirePerm(
++        module = "system",
++        write = true,
++        action = "update"
++    )
++    @Audit(
++        action = "UNLOCK",
++        module = "system",
++        objType = "user",
++        objIdSpEL = "#username"
++    )
++    public ApiResult<Map<String, Object>> unlock(@PathVariable String username) {
++        if (this.selectByUsername(username) == null) {
++            throw BusinessException.notFound("用户不存在：" + username);
++        }
++        this.privilegeGuard.assertCanManageUser(CurrentUser.get(), username);
++        this.loginThrottle.unlockAccount(username);
++        return ApiResult.ok(Map.of("username", username, "loginLocked", false));
++    }
++
+     @PutMapping({"/{username}/password"})
+     @Audit(
+         action = "CHANGE_PWD",
+diff --git a/backend-src/com/dcim/system/openapi/OpenApiController.java b/backend-src/com/dcim/system/openapi/OpenApiController.java
+new file mode 100644
+index 0000000..321ff95
+--- /dev/null
++++ b/backend-src/com/dcim/system/openapi/OpenApiController.java
+@@ -0,0 +1,322 @@
++package com.dcim.system.openapi;
++
++import com.dcim.common.ApiResult;
++import com.dcim.common.BuildInfo;
++import com.dcim.common.PageResult;
++import com.dcim.security.ModuleRegistry;
++import com.dcim.security.RequirePerm;
++import com.dcim.security.field.FieldRouteRules;
++import com.fasterxml.jackson.databind.BeanDescription;
++import com.fasterxml.jackson.databind.JavaType;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.PropertyName;
++import com.fasterxml.jackson.databind.introspect.BeanPropertyDefinition;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotEmpty;
++import jakarta.validation.constraints.NotNull;
++import java.lang.annotation.Annotation;
++import java.lang.reflect.Parameter;
++import java.lang.reflect.Type;
++import java.math.BigDecimal;
++import java.time.LocalDate;
++import java.time.LocalDateTime;
++import java.time.OffsetDateTime;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Comparator;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.core.MethodParameter;
++import org.springframework.core.ResolvableType;
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMethod;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RequestPart;
++import org.springframework.web.bind.annotation.RestController;
++import org.springframework.web.method.HandlerMethod;
++import org.springframework.web.multipart.MultipartFile;
++import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
++import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
++
++/**
++ * OpenAPI 3.0 接口文档（v3.4，ADR-06）：运行时从 Spring MVC 路由与 Jackson 反序列化元数据生成，登录后可访问。
++ *
++ * <p>不引入 springdoc：离线环境无法新增依赖，且它要求在控制器上逐个加注解。代价是多数控制器返回 Map，
++ * 响应体内部结构推导不到，文档只给出统一外层 {@code {code, msg, data}}。
++ * 每个接口带 {@code x-permission}（模块、读写、操作），字段级权限覆盖的接口带 {@code x-field-policy}。
++ */
++@RestController
++public class OpenApiController {
++    private final RequestMappingHandlerMapping mappings;
++    private final ObjectMapper objectMapper;
++    private final ModuleRegistry modules;
++    private volatile Map<String, Object> cached;
++
++    public OpenApiController(@Qualifier("requestMappingHandlerMapping") RequestMappingHandlerMapping mappings, ObjectMapper objectMapper,
++                             ModuleRegistry modules) {
++        this.mappings = mappings;
++        this.objectMapper = objectMapper;
++        this.modules = modules;
++    }
++
++    @GetMapping({"/api/openapi.json"})
++    public Map<String, Object> openapi() {
++        Map<String, Object> c = this.cached;
++        if (c == null) {
++            synchronized (this) {
++                c = this.cached;
++                if (c == null) {
++                    c = this.build();
++                    this.cached = c;
++                }
++            }
++        }
++        return c;
++    }
++
++    // ───────────────────────── 构建 ─────────────────────────
++
++    Map<String, Object> build() {
++        Map<String, Object> schemas = new TreeMap<>();
++        Map<String, Map<String, Object>> paths = new TreeMap<>();
++        Map<String, String> tagNames = new TreeMap<>();
++        List<Map.Entry<RequestMappingInfo, HandlerMethod>> entries = new ArrayList<>(this.mappings.getHandlerMethods().entrySet());
++        entries.sort(Comparator.comparing(e -> e.getValue().toString()));
++        for (Map.Entry<RequestMappingInfo, HandlerMethod> e : entries) {
++            RequestMappingInfo info = e.getKey();
++            HandlerMethod hm = e.getValue();
++            if (!hm.getBeanType().getName().startsWith("com.dcim.")) {
++                continue;
++            }
++            Set<String> patterns = info.getPatternValues();
++            Set<RequestMethod> methods = info.getMethodsCondition().getMethods();
++            for (String path : patterns) {
++                if (!path.startsWith("/api/")) {
++                    continue;
++                }
++                for (RequestMethod m : methods.isEmpty() ? Set.of(RequestMethod.GET) : methods) {
++                    Map<String, Object> op = this.operation(hm, m.name(), path, schemas, tagNames);
++                    paths.computeIfAbsent(path, k -> new TreeMap<>()).put(m.name().toLowerCase(), op);
++                }
++            }
++        }
++        Map<String, Object> doc = new LinkedHashMap<>();
++        doc.put("openapi", "3.0.3");
++        doc.put("info", Map.of(
++            "title", "智算资产管理平台 API",
++            "version", BuildInfo.version(),
++            "description", "统一响应结构 {code, msg, data}：code=0 成功；HTTP 401 未登录、403 无权限、404 不存在或不可见、409 冲突、429 限流。"
++                + "认证使用登录接口下发的 access_token Cookie，或请求头 Authorization: Bearer <个人访问令牌>。"
++        ));
++        List<Map<String, Object>> tags = new ArrayList<>();
++        tagNames.forEach((code, name) -> tags.add(Map.of("name", code, "description", name)));
++        doc.put("tags", tags);
++        doc.put("paths", paths);
++        Map<String, Object> components = new LinkedHashMap<>();
++        components.put("schemas", schemas);
++        components.put("securitySchemes", Map.of(
++            "cookieAuth", Map.of("type", "apiKey", "in", "cookie", "name", "access_token"),
++            "bearerAuth", Map.of("type", "http", "scheme", "bearer")
++        ));
++        doc.put("components", components);
++        doc.put("security", List.of(Map.of("cookieAuth", List.of()), Map.of("bearerAuth", List.of())));
++        return doc;
++    }
++
++    private Map<String, Object> operation(HandlerMethod hm, String method, String path, Map<String, Object> schemas, Map<String, String> tagNames) {
++        Map<String, Object> op = new LinkedHashMap<>();
++        RequirePerm perm = hm.getMethodAnnotation(RequirePerm.class);
++        String tag = perm != null ? perm.module() : hm.getBeanType().getSimpleName().replace("Controller", "");
++        tagNames.putIfAbsent(tag, perm != null ? this.modules.nameOf(perm.module()) : tag);
++        op.put("tags", List.of(tag));
++        op.put("operationId", hm.getBeanType().getSimpleName() + "." + hm.getMethod().getName());
++        op.put("summary", method + " " + path);
++        if (perm != null) {
++            Map<String, Object> x = new LinkedHashMap<>();
++            x.put("module", perm.module());
++            x.put("moduleName", this.modules.nameOf(perm.module()));
++            x.put("access", perm.write() ? "write" : "read");
++            if (!perm.action().isEmpty()) {
++                x.put("action", perm.action());
++            }
++            op.put("x-permission", x);
++        }
++        FieldRouteRules.Rule rule = FieldRouteRules.match(method, path.replaceAll("\\{[^/]+}", "X0"));
++        if (rule != null) {
++            op.put("x-field-policy", Map.of("module", rule.module(), "mode", rule.mode() == null ? "REQUIRE" : rule.mode().name()));
++        }
++        List<Map<String, Object>> params = new ArrayList<>();
++        Map<String, Object> body = null;
++        for (MethodParameter mp : hm.getMethodParameters()) {
++            Parameter p = mp.getMethod().getParameters()[mp.getParameterIndex()];
++            PathVariable pv = mp.getParameterAnnotation(PathVariable.class);
++            RequestParam rp = mp.getParameterAnnotation(RequestParam.class);
++            RequestBody rb = mp.getParameterAnnotation(RequestBody.class);
++            RequestPart part = mp.getParameterAnnotation(RequestPart.class);
++            if (pv != null) {
++                params.add(param(firstNonEmpty(pv.value(), pv.name(), p.getName()), "path", true, this.schemaOf(mp.getGenericParameterType(), schemas, 0)));
++            } else if (rp != null && MultipartFile.class.isAssignableFrom(mp.getParameterType())) {
++                body = Map.of("required", true, "content", Map.of("multipart/form-data", Map.of("schema", Map.of(
++                    "type", "object", "properties", Map.of(firstNonEmpty(rp.value(), rp.name(), "file"), Map.of("type", "string", "format", "binary"))))));
++            } else if (rp != null) {
++                Map<String, Object> s = new LinkedHashMap<>(this.schemaOf(mp.getGenericParameterType(), schemas, 0));
++                if (!org.springframework.web.bind.annotation.ValueConstants.DEFAULT_NONE.equals(rp.defaultValue())) {
++                    s.put("default", rp.defaultValue());
++                }
++                boolean required = rp.required() && org.springframework.web.bind.annotation.ValueConstants.DEFAULT_NONE.equals(rp.defaultValue());
++                params.add(param(firstNonEmpty(rp.value(), rp.name(), p.getName()), "query", required, s));
++            } else if (rb != null) {
++                body = new LinkedHashMap<>();
++                body.put("required", rb.required());
++                body.put("content", Map.of("application/json", Map.of("schema", this.schemaOf(mp.getGenericParameterType(), schemas, 0))));
++            } else if (part != null) {
++                body = Map.of("content", Map.of("multipart/form-data", Map.of("schema", Map.of("type", "object"))));
++            }
++        }
++        if (!params.isEmpty()) {
++            op.put("parameters", params);
++        }
++        if (body != null) {
++            op.put("requestBody", body);
++        }
++        op.put("responses", Map.of("200", this.response(hm, schemas)));
++        return op;
++    }
++
++    private Map<String, Object> response(HandlerMethod hm, Map<String, Object> schemas) {
++        ResolvableType rt = ResolvableType.forMethodReturnType(hm.getMethod());
++        Class<?> raw = rt.resolve();
++        if (raw == null || raw == void.class || raw == Void.class) {
++            return Map.of("description", "成功（直接写响应流，如文件下载）");
++        }
++        if (ResponseEntity.class.isAssignableFrom(raw)) {
++            return Map.of("description", "成功（文件或原始内容）");
++        }
++        Map<String, Object> schema;
++        if (ApiResult.class.isAssignableFrom(raw)) {
++            Map<String, Object> props = new LinkedHashMap<>();
++            props.put("code", Map.of("type", "integer", "example", 0));
++            props.put("msg", Map.of("type", "string", "example", "ok"));
++            props.put("data", this.schemaOf(rt.getGeneric(0), schemas, 0));
++            schema = Map.of("type", "object", "properties", props);
++        } else {
++            schema = this.schemaOf(rt, schemas, 0);
++        }
++        return Map.of("description", "成功", "content", Map.of("application/json", Map.of("schema", schema)));
++    }
++
++    private static Map<String, Object> param(String name, String in, boolean required, Map<String, Object> schema) {
++        Map<String, Object> p = new LinkedHashMap<>();
++        p.put("name", name);
++        p.put("in", in);
++        p.put("required", required);
++        p.put("schema", schema);
++        return p;
++    }
++
++    private static String firstNonEmpty(String... v) {
++        for (String s : v) {
++            if (s != null && !s.isEmpty()) {
++                return s;
++            }
++        }
++        return "arg";
++    }
++
++    private Map<String, Object> schemaOf(Type type, Map<String, Object> schemas, int depth) {
++        return this.schemaOf(ResolvableType.forType(type), schemas, depth);
++    }
++
++    private Map<String, Object> schemaOf(ResolvableType rt, Map<String, Object> schemas, int depth) {
++        Class<?> c = rt.resolve(Object.class);
++        if (c == String.class || c == Character.class || c == char.class || c.isEnum()) {
++            return Map.of("type", "string");
++        }
++        if (c == Integer.class || c == int.class || c == Long.class || c == long.class || c == Short.class || c == short.class) {
++            return Map.of("type", "integer");
++        }
++        if (c == BigDecimal.class || c == Double.class || c == double.class || c == Float.class || c == float.class) {
++            return Map.of("type", "number");
++        }
++        if (c == Boolean.class || c == boolean.class) {
++            return Map.of("type", "boolean");
++        }
++        if (c == LocalDate.class) {
++            return Map.of("type", "string", "format", "date");
++        }
++        if (c == LocalDateTime.class || c == OffsetDateTime.class) {
++            return Map.of("type", "string", "format", "date-time");
++        }
++        if (Collection.class.isAssignableFrom(c) || c.isArray()) {
++            ResolvableType item = c.isArray() ? rt.getComponentType() : rt.asCollection().getGeneric(0);
++            return Map.of("type", "array", "items", depth > 4 ? Map.of() : this.schemaOf(item, schemas, depth + 1));
++        }
++        if (Map.class.isAssignableFrom(c) || c == Object.class) {
++            return Map.of("type", "object");
++        }
++        if (PageResult.class.isAssignableFrom(c)) {
++            Map<String, Object> props = new LinkedHashMap<>();
++            props.put("records", Map.of("type", "array", "items", depth > 4 ? Map.of() : this.schemaOf(rt.getGeneric(0), schemas, depth + 1)));
++            props.put("total", Map.of("type", "integer"));
++            props.put("page", Map.of("type", "integer"));
++            props.put("size", Map.of("type", "integer"));
++            return Map.of("type", "object", "properties", props);
++        }
++        if (!c.getName().startsWith("com.dcim.") || depth > 6) {
++            return Map.of("type", "object");
++        }
++        String name = c.getName().substring(c.getName().lastIndexOf('.') + 1).replace('$', '.');
++        if (!schemas.containsKey(name)) {
++            schemas.put(name, Map.of("type", "object")); // 先占位，防递归
++            schemas.put(name, this.beanSchema(c, schemas, depth));
++        }
++        return Map.of("$ref", "#/components/schemas/" + name);
++    }
++
++    private Map<String, Object> beanSchema(Class<?> c, Map<String, Object> schemas, int depth) {
++        JavaType jt = this.objectMapper.constructType(c);
++        BeanDescription desc = this.objectMapper.getDeserializationConfig().introspect(jt);
++        Map<String, Object> props = new LinkedHashMap<>();
++        List<String> required = new ArrayList<>();
++        for (BeanPropertyDefinition def : desc.findProperties()) {
++            if (!def.couldDeserialize()) {
++                continue;
++            }
++            Type t = def.getField() != null ? def.getField().getAnnotated().getGenericType()
++                : def.getSetter() != null ? def.getSetter().getAnnotated().getGenericParameterTypes()[0]
++                : def.getPrimaryType();
++            Map<String, Object> s = new LinkedHashMap<>(this.schemaOf(t, schemas, depth + 1));
++            List<PropertyName> aliases = def.findAliases();
++            if (aliases != null && !aliases.isEmpty()) {
++                s.put("x-aliases", aliases.stream().map(PropertyName::getSimpleName).toList());
++            }
++            if (def.getField() != null) {
++                for (Annotation a : def.getField().getAnnotated().getAnnotations()) {
++                    if (a instanceof NotBlank || a instanceof NotNull || a instanceof NotEmpty) {
++                        required.add(def.getName());
++                        String msg = a instanceof NotBlank nb ? nb.message() : a instanceof NotNull nn ? nn.message() : ((NotEmpty)a).message();
++                        if (msg != null && !msg.startsWith("{")) {
++                            s.put("description", msg);
++                        }
++                        break;
++                    }
++                }
++            }
++            props.put(def.getName(), s);
++        }
++        Map<String, Object> out = new LinkedHashMap<>();
++        out.put("type", "object");
++        out.put("properties", props);
++        if (!required.isEmpty()) {
++            out.put("required", required);
++        }
++        return out;
++    }
++}
+diff --git a/backend-src/com/dcim/webhook/service/WebhookDispatcher.java b/backend-src/com/dcim/webhook/service/WebhookDispatcher.java
+index 62aade4..6a64263 100644
+--- a/backend-src/com/dcim/webhook/service/WebhookDispatcher.java
++++ b/backend-src/com/dcim/webhook/service/WebhookDispatcher.java
+@@ -1,50 +1,104 @@
+ package com.dcim.webhook.service;
+ 
+ import com.dcim.common.event.DomainEvent;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.jdbc.core.JdbcTemplate;
+ import org.springframework.stereotype.Component;
+-import org.springframework.transaction.annotation.Propagation;
+-import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.PlatformTransactionManager;
++import org.springframework.transaction.TransactionDefinition;
+ import org.springframework.transaction.event.TransactionPhase;
++import org.springframework.transaction.support.TransactionTemplate;
+ import org.springframework.transaction.event.TransactionalEventListener;
+ 
++/**
++ * 领域事件 → Webhook 投递记录（v3.4 改为「事务性发件箱」）。
++ *
++ * <p>v3.3 及以前在 AFTER_COMMIT 阶段以 REQUIRES_NEW 另开事务写投递记录。AFTER_COMMIT 回调执行时
++ * 原事务的连接尚未归还，REQUIRES_NEW 会再借一条：每个写请求同时占用两条连接。并发写请求数接近
++ * 连接池大小时，所有请求都握着第一条、等第二条，30 秒后成批报
++ * {@code CannotCreateTransactionException}（v3.4 并发用例 CC-05：20 路并发建单出现 500）。
++ *
++ * <p>现在在 BEFORE_COMMIT 阶段、于同一事务内用保存点（NESTED）写投递记录：
++ * <ul>
++ *   <li>只用请求已持有的那一条连接，不再有「持一等一」的连接池饥饿；</li>
++ *   <li>业务数据与投递记录同生共死：业务回滚则不投递，进程在提交后崩溃也不丢事件；</li>
++ *   <li>写投递记录失败只回滚到保存点并记录告警，不影响业务提交（与旧版「尽力而为」语义一致）。</li>
++ * </ul>
++ * 事务外发布的事件（fallbackExecution）仍立即执行，此时 NESTED 等同于新开事务。
++ *
++ * <p>没有任何启用的端点订阅该事件时直接跳过（订阅关系缓存 {@value #SUBSCRIPTION_TTL_MS} 毫秒），
++ * 批量导入等一次产生上万事件的事务不会因此多出上万个保存点。新建 / 启用的 Webhook 最迟在缓存过期后生效。
++ */
+ @Component
+ public class WebhookDispatcher {
+     
+     private static final Logger log = LoggerFactory.getLogger(WebhookDispatcher.class);
+     private final WebhookService webhookService;
+     private final JdbcTemplate jdbc;
++    private final TransactionTemplate savepoint;
++    static final long SUBSCRIPTION_TTL_MS = 5000L;
++    private volatile Set<String> subscribed;
++    private volatile long subscribedAt;
+ 
+-    public WebhookDispatcher(WebhookService webhookService, JdbcTemplate jdbc) {
++    public WebhookDispatcher(WebhookService webhookService, JdbcTemplate jdbc, PlatformTransactionManager txm) {
+         this.webhookService = webhookService;
+         this.jdbc = jdbc;
++        this.savepoint = new TransactionTemplate(txm);
++        this.savepoint.setPropagationBehavior(TransactionDefinition.PROPAGATION_NESTED);
+     }
+ 
+     @TransactionalEventListener(
+-        phase = TransactionPhase.AFTER_COMMIT,
++        phase = TransactionPhase.BEFORE_COMMIT,
+         fallbackExecution = true
+     )
+-    @Transactional(
+-        propagation = Propagation.REQUIRES_NEW
+-    )
+     public void onEvent(DomainEvent event) {
+         try {
+-            int n = this.webhookService.enqueue(event);
+-            if (n > 0) {
+-                log.debug("[webhook] {} {} 入队 {} 条", new Object[]{event.type(), event.objId(), n});
++            if (!this.anySubscriber(event.type())) {
++                return;
+             }
++            this.savepoint.executeWithoutResult(status -> {
++                int n = this.webhookService.enqueue(event);
++                if (n > 0) {
++                    log.debug("[webhook] {} {} 入队 {} 条", new Object[]{event.type(), event.objId(), n});
++                }
+ 
+-            if ("stock.movement".equals(event.type())) {
+-                this.checkLowStock(event);
+-            }
++                if ("stock.movement".equals(event.type())) {
++                    this.checkLowStock(event);
++                }
++            });
+         } catch (RuntimeException var3) {
+-            log.warn("[webhook] 事件 {} 入队失败：{}", event.type(), var3.toString());
++            log.warn("[webhook] 事件 {} 入队失败（已回滚到保存点，业务照常提交）：{}", event.type(), var3.toString());
++        }
++    }
++
++    /** 是否有启用的端点订阅该事件（含 "*"；库存流水还要看 stock.low，因为低库存告警由它派生）。 */
++    boolean anySubscriber(String type) {
++        Set<String> s = this.subscribed;
++        long now = System.currentTimeMillis();
++        if (s == null || now - this.subscribedAt > SUBSCRIPTION_TTL_MS) {
++            try {
++                // 放在保存点里：即使查询出错也只回滚到保存点，不会让业务事务进入 aborted 状态
++                s = this.savepoint.execute(st -> new HashSet<>(this.jdbc.queryForList(
++                    "SELECT DISTINCT unnest(event_types) FROM webhook_endpoint WHERE enabled = true AND deleted_at IS NULL", String.class)));
++            } catch (RuntimeException e) {
++                log.warn("[webhook] 读取订阅关系失败，按有订阅处理：{}", e.toString());
++                return true;
++            }
++            this.subscribed = s;
++            this.subscribedAt = now;
+         }
++        return s.contains("*") || s.contains(type) || "stock.movement".equals(type) && s.contains("stock.low");
++    }
++
++    /** 端点增删改后立即让订阅缓存失效（本实例；其他实例在 TTL 内生效）。 */
++    public void invalidateSubscriptions() {
++        this.subscribed = null;
+     }
+ 
+     private void checkLowStock(DomainEvent event) {
+diff --git a/backend-src/com/dcim/webhook/service/WebhookSubscriptionInvalidator.java b/backend-src/com/dcim/webhook/service/WebhookSubscriptionInvalidator.java
+new file mode 100644
+index 0000000..5003c2d
+--- /dev/null
++++ b/backend-src/com/dcim/webhook/service/WebhookSubscriptionInvalidator.java
+@@ -0,0 +1,25 @@
++package com.dcim.webhook.service;
++
++import org.aspectj.lang.annotation.AfterReturning;
++import org.aspectj.lang.annotation.Aspect;
++import org.springframework.stereotype.Component;
++
++/**
++ * Webhook 端点增删改后，让本实例的订阅关系缓存立即失效（v3.4）。
++ * 其他实例在 {@link WebhookDispatcher#SUBSCRIPTION_TTL_MS} 内自然刷新。
++ */
++@Aspect
++@Component
++public class WebhookSubscriptionInvalidator {
++
++    private final WebhookDispatcher dispatcher;
++
++    public WebhookSubscriptionInvalidator(WebhookDispatcher dispatcher) {
++        this.dispatcher = dispatcher;
++    }
++
++    @AfterReturning("target(com.dcim.webhook.mapper.WebhookEndpointMapper) && (execution(* insert*(..)) || execution(* update*(..)) || execution(* delete*(..)))")
++    public void endpointChanged() {
++        this.dispatcher.invalidateSubscriptions();
++    }
++}
+diff --git a/backend-src/com/dcim/workorder/controller/CsvExport.java b/backend-src/com/dcim/workorder/controller/CsvExport.java
+index e260164..38937e0 100644
+--- a/backend-src/com/dcim/workorder/controller/CsvExport.java
++++ b/backend-src/com/dcim/workorder/controller/CsvExport.java
+@@ -33,13 +33,19 @@ final class CsvExport {
+     }
+ 
+     static String render(List<Map<String, Object>> rows) {
++        return render(rows, java.util.Set.of());
++    }
++
++    /** v3.4：hiddenLower = 当前用户不可见的字段（小写），对应列不导出 */
++    static String render(List<Map<String, Object>> rows, java.util.Set<String> hiddenLower) {
++        List<String[]> cols = Arrays.stream(COLUMNS).filter(c -> !hiddenLower.contains(c[0].toLowerCase(java.util.Locale.ROOT))).toList();
+         StringBuilder sb = new StringBuilder();
+-        appendRow(sb, Arrays.stream(COLUMNS).map(c -> (String)c[1]).toList());
++        appendRow(sb, cols.stream().map(c -> c[1]).toList());
+ 
+         for (Map<String, Object> row : rows) {
+-            List<String> cells = new ArrayList<>(COLUMNS.length);
++            List<String> cells = new ArrayList<>(cols.size());
+ 
+-            for (String[] col : COLUMNS) {
++            for (String[] col : cols) {
+                 cells.add(cell(row.get(col[0])));
+             }
+ 
+diff --git a/backend-src/com/dcim/workorder/controller/WoAssetJson.java b/backend-src/com/dcim/workorder/controller/WoAssetJson.java
+new file mode 100644
+index 0000000..2598cc8
+--- /dev/null
++++ b/backend-src/com/dcim/workorder/controller/WoAssetJson.java
+@@ -0,0 +1,168 @@
++package com.dcim.workorder.controller;
++
++import com.dcim.common.BusinessException;
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.databind.DeserializationContext;
++import com.fasterxml.jackson.databind.JsonDeserializer;
++import com.fasterxml.jackson.databind.JsonNode;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.TreeSet;
++import java.util.regex.Pattern;
++
++/**
++ * 工单「关联资产」入参的宽松解析（v3.3.1 热补丁）。
++ *
++ * <p>背景：v3.2 只认 {@code relatedAssets}（字符串数组）和 {@code assets}（对象数组），第三方脚本 / 测试工具常用的
++ * {@code assetNos} 被 Jackson 当作未知字段<b>静默丢弃</b>，工单建成了却没有关联资产。v3.3.0 加了别名，
++ * 这里进一步把常见写法都收下来，并且对认不出的「像资产字段」的键直接报 400，不再静默丢弃：
++ * <ul>
++ *   <li>字段名：relatedAssets / assetNos / assetNoList / assetList / assetNo / relatedAssetNos / asset_nos / related_assets；</li>
++ *   <li>取值：字符串数组、单个字符串、逗号（中英文）/ 分号 / 顿号 / 空白分隔的字符串、数字、带 assetNo 字段的对象（或对象数组）；</li>
++ *   <li>{@code assets} 明细同时接受对象数组与字符串数组。</li>
++ * </ul>
++ */
++public final class WoAssetJson {
++    private static final Pattern SEP = Pattern.compile("[,，;；、\\s]+");
++    /** 由 relatedAssets 的 @JsonAlias 接收的字段名（小写比较），其余含 asset 的未知字段一律拒绝 */
++    static final String ACCEPTED_HINT = "relatedAssets（资产编号数组）或 assets（明细对象数组），也兼容 assetNos / assetNoList";
++
++    private WoAssetJson() {
++    }
++
++    static void addSplit(List<String> out, String s) {
++        if (s == null) {
++            return;
++        }
++        for (String part : SEP.split(s.trim())) {
++            if (!part.isBlank()) {
++                out.add(part.trim());
++            }
++        }
++    }
++
++    static String assetNoOf(JsonNode obj) {
++        for (String k : new String[]{"assetNo", "asset_no", "assetCode", "no"}) {
++            JsonNode v = obj.get(k);
++            if (v != null && !v.isNull() && v.isValueNode()) {
++                return v.asText();
++            }
++        }
++        return null;
++    }
++
++    /**
++     * 请求体里出现了认不出的、名字含 asset 的字段 → 400（以前会被静默丢弃）。
++     * 其他未知字段保持 v3.2 行为（忽略），避免影响已有调用方。
++     */
++    public static void rejectUnknownAssetFields(Map<String, Object> unknown) {
++        if (unknown == null || unknown.isEmpty()) {
++            return;
++        }
++        TreeSet<String> bad = new TreeSet<>();
++        for (String k : unknown.keySet()) {
++            if (k != null && k.toLowerCase(Locale.ROOT).contains("asset")) {
++                bad.add(k);
++            }
++        }
++        if (!bad.isEmpty()) {
++            throw BusinessException.badRequest("无法识别的关联资产字段：" + String.join("、", bad) + "；请使用 " + ACCEPTED_HINT);
++        }
++    }
++
++    /** relatedAssets 及其别名 → 资产编号列表 */
++    public static final class AssetNoList extends JsonDeserializer<List<String>> {
++        @Override
++        public List<String> deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
++            JsonNode node = p.readValueAsTree();
++            List<String> out = new ArrayList<>();
++            if (node == null || node.isNull() || node.isMissingNode()) {
++                return null;
++            }
++            collect(node, out, p, ctxt, true);
++            return out;
++        }
++
++        private static void collect(JsonNode node, List<String> out, JsonParser p, DeserializationContext ctxt, boolean top) throws IOException {
++            if (node.isTextual()) {
++                addSplit(out, node.asText());
++            } else if (node.isNumber()) {
++                out.add(node.asText());
++            } else if (node.isObject()) {
++                String no = assetNoOf(node);
++                if (no == null) {
++                    ctxt.reportInputMismatch(List.class, "关联资产对象缺少 assetNo 字段");
++                }
++                addSplit(out, no);
++            } else if (node.isArray() && top) {
++                Iterator<JsonNode> it = node.elements();
++                while (it.hasNext()) {
++                    JsonNode e = it.next();
++                    if (e != null && !e.isNull()) {
++                        collect(e, out, p, ctxt, false);
++                    }
++                }
++            } else {
++                ctxt.reportInputMismatch(List.class, "关联资产格式不正确：" + node.getNodeType());
++            }
++        }
++
++        @Override
++        public List<String> getNullValue(DeserializationContext ctxt) {
++            return null;
++        }
++    }
++
++    /** assets 明细：对象数组（标准）、字符串数组、单个对象、逗号分隔字符串 */
++    public static final class AssetLines extends JsonDeserializer<List<WorkorderController.AssetLineReq>> {
++        @Override
++        public List<WorkorderController.AssetLineReq> deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
++            JsonNode node = p.readValueAsTree();
++            if (node == null || node.isNull() || node.isMissingNode()) {
++                return null;
++            }
++            List<WorkorderController.AssetLineReq> out = new ArrayList<>();
++            if (node.isArray()) {
++                Iterator<JsonNode> it = node.elements();
++                while (it.hasNext()) {
++                    one(it.next(), out, p, ctxt);
++                }
++            } else {
++                one(node, out, p, ctxt);
++            }
++            return out;
++        }
++
++        private static void one(JsonNode e, List<WorkorderController.AssetLineReq> out, JsonParser p, DeserializationContext ctxt) throws IOException {
++            if (e == null || e.isNull()) {
++                return;
++            }
++            if (e.isTextual() || e.isNumber()) {
++                List<String> nos = new ArrayList<>();
++                addSplit(nos, e.asText());
++                for (String no : nos) {
++                    WorkorderController.AssetLineReq line = new WorkorderController.AssetLineReq();
++                    line.setAssetNo(no);
++                    out.add(line);
++                }
++            } else if (e.isObject()) {
++                WorkorderController.AssetLineReq line = p.getCodec().treeToValue(e, WorkorderController.AssetLineReq.class);
++                if ((line.getAssetNo() == null || line.getAssetNo().isBlank()) && assetNoOf(e) != null) {
++                    line.setAssetNo(assetNoOf(e));
++                }
++                out.add(line);
++            } else {
++                ctxt.reportInputMismatch(List.class, "资产明细格式不正确：" + e.getNodeType());
++            }
++        }
++
++        @Override
++        public List<WorkorderController.AssetLineReq> getNullValue(DeserializationContext ctxt) {
++            return null;
++        }
++    }
++}
+diff --git a/backend-src/com/dcim/workorder/controller/WorkorderController.java b/backend-src/com/dcim/workorder/controller/WorkorderController.java
+index 2f87f18..d7bff5b 100644
+--- a/backend-src/com/dcim/workorder/controller/WorkorderController.java
++++ b/backend-src/com/dcim/workorder/controller/WorkorderController.java
+@@ -36,6 +36,8 @@ import org.springframework.web.bind.annotation.RestController;
+ @RestController
+ @RequestMapping({"/api/workorders"})
+ public class WorkorderController {
++    @org.springframework.beans.factory.annotation.Autowired
++    private com.dcim.security.field.FieldPolicyService fieldPolicies;
+     private final WorkorderService workorderService;
+     static final long MAX_PAGE_SIZE = 200L;
+ 
+@@ -77,7 +79,8 @@ public class WorkorderController {
+ 
+     @GetMapping({"/export"})
+     @RequirePerm(
+-        module = "workorders"
++        module = "workorders",
++        action = "export"
+     )
+     public ResponseEntity<byte[]> export(
+         @RequestParam(required = false) String status,
+@@ -98,7 +101,11 @@ public class WorkorderController {
+         q.setApplyFrom(applyFrom);
+         q.setApplyTo(applyTo);
+         q.setSlaOverdue(slaOverdue);
+-        String csv = CsvExport.render(this.workorderService.exportRows(q));
++        // v3.4：与资产导出一致，受角色「导出」操作权限约束，并按字段权限过滤列
++        String csv = CsvExport.render(
++            this.workorderService.exportRows(q),
++            this.fieldPolicies.policy(com.dcim.security.CurrentUser.get(), "workorders").hiddenKeysLower("workorders")
++        );
+         String filename = "workorders-" + LocalDate.now() + ".csv";
+         byte[] body = ("\ufeff" + csv).getBytes(StandardCharsets.UTF_8);
+         return ((BodyBuilder)ResponseEntity.ok().header("Content-Disposition", new String[]{"attachment; filename=\"" + filename + "\""}))
+@@ -126,6 +133,7 @@ public class WorkorderController {
+         objType = "workorder"
+     )
+     public ApiResult<Map<String, Object>> create(@RequestBody @Valid WorkorderController.CreateWoReq req) {
++        WoAssetJson.rejectUnknownAssetFields(req.unknownFields());
+         List<WoAssetLineInput> assetLines = this.toAssetLines(req);
+         WorkorderEntity wo = this.workorderService
+             .create(
+@@ -212,6 +220,13 @@ public class WorkorderController {
+         objIdSpEL = "#woNo"
+     )
+     public ApiResult<Map<String, Object>> update(@PathVariable String woNo, @RequestBody @Valid WorkorderController.UpdateWoReq req) {
++        WoAssetJson.rejectUnknownAssetFields(req.unknownFields());
++        if (req.getRelatedAssets() != null) {
++            return ApiResult.ok(
++                this.workorderService
++                    .updateBasicAndAssets(woNo, req.getTitle(), req.getDescription(), req.getPriority(), req.getExpectFinish(), req.getRelatedAssets())
++            );
++        }
+         return ApiResult.ok(this.workorderService.updateBasic(woNo, req.getTitle(), req.getDescription(), req.getPriority(), req.getExpectFinish()));
+     }
+ 
+@@ -811,10 +826,27 @@ public class WorkorderController {
+         private String title;
+         private String description;
+         private String priority;
+-        /** 关联资产编号；兼容第三方 / 测试脚本常用的 assetNos、assetNoList 字段名（v3.2 中这些字段被静默丢弃） */
+-        @com.fasterxml.jackson.annotation.JsonAlias({"assetNos", "assetNoList", "assetList"})
++        /**
++         * 关联资产编号；兼容第三方 / 测试脚本常用的 assetNos、assetNoList 等字段名（v3.2 中这些字段被静默丢弃）。
++         * v3.3.1：取值也兼容单个字符串、逗号分隔字符串、对象数组，见 {@link WoAssetJson}。
++         */
++        @com.fasterxml.jackson.annotation.JsonAlias({"assetNos", "assetNoList", "assetList", "assetNo", "relatedAssetNos", "asset_nos", "related_assets"})
++        @com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = WoAssetJson.AssetNoList.class)
+         private List<String> relatedAssets;
++        @com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = WoAssetJson.AssetLines.class)
+         private List<WorkorderController.AssetLineReq> assets;
++        /** 未识别字段（只用于拒绝认不出的资产字段，不参与业务） */
++        @com.fasterxml.jackson.annotation.JsonIgnore
++        private final Map<String, Object> unknownFields = new LinkedHashMap<>();
++
++        @com.fasterxml.jackson.annotation.JsonAnySetter
++        public void putUnknownField(String key, Object value) {
++            this.unknownFields.put(key, value);
++        }
++
++        public Map<String, Object> unknownFields() {
++            return this.unknownFields;
++        }
+         private List<String> relatedMaterials;
+         private Integer applyQty;
+         private String targetLocation;
+@@ -1959,6 +1991,32 @@ public class WorkorderController {
+         private String description;
+         private String priority;
+         private String expectFinish;
++        /**
++         * v3.3.1：可选。传入时把工单关联资产整体替换为该列表（新增的建行、移除的删行，与 /items 接口同一套校验）；
++         * 不传则不改动关联资产。v3.3.0 及以前该字段被静默忽略。
++         */
++        @com.fasterxml.jackson.annotation.JsonAlias({"assetNos", "assetNoList", "assetList", "assetNo", "relatedAssetNos", "asset_nos", "related_assets"})
++        @com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = WoAssetJson.AssetNoList.class)
++        private List<String> relatedAssets;
++        @com.fasterxml.jackson.annotation.JsonIgnore
++        private final Map<String, Object> unknownFields = new LinkedHashMap<>();
++
++        @com.fasterxml.jackson.annotation.JsonAnySetter
++        public void putUnknownField(String key, Object value) {
++            this.unknownFields.put(key, value);
++        }
++
++        public Map<String, Object> unknownFields() {
++            return this.unknownFields;
++        }
++
++        public List<String> getRelatedAssets() {
++            return this.relatedAssets;
++        }
++
++        public void setRelatedAssets(final List<String> relatedAssets) {
++            this.relatedAssets = relatedAssets;
++        }
+ 
+         
+         public String getTitle() {
+diff --git a/backend-src/com/dcim/workorder/service/WorkorderService.java b/backend-src/com/dcim/workorder/service/WorkorderService.java
+index 44d2fe5..34afa01 100644
+--- a/backend-src/com/dcim/workorder/service/WorkorderService.java
++++ b/backend-src/com/dcim/workorder/service/WorkorderService.java
+@@ -49,6 +49,7 @@ import java.util.Arrays;
+ import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.LinkedHashSet;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.Map.Entry;
+@@ -466,12 +467,16 @@ public class WorkorderService {
+             .stream()
+             .map(WorkorderItemEntity::getAssetNo)
+             .toList();
+-        WorkorderEntity upd = new WorkorderEntity();
+         String csv = this.joinCsv(assetNos);
+         checkCsvLen("关联资产", csv);
+-        upd.setRelatedAssets(csv);
+-        upd.setUpdatedAt(LocalDateTime.now());
+-        this.workorderMapper.update(upd, Wrappers.<WorkorderEntity>lambdaUpdate().eq(WorkorderEntity::getWoNo, woNo));
++        // v3.3.1：显式 set（可为 NULL）。原写法用实体更新，MyBatis-Plus 默认跳过 null 字段——删掉最后一条资产行后
++        // related_assets 不会被清空，详情页仍显示已删除的资产。
++        this.workorderMapper
++            .update(
++                null,
++                ((Wrappers.<WorkorderEntity>lambdaUpdate().eq(WorkorderEntity::getWoNo, woNo)).set(WorkorderEntity::getRelatedAssets, csv))
++                    .set(WorkorderEntity::getUpdatedAt, LocalDateTime.now())
++            );
+     }
+ 
+     public PageResult<Map<String, Object>> list(WoListQuery q) {
+@@ -1038,6 +1043,67 @@ public class WorkorderService {
+         }
+     }
+ 
++    /**
++     * v3.3.1：PUT /workorders/{woNo} 携带 relatedAssets（或 assetNos 等别名）时，基本信息与关联资产在同一事务内更新。
++     */
++    @Transactional
++    public Map<String, Object> updateBasicAndAssets(
++        String woNo, String title, String description, String priority, String expectFinish, List<String> assetNos
++    ) {
++        this.updateBasic(woNo, title, description, priority, expectFinish);
++        this.replaceAssets(woNo, assetNos);
++        return this.detail(woNo);
++    }
++
++    /**
++     * 把工单关联资产整体替换为给定列表：新增的按 addItem 建行（含资产存在性、调拨目标校验），
++     * 移除的按 deleteItem 删行；已在工单上的资产保持原行不动（不丢目标机柜等明细）。
++     */
++    @Transactional
++    public Map<String, Object> replaceAssets(String woNo, List<String> assetNos) {
++        WorkorderEntity wo = this.requireEditableWo(woNo);
++        LinkedHashSet<String> want = new LinkedHashSet<>();
++        if (assetNos != null) {
++            for (String a : assetNos) {
++                if (a != null && !a.isBlank()) {
++                    want.add(a.trim());
++                }
++            }
++        }
++        if (want.isEmpty() && "调拨".equals(this.requireConfig(wo.getWoType()).getWoType())) {
++            throw BusinessException.badRequest("调拨工单至少关联 1 项资产");
++        }
++        List<WorkorderItemEntity> current = this.itemMapper
++            .selectList((Wrappers.<WorkorderItemEntity>lambdaQuery().eq(WorkorderItemEntity::getWoNo, woNo)).orderByAsc(WorkorderItemEntity::getItemNo));
++        Set<String> have = new HashSet<>();
++        int removed = 0;
++        for (WorkorderItemEntity it : current) {
++            have.add(it.getAssetNo());
++            if (!want.contains(it.getAssetNo())) {
++                this.deleteItem(woNo, it.getItemNo());
++                removed++;
++            }
++        }
++        int added = 0;
++        for (String a : want) {
++            if (!have.contains(a)) {
++                WoAssetLineInput line = new WoAssetLineInput();
++                line.setAssetNo(a);
++                this.addItem(woNo, line);
++                added++;
++            }
++        }
++        if (added == 0 && removed == 0) {
++            this.syncRelatedAssetsCsv(woNo);
++        }
++        Map<String, Object> out = new LinkedHashMap<>();
++        out.put("woNo", woNo);
++        out.put("added", added);
++        out.put("removed", removed);
++        out.put("relatedAssets", String.join(",", want));
++        return out;
++    }
++
+     @Transactional
+     public Map<String, Object> updateRepairCost(String woNo, BigDecimal costLabor, BigDecimal costService, BigDecimal costOther) {
+         WorkorderEntity wo = this.requireWo(woNo);

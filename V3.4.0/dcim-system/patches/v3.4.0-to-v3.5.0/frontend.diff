@@ -1,0 +1,1665 @@
+diff --git a/platform-web/package.json b/platform-web/package.json
+index d4bb2cc..cfd3679 100644
+--- a/platform-web/package.json
++++ b/platform-web/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "platform-web",
+   "private": true,
+-  "version": "3.4.0",
++  "version": "3.5.0",
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+diff --git a/platform-web/src/api/ci.ts b/platform-web/src/api/ci.ts
+index 682ba43..b51258f 100644
+--- a/platform-web/src/api/ci.ts
++++ b/platform-web/src/api/ci.ts
+@@ -72,4 +72,19 @@ export function fetchImpactGraph(type: string, id: string, direction: 'downstrea
+   return http.get<any, CiGraph>('/ci-relations/impact', { params: { type, id, direction, depth } })
+ }
+ 
++/** v3.5：全量拓扑（网络拓扑页；无根节点，机房/机柜/资产隐含层级 + 显式关系） */
++export interface CiFullGraph {
++  nodes: CiNode[]
++  edges: CiEdge[]
++  truncated: boolean
++  summary?: Record<string, number>
++}
++
++/** roomCode 省略 = 全部机房；服务端按 500 节点截断（truncated 标记） */
++export function fetchFullGraph(roomCode?: string) {
++  return http.get<any, CiFullGraph>('/ci-relations/graph', {
++    params: roomCode ? { roomCode } : undefined,
++  })
++}
++
+ export const CI_TYPE_LABEL: Record<string, string> = { ASSET: '资产', RACK: '机柜', ROOM: '机房' }
+diff --git a/platform-web/src/api/notification.ts b/platform-web/src/api/notification.ts
+new file mode 100644
+index 0000000..64f5d5d
+--- /dev/null
++++ b/platform-web/src/api/notification.ts
+@@ -0,0 +1,43 @@
++import http from './client'
++import type { PageResult } from './types'
++
++/**
++ * 通知域 API（v3.5）：从 api/workorder.ts 迁出独立成域。
++ * 后端 NotificationController：/api/notifications/*（登录即可访问，无模块权限门槛）。
++ */
++
++/** 通知条目（与后端 NotificationController /my 行结构、SSE notification 帧载荷一致） */
++export interface NotificationItem {
++  id: number | string
++  username?: string
++  type?: string
++  title: string
++  content?: string
++  refId?: string
++  readFlag?: boolean
++  createdAt?: string
++}
++
++/** 通知列表查询参数 */
++export interface NotificationQuery {
++  page: number
++  size: number
++  unread?: boolean
++}
++
++export function fetchMyNotifications(params: NotificationQuery) {
++  return http.get<any, PageResult<NotificationItem>>('/notifications/my', { params })
++}
++
++export function fetchUnreadCount() {
++  // silent：降级轮询每 30s 一次，后端不可用时不弹全局错误（红点数据自行兜底为 0）
++  return http.get<any, { count: number }>('/notifications/unread-count', { silent: true })
++}
++
++export function markNotificationRead(id: number | string) {
++  return http.put<any, void>(`/notifications/${encodeURIComponent(String(id))}/read`)
++}
++
++export function markAllNotificationsRead() {
++  return http.put<any, void>('/notifications/read-all')
++}
+diff --git a/platform-web/src/api/workorder.ts b/platform-web/src/api/workorder.ts
+index 4a70f14..5c9cea1 100644
+--- a/platform-web/src/api/workorder.ts
++++ b/platform-web/src/api/workorder.ts
+@@ -349,25 +349,6 @@ export interface WoUpdatePayload {
+   expectFinish?: string
+ }
+ 
+-/** 通知条目 */
+-export interface NotificationItem {
+-  id: number | string
+-  username?: string
+-  type?: string
+-  title: string
+-  content?: string
+-  refId?: string
+-  readFlag?: boolean
+-  createdAt?: string
+-}
+-
+-/** 通知列表查询参数 */
+-export interface NotificationQuery {
+-  page: number
+-  size: number
+-  unread?: boolean
+-}
+-
+ /* ---------------- 工单 ---------------- */
+ 
+ export function fetchWorkorders(params: WorkorderQuery) {
+@@ -572,20 +553,4 @@ export function updateWorkorderReplacements(woNo: string, replacements: WoReplac
+   )
+ }
+ 
+-/* ---------------- 通知 ---------------- */
+-
+-export function fetchMyNotifications(params: NotificationQuery) {
+-  return http.get<any, PageResult<NotificationItem>>('/notifications/my', { params })
+-}
+-
+-export function fetchUnreadCount() {
+-  return http.get<any, { count: number }>('/notifications/unread-count')
+-}
+-
+-export function markNotificationRead(id: number | string) {
+-  return http.put<any, void>(`/notifications/${encodeURIComponent(String(id))}/read`)
+-}
+-
+-export function markAllNotificationsRead() {
+-  return http.put<any, void>('/notifications/read-all')
+-}
++// v3.5：通知 API 已迁出至 @/api/notification（通知域独立，SSE/通知中心复用）
+diff --git a/platform-web/src/layout/MainLayout.vue b/platform-web/src/layout/MainLayout.vue
+index 0e66c5e..54607b1 100644
+--- a/platform-web/src/layout/MainLayout.vue
++++ b/platform-web/src/layout/MainLayout.vue
+@@ -1,18 +1,14 @@
+ <script setup lang="ts">
+ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+ import { useRoute, useRouter } from 'vue-router'
+-import { ElMessage } from 'element-plus'
++import { ElMessage, ElNotification } from 'element-plus'
+ import { Search, Monitor, Sunny, Moon, User, ArrowDown, Bell } from '@element-plus/icons-vue'
+ import { useAuthStore } from '@/stores/auth'
+ import http from '@/api/client'
+ import { useThemeStore } from '@/stores/theme'
+-import {
+-  fetchMyNotifications,
+-  fetchUnreadCount,
+-  markAllNotificationsRead,
+-  markNotificationRead,
+-} from '@/api/workorder'
+-import type { NotificationItem } from '@/api/workorder'
++import { fetchMyNotifications } from '@/api/notification'
++import type { NotificationItem } from '@/api/notification'
++import { useNotificationStore } from '@/stores/notification'
+ import { globalSearch } from '@/api/search'
+ import type { SearchResultItem } from '@/api/search'
+ 
+@@ -53,6 +49,8 @@ const menuGroups: MenuGroup[] = [
+       { path: '/workorders', title: '我的工单', module: 'workorders' },
+       { path: '/workorders', title: '待我审批', module: 'workorders', query: { tab: 'approve' } },
+       { path: '/service-desk', title: '服务目录', module: 'dashboard' },
++      // v3.5：通知中心（登录即见，无模块权限门槛；后端 /api/notifications 同样不设 @RequirePerm）
++      { path: '/notifications', title: '通知中心', module: 'dashboard' },
+     ],
+   },
+   {
+@@ -67,6 +65,7 @@ const menuGroups: MenuGroup[] = [
+       { path: '/assets/expiry', title: '到期与续费', module: 'assets' },
+       { path: '/assets/quality', title: '数据质量', module: 'assets' },
+       { path: '/ci-relations', title: 'CI 关系/影响分析', module: 'assets' },
++      { path: '/topology', title: '网络拓扑', module: 'assets' },
+     ],
+   },
+   {
+@@ -286,20 +285,11 @@ async function openAbout() {
+   }
+ }
+ 
+-/* ---------------- 通知铃铛 ---------------- */
+-const unreadCount = ref(0)
++/* ---------------- 通知铃铛（v3.5：SSE 实时红点 + toast，轮询降级由 store 承担） ---------------- */
++const noti = useNotificationStore()
+ const notiLoading = ref(false)
+ const notiList = ref<NotificationItem[]>([])
+-let unreadTimer: number | undefined
+-
+-async function loadUnreadCount() {
+-  try {
+-    const res = await fetchUnreadCount()
+-    unreadCount.value = res?.count ?? 0
+-  } catch {
+-    // 拦截器已提示
+-  }
+-}
++let offNotification: (() => void) | undefined
+ 
+ async function loadNotiList() {
+   notiLoading.value = true
+@@ -320,9 +310,8 @@ function onNotiShow() {
+ async function onNotiClick(item: NotificationItem) {
+   if (item.readFlag) return
+   try {
+-    await markNotificationRead(item.id)
+-    void loadNotiList()
+-    void loadUnreadCount()
++    await noti.markRead(item.id)
++    item.readFlag = true
+   } catch {
+     // 拦截器已提示
+   }
+@@ -330,29 +319,40 @@ async function onNotiClick(item: NotificationItem) {
+ 
+ async function onReadAll() {
+   try {
+-    await markAllNotificationsRead()
++    await noti.markAllRead()
+     ElMessage.success('已全部标记为已读')
+     void loadNotiList()
+-    void loadUnreadCount()
+   } catch {
+     // 拦截器已提示
+   }
+ }
+ 
+ onMounted(() => {
+-  void loadUnreadCount()
+-  unreadTimer = window.setInterval(() => void loadUnreadCount(), 30000)
++  // 建立 SSE（失败自动退避重连，连续失败降级 30s 轮询）
++  noti.start()
++  // 实时到达的站内信弹 toast：只有 SSE 实时帧会触发订阅者，历史通知不弹
++  offNotification = noti.onNotification((n) => {
++    ElNotification({
++      title: n.title || '新通知',
++      message: n.content || '',
++      type: 'info',
++      duration: 5000,
++      position: 'bottom-right',
++    })
++  })
+ })
+ 
+ watch(
+   () => route.path,
+   () => {
+-    void loadUnreadCount()
++    // 路由切换时对齐一次未读数（跨页面操作后的兜底；SSE 正常时开销可忽略）
++    void noti.refreshUnread()
+   },
+ )
+ 
+ onUnmounted(() => {
+-  window.clearInterval(unreadTimer)
++  offNotification?.()
++  noti.stop()
+ })
+ </script>
+ 
+@@ -419,7 +419,7 @@ onUnmounted(() => {
+           <el-popover width="360" trigger="click" @show="onNotiShow">
+             <template #reference>
+               <span class="layout-bell">
+-                <el-badge :value="unreadCount" :max="99" :hidden="unreadCount <= 0">
++                <el-badge :value="noti.unreadCount" :max="99" :hidden="noti.unreadCount <= 0">
+                   <el-icon :size="18"><Bell /></el-icon>
+                 </el-badge>
+               </span>
+@@ -449,6 +449,7 @@ onUnmounted(() => {
+               </div>
+               <div class="noti-footer">
+                 <el-button link type="primary" @click="onReadAll">全部已读</el-button>
++                <el-button link type="primary" @click="router.push('/notifications')">查看全部</el-button>
+               </div>
+             </div>
+           </el-popover>
+diff --git a/platform-web/src/router/index.ts b/platform-web/src/router/index.ts
+index 9aa3ff5..7e7dcd2 100644
+--- a/platform-web/src/router/index.ts
++++ b/platform-web/src/router/index.ts
+@@ -289,6 +289,14 @@ const routes: RouteRecordRaw[] = [
+         meta: { title: 'CI 关系与影响分析', module: 'assets' },
+       },
+ 
++      // v3.5：全量网络拓扑（机房过滤 + 关系图例 + 节点跳转）
++      {
++        path: 'topology',
++        name: 'ci-topology',
++        component: () => import('@/views/ci/TopologyView.vue'),
++        meta: { title: '网络拓扑', module: 'assets' },
++      },
++
+       // 平台：个人令牌 / 目录集成 / 数据质量
+       {
+         path: 'account/tokens',
+@@ -366,6 +374,14 @@ const routes: RouteRecordRaw[] = [
+         component: () => import('@/views/webhook/WebhookListView.vue'),
+         meta: { title: '消息推送 / Webhook', module: 'system' },
+       },
++
++      // v3.5：通知中心（登录即可访问；module=dashboard 恒可见，与后端 /api/notifications 不设权限门槛对齐）
++      {
++        path: 'notifications',
++        name: 'notification-center',
++        component: () => import('@/views/system/NotificationCenterView.vue'),
++        meta: { title: '通知中心', module: 'dashboard' },
++      },
+     ],
+   },
+   // 企微移动端 H5（独立移动布局 + 底部 tab 导航）
+diff --git a/platform-web/src/stores/notification.ts b/platform-web/src/stores/notification.ts
+new file mode 100644
+index 0000000..808c319
+--- /dev/null
++++ b/platform-web/src/stores/notification.ts
+@@ -0,0 +1,176 @@
++import { defineStore } from 'pinia'
++import { fetchUnreadCount, markAllNotificationsRead, markNotificationRead } from '@/api/notification'
++import type { NotificationItem } from '@/api/notification'
++
++/**
++ * 通知实时推送 store（v3.5）。
++ *
++ * 通道优先级：SSE（/api/notifications/sse，同源 cookie 自动认证，EventSource
++ * 无需显式带 token）→ 失败指数退避重连（1s/2s/4s/8s/16s）→ 连续 5 次失败
++ * 降级为 30s 轮询未读数（保留 v3.4 行为，功能不中断）。
++ * MainLayout 挂载时 start()，卸载/登出时 stop()。
++ *
++ * SSE 两类帧（均为 event:message，服务端心跳是 :ping 注释帧不触发 onmessage）：
++ * - kind=notification：按用户推送的站内信（字段与 /notifications/my 行一致）
++ *   → 未读红点 +1，并通知订阅者（MainLayout toast / 通知中心列表刷新）
++ * - kind=event：频道广播（workorder/stock/... 有变化的轻量信号）
++ *   → 仅通知订阅者，由各列表页自行决定是否刷新
++ */
++
++/** SSE 频道事件帧（kind=event） */
++export interface ChannelEvent {
++  channel: string
++  type: string
++  objType?: string
++  objId?: string
++  occurredAt?: string
++  data?: Record<string, unknown>
++}
++
++const MAX_RETRIES = 5
++const BACKOFF_CAP_MS = 30_000
++const POLL_MS = 30_000
++const SSE_URL = '/api/notifications/sse'
++
++// 非序列化资源（连接/定时器/订阅者）放模块级：不进响应式 state，避免 Proxy 包装与快照开销
++let es: EventSource | null = null
++let retries = 0
++let retryTimer: number | undefined
++let pollTimer: number | undefined
++const notifCallbacks = new Set<(n: NotificationItem) => void>()
++const channelCallbacks = new Set<(e: ChannelEvent) => void>()
++
++export const useNotificationStore = defineStore('notification', {
++  state: () => ({
++    unreadCount: 0,
++    /** 推送通道：connecting=建连/退避中；sse=实时连接；polling=降级轮询；idle=未启动 */
++    transport: 'idle' as 'idle' | 'connecting' | 'sse' | 'polling',
++  }),
++
++  actions: {
++    /** MainLayout 挂载时调用：拉一次未读数并建立 SSE（幂等，重复调用无副作用） */
++    start() {
++      if (es !== null || retryTimer !== undefined || pollTimer !== undefined) return
++      void this.refreshUnread()
++      this.connectSse()
++    },
++
++    /** MainLayout 卸载/登出时调用：断 SSE、清定时器，回到 idle */
++    stop() {
++      if (retryTimer !== undefined) {
++        window.clearTimeout(retryTimer)
++        retryTimer = undefined
++      }
++      this.stopPolling()
++      es?.close()
++      es = null
++      retries = 0
++      this.transport = 'idle'
++    },
++
++    /** 拉取服务端未读数（对齐真值；silent 失败不打扰用户） */
++    async refreshUnread() {
++      try {
++        const res = await fetchUnreadCount()
++        this.unreadCount = res?.count ?? 0
++      } catch {
++        // 静默：降级轮询期间后端不可用属预期场景
++      }
++    },
++
++    /** 标记单条已读：成功后本地红点减一（新到达的未读由 SSE 增量补偿，无需回拉） */
++    async markRead(id: number | string) {
++      await markNotificationRead(id)
++      this.unreadCount = Math.max(0, this.unreadCount - 1)
++    },
++
++    /** 全部已读：成功后红点清零 */
++    async markAllRead() {
++      await markAllNotificationsRead()
++      this.unreadCount = 0
++    },
++
++    /** 订阅实时到达的站内信（供 toast / 通知中心列表刷新）。返回取消订阅函数。 */
++    onNotification(cb: (n: NotificationItem) => void): () => void {
++      notifCallbacks.add(cb)
++      return () => notifCallbacks.delete(cb)
++    },
++
++    /** 订阅频道变化事件（供列表页局部刷新）。返回取消订阅函数。 */
++    onChannelEvent(cb: (e: ChannelEvent) => void): () => void {
++      channelCallbacks.add(cb)
++      return () => channelCallbacks.delete(cb)
++    },
++
++    /* ---------------- 内部：SSE 建连 / 退避 / 降级 ---------------- */
++
++    connectSse() {
++      this.transport = 'connecting'
++      try {
++        es = new EventSource(SSE_URL)
++      } catch {
++        this.degradeToPolling()
++        return
++      }
++      es.onopen = () => {
++        retries = 0
++        this.transport = 'sse'
++        this.stopPolling()
++        // 重连窗口内可能漏推，连上后对齐一次服务端真值
++        void this.refreshUnread()
++      }
++      es.onmessage = (ev: MessageEvent<string>) => this.handleFrame(ev.data)
++      es.onerror = () => {
++        // 完全自管重连：先关掉浏览器默认自动重连，再按自己的退避节奏连，行为可预测
++        es?.close()
++        es = null
++        this.scheduleReconnect()
++      }
++    },
++
++    handleFrame(raw: string) {
++      let frame: Record<string, unknown>
++      try {
++        frame = JSON.parse(raw) as Record<string, unknown>
++      } catch {
++        return
++      }
++      if (frame.kind === 'notification') {
++        const n = frame as unknown as NotificationItem
++        if (!n.readFlag) this.unreadCount++
++        for (const cb of notifCallbacks) cb(n)
++      } else if (frame.kind === 'event') {
++        const e = frame as unknown as ChannelEvent
++        for (const cb of channelCallbacks) cb(e)
++      }
++    },
++
++    scheduleReconnect() {
++      retries++
++      if (retries > MAX_RETRIES) {
++        this.degradeToPolling()
++        return
++      }
++      const delay = Math.min(1000 * 2 ** (retries - 1), BACKOFF_CAP_MS)
++      this.transport = 'connecting'
++      retryTimer = window.setTimeout(() => {
++        retryTimer = undefined
++        this.connectSse()
++      }, delay)
++    },
++
++    degradeToPolling() {
++      this.stopPolling()
++      this.transport = 'polling'
++      void this.refreshUnread()
++      pollTimer = window.setInterval(() => void this.refreshUnread(), POLL_MS)
++    },
++
++    stopPolling() {
++      if (pollTimer !== undefined) {
++        window.clearInterval(pollTimer)
++        pollTimer = undefined
++      }
++    },
++  },
++})
+diff --git a/platform-web/src/views/ci/TopologyView.vue b/platform-web/src/views/ci/TopologyView.vue
+new file mode 100644
+index 0000000..20e1e47
+--- /dev/null
++++ b/platform-web/src/views/ci/TopologyView.vue
+@@ -0,0 +1,268 @@
++<script setup lang="ts">
++/**
++ * v3.5 网络拓扑：全量 CI 关系图（机房 / 机柜 / 资产）。
++ * - 数据来自 GET /api/ci-relations/graph（隐含层级 + 显式关系，服务端 500 节点截断）
++ * - 机房过滤 / 关系类型图例筛选（客户端过滤边，节点随之收缩）
++ * - 节点点击跳转：资产 → 资产台账，机柜 → 机柜管理，机房 → 机房管理
++ */
++import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
++import { useRouter } from 'vue-router'
++import echarts, { CHART_COLORS } from '@/utils/echarts'
++import type { EChartsType } from '@/utils/echarts'
++import { fetchRooms } from '@/api/room'
++import { CI_TYPE_LABEL, fetchFullGraph } from '@/api/ci'
++import type { CiFullGraph } from '@/api/ci'
++
++const router = useRouter()
++
++/** 关系类型目录（全量图实际会出现的 7 种；label 与后端 CiGraphService 对齐） */
++const REL_CATALOG: { value: string; label: string; implicit: boolean }[] = [
++  { value: 'DEPENDS_ON', label: '依赖', implicit: false },
++  { value: 'RUNS_ON', label: '运行于', implicit: false },
++  { value: 'POWERED_BY', label: '供电来自', implicit: false },
++  { value: 'CONNECTS_TO', label: '网络连接', implicit: false },
++  { value: 'BACKUP_OF', label: '备份自', implicit: false },
++  { value: 'CONTAINS', label: '机房/机柜包含', implicit: true },
++  { value: 'PART_OF', label: '部件所属', implicit: true },
++]
++
++const rooms = ref<{ roomCode: string; name: string }[]>([])
++const roomCode = ref('')
++const graph = ref<CiFullGraph | null>(null)
++const loading = ref(false)
++/** 勾选的关系类型（默认全部显示） */
++const relFilter = ref<string[]>(REL_CATALOG.map((r) => r.value))
++
++const chartEl = ref<HTMLDivElement>()
++let chart: EChartsType | null = null
++
++const TYPE_COLOR: Record<string, string> = { ROOM: CHART_COLORS[5], RACK: CHART_COLORS[2], ASSET: CHART_COLORS[0] }
++const TYPE_SIZE: Record<string, number> = { ROOM: 50, RACK: 34, ASSET: 22 }
++
++async function loadRooms() {
++  try {
++    const res = await fetchRooms({ page: 1, size: 200 })
++    rooms.value = (res.records ?? []).map((r) => ({ roomCode: r.roomCode, name: r.name }))
++  } catch {
++    rooms.value = []
++  }
++}
++
++async function load() {
++  loading.value = true
++  try {
++    graph.value = await fetchFullGraph(roomCode.value || undefined)
++    await nextTick()
++    render()
++  } catch {
++    graph.value = null
++  } finally {
++    loading.value = false
++  }
++}
++
++/** 可见边 = 勾选的关系类型；可见节点 = 至少连着一条可见边 */
++const visible = computed(() => {
++  const g = graph.value
++  if (!g) return { nodes: [], edges: [] }
++  const edges = g.edges.filter((e) => relFilter.value.includes(e.rel))
++  const used = new Set<string>()
++  edges.forEach((e) => {
++    used.add(e.from)
++    used.add(e.to)
++  })
++  return { nodes: g.nodes.filter((n) => used.has(`${n.type}:${n.id}`)), edges }
++})
++
++/** 图例计数：当前数据里各关系类型出现次数（不受筛选影响，便于判断） */
++function relCount(v: string): number {
++  return graph.value?.edges.filter((e) => e.rel === v).length ?? 0
++}
++
++function render() {
++  if (!chartEl.value) return
++  if (!chart) chart = echarts.init(chartEl.value)
++  const { nodes, edges } = visible.value
++  if (!nodes.length) {
++    chart.clear()
++    return
++  }
++  const nameOf = new Map(nodes.map((n) => [`${n.type}:${n.id}`, n.name] as const))
++  const data = nodes.map((n) => ({
++    id: `${n.type}:${n.id}`,
++    name: n.name,
++    itemStyle: { color: TYPE_COLOR[n.type] || CHART_COLORS[4] },
++    symbolSize: TYPE_SIZE[n.type] ?? 22,
++    label: { show: nodes.length < 80, position: 'right', formatter: n.name },
++    rawType: n.type,
++    rawId: n.id,
++    rawStatus: n.status,
++  }))
++  const links = edges.map((e) => ({
++    source: e.from,
++    target: e.to,
++    rawLabel: e.label,
++    label: { show: false, formatter: e.label, fontSize: 10 },
++    emphasis: { label: { show: true } },
++    lineStyle: { type: e.implicit ? 'dashed' : 'solid', opacity: 0.65 },
++  }))
++  chart.setOption(
++    {
++      tooltip: {
++        formatter: (p: any) => {
++          if (p.dataType === 'node') {
++            const d = p.data
++            return `${CI_TYPE_LABEL[d.rawType] || d.rawType}　${d.rawId}<br/>${d.name}${d.rawStatus ? '　' + d.rawStatus : ''}<br/><span style="color:#909399">点击节点跳转</span>`
++          }
++          if (p.dataType === 'edge') {
++            const s = nameOf.get(p.data.source)
++            const t = nameOf.get(p.data.target)
++            return `${p.data.rawLabel}<br/>${s || p.data.source} → ${t || p.data.target}`
++          }
++          return ''
++        },
++      },
++      series: [
++        {
++          type: 'graph',
++          layout: 'force',
++          roam: true,
++          draggable: true,
++          force: { repulsion: 300, edgeLength: [60, 140], gravity: 0.08 },
++          edgeSymbol: ['none', 'arrow'],
++          edgeSymbolSize: 7,
++          data,
++          links,
++          emphasis: { focus: 'adjacency' },
++        },
++      ],
++    },
++    true,
++  )
++  chart.off('click')
++  chart.on('click', (p: any) => {
++    if (p.dataType !== 'node') return
++    const { rawType, rawId } = p.data
++    if (rawType === 'ASSET') {
++      void router.push({ path: '/assets/inventory', query: { keyword: rawId } })
++    } else if (rawType === 'RACK') {
++      void router.push({ path: '/racks', query: { keyword: rawId } })
++    } else if (rawType === 'ROOM') {
++      void router.push({ path: '/rooms', query: { keyword: rawId } })
++    }
++  })
++}
++
++function onResize() {
++  chart?.resize()
++}
++
++watch(relFilter, () => render())
++
++onMounted(() => {
++  window.addEventListener('resize', onResize)
++  void loadRooms()
++  void load()
++})
++
++onBeforeUnmount(() => {
++  window.removeEventListener('resize', onResize)
++  chart?.dispose()
++  chart = null
++})
++</script>
++
++<template>
++  <div class="page-card">
++    <div class="page-title">网络拓扑</div>
++
++    <div class="page-toolbar">
++      <el-select
++        v-model="roomCode"
++        placeholder="全部机房"
++        clearable
++        filterable
++        style="width: 220px"
++        @change="load"
++      >
++        <el-option v-for="r in rooms" :key="r.roomCode" :label="`${r.name}（${r.roomCode}）`" :value="r.roomCode" />
++      </el-select>
++      <el-button type="primary" plain @click="load">刷新</el-button>
++      <div style="flex: 1"></div>
++      <span v-if="graph" class="hint">
++        资产 {{ graph.summary?.ASSET ?? 0 }} · 机柜 {{ graph.summary?.RACK ?? 0 }} · 机房 {{ graph.summary?.ROOM ?? 0 }}
++        <el-tag v-if="graph.truncated" type="warning" size="small" style="margin-left: 6px">已截断（仅显示前 500 个节点）</el-tag>
++      </span>
++    </div>
++
++    <!-- 关系图例（筛选） -->
++    <div class="rel-filter">
++      <el-checkbox-group v-model="relFilter">
++        <el-checkbox v-for="r in REL_CATALOG" :key="r.value" :value="r.value">
++          {{ r.label }}（{{ relCount(r.value) }}）
++        </el-checkbox>
++      </el-checkbox-group>
++    </div>
++
++    <div class="chart-wrap">
++      <div ref="chartEl" v-loading="loading" class="chart"></div>
++      <el-empty
++        v-if="!loading && !visible.nodes.length"
++        description="当前筛选下没有可见的关系，勾选上方关系类型或切换机房"
++        class="chart-empty"
++      />
++    </div>
++
++    <div class="legend">
++      <span><i :style="{ background: TYPE_COLOR.ROOM }"></i>机房</span>
++      <span><i :style="{ background: TYPE_COLOR.RACK }"></i>机柜</span>
++      <span><i :style="{ background: TYPE_COLOR.ASSET }"></i>资产</span>
++      <span>实线 = 登记的关系　虚线 = 物理位置/部件推导　滚轮缩放 / 拖拽平移　点击节点跳转台账</span>
++    </div>
++  </div>
++</template>
++
++<style scoped>
++.hint {
++  font-size: 12px;
++  color: var(--el-text-color-secondary);
++}
++.rel-filter {
++  margin-bottom: 10px;
++}
++.rel-filter :deep(.el-checkbox) {
++  margin-right: 16px;
++}
++.chart-wrap {
++  position: relative;
++  border: 1px solid var(--el-border-color-lighter);
++  border-radius: 6px;
++}
++.chart {
++  height: 560px;
++}
++.chart-empty {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  pointer-events: none;
++}
++.legend {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 14px;
++  font-size: 12px;
++  color: var(--el-text-color-secondary);
++  margin-top: 8px;
++}
++.legend i {
++  display: inline-block;
++  width: 10px;
++  height: 10px;
++  border-radius: 50%;
++  margin-right: 4px;
++  vertical-align: -1px;
++}
++</style>
+diff --git a/platform-web/src/views/monitoring/AlertCenterView.vue b/platform-web/src/views/monitoring/AlertCenterView.vue
+index 3ce7592..34c3aa0 100644
+--- a/platform-web/src/views/monitoring/AlertCenterView.vue
++++ b/platform-web/src/views/monitoring/AlertCenterView.vue
+@@ -41,6 +41,8 @@ const loading = ref(false)
+ const stats = ref<AlertStats | null>(null)
+ const selected = ref<AlertItem[]>([])
+ let timer: number | undefined
++/** v3.5 节流：上次刷新时间（手动/自动都记录），自动刷新至少间隔 25s */
++let lastRefreshAt = 0
+ 
+ function fmt(v?: string) {
+   return v ? v.replace('T', ' ').slice(0, 19) : '-'
+@@ -90,6 +92,7 @@ function search() {
+ }
+ 
+ function refresh() {
++  lastRefreshAt = Date.now()
+   void load()
+   void loadStats()
+ }
+@@ -157,9 +160,16 @@ onMounted(() => {
+     query.status = ''
+   }
+   refresh()
+-  // 活动告警页每 30 秒自动刷新
++  // v3.5 节流自动刷新（30s 周期）：仅页面可见、详情抽屉未打开、距上次刷新 ≥25s 时触发，
++  // 避免阅读详情/刚手动刷新时列表跳动
+   timer = window.setInterval(() => {
+-    if (document.visibilityState === 'visible') refresh()
++    if (
++      document.visibilityState === 'visible'
++      && !drawer.value
++      && Date.now() - lastRefreshAt >= 25000
++    ) {
++      refresh()
++    }
+   }, 30000)
+ })
+ onBeforeUnmount(() => window.clearInterval(timer))
+diff --git a/platform-web/src/views/report/DashboardView.vue b/platform-web/src/views/report/DashboardView.vue
+index 3bc19c9..a9fc2bb 100644
+--- a/platform-web/src/views/report/DashboardView.vue
++++ b/platform-web/src/views/report/DashboardView.vue
+@@ -1,6 +1,6 @@
+ <script setup lang="ts">
+ import { ASSET_EVENT_LABEL } from '@/utils/assetEvents'
+-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
++import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+ import { useAuthStore } from '@/stores/auth'
+ import echarts, { CHART_COLORS, axisColor, surfaceColor, type EChartsType } from '@/utils/echarts'
+ import { fetchDashboard, fetchWorkorderSla, fetchRepairCost, fetchRepairDuration, fetchAssetFinanceSummary, fetchOpexStructure, fetchSupplierPerformance, fetchCapacityPlanning, fetchAssetTco } from '@/api/report'
+@@ -967,8 +967,38 @@ function supplierExtra(): string {
+   return `${list.length} 家供应商 · 平均分 ${avg}`
+ }
+ 
++/* ---------------- v3.5 卡片布局配置（显隐/排序，localStorage 持久化） ---------------- */
++const LAYOUT_KEY = 'dcim.dashboard.layout'
++
++interface DashboardLayout {
++  /** 隐藏的图表 key */
++  hidden: string[]
++  /** 显示顺序（未列出的按默认顺序排在末尾） */
++  order: string[]
++}
++
++function loadLayout(): DashboardLayout {
++  try {
++    const raw = localStorage.getItem(LAYOUT_KEY)
++    if (raw) {
++      const v = JSON.parse(raw)
++      if (Array.isArray(v?.hidden) && Array.isArray(v?.order)) {
++        return {
++          hidden: (v.hidden as unknown[]).filter((x): x is string => typeof x === 'string'),
++          order: (v.order as unknown[]).filter((x): x is string => typeof x === 'string'),
++        }
++      }
++    }
++  } catch {
++    // 配置损坏时回退默认布局
++  }
++  return { hidden: [], order: [] }
++}
++
++const layout = ref<DashboardLayout>(loadLayout())
++
+ /* ---------------- 图表清单 ---------------- */
+-const chartList = computed(() => {
++const allChartDefs = computed(() => {
+   const d = data.value
+   const statuses = d?.byStatusBiz.map((s) => s.key) ?? []
+   const wo = d?.woStats
+@@ -1075,6 +1105,70 @@ const chartList = computed(() => {
+   ]
+ })
+ 
++/** 应用布局后的图表清单：过滤隐藏 + 按 order 排序（未列出的按默认顺序排在末尾） */
++const chartList = computed(() => {
++  const { hidden, order } = layout.value
++  const rank = (key: string): number => {
++    const i = order.indexOf(key)
++    return i < 0 ? order.length : i
++  }
++  return allChartDefs.value
++    .filter((c) => !hidden.includes(c.key))
++    .slice()
++    .sort((a, b) => rank(a.key) - rank(b.key))
++})
++
++/* ---------------- v3.5 布局编辑抽屉（勾选显隐 + 上下移排序，不做拖拽） ---------------- */
++const layoutDrawer = ref(false)
++/** 草稿（保存前不影响渲染） */
++const draftOrder = ref<string[]>([])
++const draftHidden = ref<string[]>([])
++
++function openLayout() {
++  const shown = chartList.value.map((c) => c.key as string)
++  const hiddenKeys = allChartDefs.value.map((c) => c.key as string).filter((k) => !shown.includes(k))
++  draftOrder.value = [...shown, ...hiddenKeys]
++  draftHidden.value = [...layout.value.hidden]
++  layoutDrawer.value = true
++}
++
++function draftVisible(key: string): boolean {
++  return !draftHidden.value.includes(key)
++}
++
++function toggleDraft(key: string, visible: string | number | boolean) {
++  if (visible) draftHidden.value = draftHidden.value.filter((k) => k !== key)
++  else if (!draftHidden.value.includes(key)) draftHidden.value.push(key)
++}
++
++function draftTitle(key: string): string {
++  return allChartDefs.value.find((c) => (c.key as string) === key)?.title ?? key
++}
++
++function moveDraft(i: number, dir: -1 | 1) {
++  const j = i + dir
++  const arr = draftOrder.value
++  if (j < 0 || j >= arr.length) return
++  const t = arr[i]
++  arr[i] = arr[j]
++  arr[j] = t
++}
++
++function saveLayout() {
++  layout.value = {
++    hidden: draftHidden.value.filter((k) => draftOrder.value.includes(k)),
++    order: [...draftOrder.value],
++  }
++  localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout.value))
++  layoutDrawer.value = false
++}
++
++function resetLayout() {
++  layout.value = { hidden: [], order: [] }
++  localStorage.removeItem(LAYOUT_KEY)
++  layoutDrawer.value = false
++}
++
+ /* ---------------- 图表实例管理（按需初始化 + resize + 卸载销毁） ---------------- */
+ const boxes = new Map<string, HTMLDivElement>()
+ const instances = new Map<string, EChartsType>()
+@@ -1142,6 +1236,9 @@ function handleThemeChange() {
+   void nextTick(() => renderCharts())
+ }
+ 
++/** v3.5：布局变化（显隐/排序）后按新卡片集合重绘 */
++watch(chartList, () => void nextTick(() => renderCharts()))
++
+ onMounted(() => {
+   updateLayout()
+   if (canSeeReport.value) void load()
+@@ -1166,6 +1263,11 @@ onBeforeUnmount(() => {
+     sub-title="请从左侧菜单进入有权限的模块，或联系管理员为当前角色开通报表权限"
+   />
+   <div v-else v-loading="loading" class="dashboard">
++    <!-- v3.5 布局设置入口 -->
++    <div class="layout-bar">
++      <el-button size="small" plain @click="openLayout">布局设置</el-button>
++    </div>
++
+     <!-- 顶部统计卡 -->
+     <el-row :gutter="16">
+       <el-col :span="colSpan === 24 ? 24 : 6">
+@@ -1225,10 +1327,49 @@ onBeforeUnmount(() => {
+         </el-card>
+       </el-col>
+     </el-row>
++
++    <!-- v3.5 布局编辑：勾选显隐 + 上下移排序（不做拖拽） -->
++    <el-drawer v-model="layoutDrawer" title="布局设置" size="440px">
++      <div class="layout-tip">勾选要显示的图表卡片；「上移 / 下移」调整顺序，保存后立即生效并记住选择。</div>
++      <div v-for="(k, i) in draftOrder" :key="k" class="layout-row">
++        <el-checkbox :model-value="draftVisible(k)" @change="(v: string | number | boolean) => toggleDraft(k, v)">
++          {{ draftTitle(k) }}
++        </el-checkbox>
++        <span class="layout-ops">
++          <el-button :disabled="i === 0" link size="small" @click="moveDraft(i, -1)">上移</el-button>
++          <el-button :disabled="i === draftOrder.length - 1" link size="small" @click="moveDraft(i, 1)">下移</el-button>
++        </span>
++      </div>
++      <template #footer>
++        <el-button @click="resetLayout">恢复默认</el-button>
++        <el-button type="primary" @click="saveLayout">保存</el-button>
++      </template>
++    </el-drawer>
+   </div>
+ </template>
+ 
+ <style scoped>
++.layout-bar {
++  display: flex;
++  justify-content: flex-end;
++  margin-bottom: 8px;
++}
++.layout-tip {
++  font-size: 12px;
++  color: var(--el-text-color-secondary);
++  margin-bottom: 12px;
++  line-height: 1.6;
++}
++.layout-row {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  padding: 6px 4px;
++  border-bottom: 1px solid var(--el-border-color-lighter);
++}
++.layout-ops {
++  white-space: nowrap;
++}
+ .stat-card :deep(.el-card__body) {
+   padding: 16px 20px;
+ }
+diff --git a/platform-web/src/views/system/NotificationCenterView.vue b/platform-web/src/views/system/NotificationCenterView.vue
+new file mode 100644
+index 0000000..31e8b35
+--- /dev/null
++++ b/platform-web/src/views/system/NotificationCenterView.vue
+@@ -0,0 +1,283 @@
++<script setup lang="ts">
++import { computed, onMounted, onUnmounted, ref } from 'vue'
++import { useRoute, useRouter } from 'vue-router'
++import { ElMessage } from 'element-plus'
++import { Refresh } from '@element-plus/icons-vue'
++import { useNotificationStore } from '@/stores/notification'
++import { fetchMyNotifications } from '@/api/notification'
++import type { NotificationItem } from '@/api/notification'
++import type { RouteLocationRaw } from 'vue-router'
++
++/**
++ * 通知中心（v3.5）：站内信全量视图——全部/未读筛选、分页、单条/全部已读、
++ * 按类型跳转（工单/问题/变更/库存等）；SSE 实时到达的通知在第一页时自动刷新，
++ * 推送通道降级为轮询时顶部状态标签提示（不中断使用）。
++ */
++
++const PAGE_SIZE = 20
++
++/** 类型元数据：标签 / tag 颜色 / refId 跳转（无 to 则仅标读不跳转） */
++interface TypeMeta {
++  label: string
++  tag: 'primary' | 'success' | 'warning' | 'danger' | 'info'
++  to?: (refId: string) => RouteLocationRaw
++}
++
++const woDetail = (r: string): RouteLocationRaw => ({ path: `/workorders/${encodeURIComponent(r)}` })
++
++const EXACT_META: Record<string, TypeMeta> = {
++  SLA: { label: 'SLA 升级', tag: 'danger', to: woDetail },
++  STOCK_LOW: {
++    label: '库存预警',
++    tag: 'warning',
++    // ticket 模式 refId=工单号（跳详情）；notify 模式 refId=物料编码（跳库存水位）
++    to: (r) => (r.startsWith('WO-') ? woDetail(r) : { path: '/rfid/stock', query: { keyword: r } }),
++  },
++  GPU_ALERT: { label: 'GPU 告警', tag: 'danger', to: woDetail },
++  INSPECTION: { label: '巡检', tag: 'success', to: woDetail },
++  PROBLEM: { label: '问题', tag: 'warning', to: (r) => ({ path: '/problems', query: { id: r } }) },
++  CHANGE: { label: '变更', tag: 'info', to: (r) => ({ path: '/changes', query: { id: r } }) },
++  CONTRACT: { label: '合同', tag: 'info', to: (r) => ({ path: '/suppliers/contracts', query: { id: r } }) },
++}
++
++const DEFAULT_META: TypeMeta = { label: '通知', tag: 'info' }
++
++function metaOf(type?: string): TypeMeta {
++  if (!type) return DEFAULT_META
++  if (EXACT_META[type]) return EXACT_META[type]
++  if (type.startsWith('WO_')) return { label: '工单', tag: 'primary', to: woDetail }
++  return DEFAULT_META
++}
++
++function fmtTime(s?: string): string {
++  return (s || '').replace('T', ' ')
++}
++
++const store = useNotificationStore()
++const router = useRouter()
++const route = useRoute()
++
++const tab = ref<'all' | 'unread'>('all')
++const page = ref(1)
++const total = ref(0)
++const loading = ref(false)
++const list = ref<NotificationItem[]>([])
++
++const transportTag = computed(() => {
++  switch (store.transport) {
++    case 'sse':
++      return { text: '实时推送', type: 'success' as const }
++    case 'polling':
++      return { text: '轮询模式', type: 'info' as const }
++    default:
++      return { text: '连接中', type: 'warning' as const }
++  }
++})
++
++async function load() {
++  loading.value = true
++  try {
++    const res = await fetchMyNotifications({
++      page: page.value,
++      size: PAGE_SIZE,
++      unread: tab.value === 'unread' ? true : undefined,
++    })
++    list.value = res.records ?? []
++    total.value = res.total ?? 0
++  } catch {
++    // 拦截器已提示
++  } finally {
++    loading.value = false
++  }
++}
++
++function onTabChange() {
++  page.value = 1
++  void load()
++}
++
++function onPageChange(p: number) {
++  page.value = p
++  void load()
++}
++
++/** 点击通知：未读先标读（红点联动），再按类型跳转；已读直接跳转 */
++async function onClick(item: NotificationItem) {
++  if (!item.readFlag) {
++    try {
++      await store.markRead(item.id)
++      item.readFlag = true
++    } catch {
++      return // 标读失败不跳转，拦截器已提示
++    }
++  }
++  const meta = metaOf(item.type)
++  if (meta.to && item.refId) router.push(meta.to(item.refId))
++}
++
++async function onReadAll() {
++  try {
++    await store.markAllRead()
++    ElMessage.success('已全部标记为已读')
++    void load()
++  } catch {
++    // 拦截器已提示
++  }
++}
++
++/* SSE 实时到达：处于第一页时自动刷新，让最新通知立即可见 */
++let offNotification: (() => void) | undefined
++
++onMounted(() => {
++  // 从别处（如铃铛面板）带着 unread 筛选进入
++  if (route.query.tab === 'unread') tab.value = 'unread'
++  void load()
++  offNotification = store.onNotification(() => {
++    if (page.value === 1) void load()
++  })
++})
++
++onUnmounted(() => {
++  offNotification?.()
++})
++</script>
++
++<template>
++  <div class="noti-center">
++    <div class="noti-toolbar">
++      <el-radio-group v-model="tab" @change="onTabChange">
++        <el-radio-button value="all">全部</el-radio-button>
++        <el-radio-button value="unread">未读（{{ store.unreadCount }}）</el-radio-button>
++      </el-radio-group>
++      <div class="noti-toolbar-right">
++        <el-tag :type="transportTag.type" size="small" effect="plain" round>
++          {{ transportTag.text }}
++        </el-tag>
++        <el-button :icon="Refresh" @click="load()">刷新</el-button>
++        <el-button type="primary" plain :disabled="store.unreadCount <= 0" @click="onReadAll">全部已读</el-button>
++      </div>
++    </div>
++
++    <div v-loading="loading" class="noti-list">
++      <div
++        v-for="n in list"
++        :key="String(n.id)"
++        class="noti-row"
++        :class="{ 'is-unread': !n.readFlag }"
++        @click="onClick(n)"
++      >
++        <div class="noti-row-head">
++          <span v-if="!n.readFlag" class="noti-dot"></span>
++          <el-tag :type="metaOf(n.type).tag" size="small" effect="light">
++            {{ metaOf(n.type).label }}
++          </el-tag>
++          <span class="noti-title">{{ n.title }}</span>
++          <span class="noti-time">{{ fmtTime(n.createdAt) }}</span>
++        </div>
++        <div v-if="n.content" class="noti-content">{{ n.content }}</div>
++      </div>
++      <el-empty v-if="!loading && list.length === 0" description="暂无通知" />
++    </div>
++
++    <div class="noti-pager">
++      <el-pagination
++        background
++        layout="total, prev, pager, next"
++        :total="total"
++        :page-size="PAGE_SIZE"
++        :current-page="page"
++        @current-change="onPageChange"
++      />
++    </div>
++  </div>
++</template>
++
++<style scoped>
++.noti-center {
++  max-width: 960px;
++  margin: 0 auto;
++  background: var(--el-bg-color);
++  border-radius: 6px;
++  padding: 16px;
++}
++
++.noti-toolbar {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  flex-wrap: wrap;
++  gap: 10px;
++  margin-bottom: 12px;
++}
++
++.noti-toolbar-right {
++  display: inline-flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.noti-list {
++  min-height: 200px;
++}
++
++.noti-row {
++  padding: 12px 8px;
++  border-bottom: 1px solid var(--el-border-color-lighter);
++  cursor: pointer;
++}
++
++.noti-row:hover {
++  background: var(--el-fill-color-light);
++}
++
++.noti-row-head {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.noti-dot {
++  width: 7px;
++  height: 7px;
++  border-radius: 50%;
++  background: var(--el-color-danger);
++  flex-shrink: 0;
++}
++
++.noti-title {
++  font-size: 14px;
++  color: var(--el-text-color-regular);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.noti-row.is-unread .noti-title {
++  font-weight: 600;
++  color: var(--el-text-color-primary);
++}
++
++.noti-time {
++  margin-left: auto;
++  font-size: 12px;
++  color: var(--el-text-color-placeholder);
++  flex-shrink: 0;
++}
++
++.noti-content {
++  margin: 6px 0 0 15px;
++  font-size: 13px;
++  color: var(--el-text-color-secondary);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  display: -webkit-box;
++  -webkit-line-clamp: 2;
++  -webkit-box-orient: vertical;
++}
++
++.noti-pager {
++  display: flex;
++  justify-content: flex-end;
++  padding-top: 12px;
++}
++</style>
+diff --git a/platform-web/src/views/workorder/WorkorderKanbanBoard.vue b/platform-web/src/views/workorder/WorkorderKanbanBoard.vue
+new file mode 100644
+index 0000000..d49d872
+--- /dev/null
++++ b/platform-web/src/views/workorder/WorkorderKanbanBoard.vue
+@@ -0,0 +1,302 @@
++<script setup lang="ts">
++/**
++ * v3.5 工单看板：按状态分列，原生 HTML5 DnD 拖拽流转。
++ * - 拖拽卡片到目标列 → 调 transition 接口；失败（409 非法流转 / 403 无权限）卡片留在原列（回弹）
++ * - 驳回需必填意见（弹窗输入）；处理中→已关闭需根因分类，看板不提供（引导详情页）
++ * - 与列表页共享筛选条件（props.filters）；数据最多 200 条（后端分页上限）
++ */
++import { computed, onMounted, ref, watch } from 'vue'
++import { ElMessage, ElMessageBox } from 'element-plus'
++import { fetchWorkorders, transitionWorkorder, WO_STATUSES } from '@/api/workorder'
++import type { WorkorderItem } from '@/api/workorder'
++import { isSlaOverdue, priorityTag, statusTag } from './wo-shared'
++
++const props = defineProps<{
++  /** 列表页当前筛选条件（status 之外的条件同样生效） */
++  filters: Record<string, unknown>
++}>()
++const emit = defineEmits<{ (e: 'open', wo: WorkorderItem): void }>()
++
++/** 看板拖拽可达的状态迁移表（与后端 WorkorderStateMachine 对齐；
++ *  处理中→已关闭需根因分类且仅管理员，看板不提供，引导到详情页） */
++const DRAG_ACTIONS: Record<string, Record<string, string>> = {
++  待处理: { 处理中: '开始处理', 待审批: '提交审批' },
++  待审批: { 处理中: '审批通过', 已驳回: '驳回' },
++  已驳回: { 待审批: '重新提交', 已关闭: '关闭' },
++  处理中: { 已完成: '完成工单', 待处理: '退回' },
++  已完成: { 处理中: '重新打开' },
++}
++
++const columns = WO_STATUSES as readonly string[]
++const records = ref<WorkorderItem[]>([])
++const total = ref(0)
++const loading = ref(false)
++/** 流转请求进行中的工单（防重复提交） */
++const busyWo = ref('')
++const dragFrom = ref<{ woNo: string; from: string } | null>(null)
++const dragOverCol = ref('')
++
++const byStatus = computed(() => {
++  const m: Record<string, WorkorderItem[]> = {}
++  columns.forEach((s) => (m[s] = []))
++  records.value.forEach((r) => {
++    if (m[r.status]) m[r.status].push(r)
++  })
++  return m
++})
++
++const truncated = computed(() => total.value > records.value.length)
++
++async function load() {
++  loading.value = true
++  try {
++    const res = await fetchWorkorders({ ...props.filters, page: 1, size: 200 })
++    records.value = res.records ?? []
++    total.value = res.total ?? 0
++  } catch {
++    // 拦截器已提示
++  } finally {
++    loading.value = false
++  }
++}
++
++/** 该状态的卡片是否可拖（有可达迁移才可拖） */
++function draggableOf(status: string): boolean {
++  return Object.keys(DRAG_ACTIONS[status] ?? {}).length > 0
++}
++
++function onDragStart(e: DragEvent, wo: WorkorderItem) {
++  if (!draggableOf(wo.status) || busyWo.value === wo.woNo) {
++    e.preventDefault()
++    return
++  }
++  dragFrom.value = { woNo: wo.woNo, from: wo.status }
++  if (e.dataTransfer) {
++    e.dataTransfer.effectAllowed = 'move'
++    e.dataTransfer.setData('text/plain', wo.woNo)
++  }
++}
++
++function onDragOver(e: DragEvent, status: string) {
++  if (!dragFrom.value) return
++  e.preventDefault()
++  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
++  dragOverCol.value = status
++}
++
++function onDrop(e: DragEvent, status: string) {
++  e.preventDefault()
++  const d = dragFrom.value
++  dragFrom.value = null
++  dragOverCol.value = ''
++  if (!d) return
++  void doTransition(d, status)
++}
++
++function onDragEnd() {
++  dragFrom.value = null
++  dragOverCol.value = ''
++}
++
++async function doTransition(d: { woNo: string; from: string }, to: string) {
++  if (d.from === to) return
++  const action = DRAG_ACTIONS[d.from]?.[to]
++  if (!action) {
++    if (d.from === '处理中' && to === '已关闭') {
++      ElMessage.warning('处理中工单请从详情页关闭（需选择根因分类）')
++    } else {
++      ElMessage.info(`「${d.from}」工单不支持直接移动到「${to}」`)
++    }
++    return
++  }
++  let opinion: string | undefined
++  if (action === '驳回') {
++    try {
++      const { value } = await ElMessageBox.prompt('驳回必须填写审批意见', `驳回 ${d.woNo}`, {
++        inputPlaceholder: '驳回意见（必填）',
++        inputValidator: (v: string) => !!v?.trim() || '请填写驳回意见',
++      })
++      opinion = value.trim()
++    } catch {
++      return // 取消 = 卡片回弹
++    }
++  }
++  busyWo.value = d.woNo
++  try {
++    await transitionWorkorder(d.woNo, { action, opinion })
++    ElMessage.success(`已执行「${action}」`)
++    await load()
++  } catch {
++    // 拦截器已提示（409 非法流转 / 403 无权限）→ 卡片留在原列（回弹）
++  } finally {
++    busyWo.value = ''
++  }
++}
++
++function fmtTime(v?: string): string {
++  return v ? v.replace('T', ' ').slice(5, 16) : '-'
++}
++
++/** 筛选条件变化（查询/重置/快捷开关）时看板跟随刷新 */
++watch(() => props.filters, () => void load())
++
++onMounted(() => void load())
++</script>
++
++<template>
++  <div v-loading="loading" class="kanban">
++    <div v-if="truncated" class="kanban-hint">
++      <el-tag type="info" size="small">仅显示前 {{ records.length }} 条（共 {{ total }} 条），可用筛选缩小范围</el-tag>
++    </div>
++    <div class="kanban-cols">
++      <div
++        v-for="col in columns"
++        :key="col"
++        class="kb-col"
++        :class="{ 'kb-over': dragOverCol === col && !!dragFrom }"
++        @dragover="onDragOver($event, col)"
++        @dragleave="dragOverCol = ''"
++        @drop="onDrop($event, col)"
++      >
++        <div class="kb-head">
++          <el-tag :type="statusTag(col)" effect="plain">{{ col }}</el-tag>
++          <span class="kb-count">{{ byStatus[col].length }}</span>
++        </div>
++        <div class="kb-body">
++          <div
++            v-for="wo in byStatus[col]"
++            :key="wo.woNo"
++            class="kb-card"
++            :class="{
++              'kb-draggable': draggableOf(col),
++              'kb-busy': busyWo === wo.woNo,
++              'kb-dragging': dragFrom?.woNo === wo.woNo,
++            }"
++            :draggable="draggableOf(col) && busyWo !== wo.woNo"
++            :title="draggableOf(col) ? '拖拽到其他列流转状态，点击打开详情' : '终态，点击打开详情'"
++            @dragstart="onDragStart($event, wo)"
++            @dragend="onDragEnd"
++            @click="emit('open', wo)"
++          >
++            <div class="kb-card-top">
++              <span class="kb-no">{{ wo.woNo }}</span>
++              <el-tag v-if="wo.priority" :type="priorityTag(wo.priority)" size="small">{{ wo.priority }}</el-tag>
++              <el-tag v-if="isSlaOverdue(wo)" type="danger" size="small" effect="dark">超期</el-tag>
++            </div>
++            <div class="kb-title">{{ wo.title }}</div>
++            <div class="kb-meta">
++              <span>{{ wo.woType }}</span>
++              <span>{{ wo.handler ? wo.handler : wo.applicant || '-' }}</span>
++              <span>{{ fmtTime(wo.applyTime || wo.createdAt) }}</span>
++            </div>
++          </div>
++          <div v-if="!byStatus[col].length" class="kb-empty">暂无工单</div>
++        </div>
++      </div>
++    </div>
++  </div>
++</template>
++
++<style scoped>
++.kanban-hint {
++  margin-bottom: 8px;
++}
++.kanban-cols {
++  display: flex;
++  gap: 12px;
++  overflow-x: auto;
++  align-items: flex-start;
++  padding-bottom: 8px;
++}
++.kb-col {
++  flex: 0 0 280px;
++  min-height: 320px;
++  border: 1px solid var(--el-border-color-lighter);
++  border-radius: 6px;
++  background: var(--el-fill-color-blank);
++  transition: border-color 0.15s;
++}
++.kb-col.kb-over {
++  border-color: var(--el-color-primary);
++  box-shadow: 0 0 0 1px var(--el-color-primary-light-7) inset;
++}
++.kb-head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  padding: 10px 12px 6px;
++  border-bottom: 1px solid var(--el-border-color-lighter);
++}
++.kb-count {
++  font-size: 12px;
++  color: var(--el-text-color-secondary);
++  font-variant-numeric: tabular-nums;
++}
++.kb-body {
++  padding: 8px;
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  min-height: 260px;
++  max-height: 640px;
++  overflow-y: auto;
++}
++.kb-card {
++  border: 1px solid var(--el-border-color-lighter);
++  border-radius: 5px;
++  padding: 8px 10px;
++  cursor: pointer;
++  background: var(--el-bg-color);
++}
++.kb-card:hover {
++  border-color: var(--el-color-primary-light-5);
++}
++.kb-card.kb-draggable {
++  cursor: grab;
++}
++.kb-card.kb-dragging {
++  opacity: 0.45;
++}
++.kb-card.kb-busy {
++  opacity: 0.6;
++  pointer-events: none;
++}
++.kb-card-top {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++}
++.kb-no {
++  font-size: 12px;
++  font-weight: 600;
++  color: var(--el-text-color-regular);
++  font-variant-numeric: tabular-nums;
++}
++.kb-title {
++  margin-top: 4px;
++  font-size: 13px;
++  line-height: 1.5;
++  color: var(--el-text-color-primary);
++  word-break: break-all;
++  display: -webkit-box;
++  -webkit-line-clamp: 2;
++  -webkit-box-orient: vertical;
++  overflow: hidden;
++}
++.kb-meta {
++  margin-top: 6px;
++  display: flex;
++  gap: 10px;
++  font-size: 12px;
++  color: var(--el-text-color-secondary);
++  flex-wrap: wrap;
++}
++.kb-empty {
++  border: 1px dashed var(--el-border-color-lighter);
++  border-radius: 5px;
++  padding: 14px 0;
++  text-align: center;
++  font-size: 12px;
++  color: var(--el-text-color-placeholder);
++}
++</style>
+diff --git a/platform-web/src/views/workorder/WorkorderListView.vue b/platform-web/src/views/workorder/WorkorderListView.vue
+index 22e08fd..b4918b1 100644
+--- a/platform-web/src/views/workorder/WorkorderListView.vue
++++ b/platform-web/src/views/workorder/WorkorderListView.vue
+@@ -9,6 +9,7 @@ import { exportWorkorders, fetchWorkorders, WO_PRIORITIES, WO_STATUSES, WO_TYPES
+ import type { WorkorderItem } from '@/api/workorder'
+ import { isSlaOverdue, priorityTag, statusTag } from './wo-shared'
+ import WorkorderCreateDialog from './WorkorderCreateDialog.vue'
++import WorkorderKanbanBoard from './WorkorderKanbanBoard.vue'
+ 
+ const auth = useAuthStore()
+ const router = useRouter()
+@@ -52,6 +53,19 @@ function params() {
+   }
+ }
+ 
++/** v3.5 视图模式：表格 / 看板（看板支持拖拽流转，UI-08） */
++const viewMode = ref<'table' | 'kanban'>('table')
++
++/** 看板筛选条件：与表格同口径；分页由看板自理（最多 200 条） */
++const kanbanFilters = computed(() => {
++  const p = params() as Record<string, unknown>
++  const rest: Record<string, unknown> = {}
++  Object.keys(p).forEach((k) => {
++    if (k !== 'page' && k !== 'size') rest[k] = p[k]
++  })
++  return rest
++})
++
+ async function load() {
+   listLoading.value = true
+   try {
+@@ -223,11 +237,16 @@ onMounted(() => {
+         仅看超期
+       </el-button>
+       <div style="flex: 1"></div>
++      <el-radio-group v-model="viewMode" size="small">
++        <el-radio-button value="table">表格</el-radio-button>
++        <el-radio-button value="kanban">看板</el-radio-button>
++      </el-radio-group>
+       <el-button :loading="exporting" @click="doExport">导出 CSV</el-button>
+       <el-button v-if="canWrite" type="primary" @click="openCreate">创建工单</el-button>
+     </div>
+ 
+-    <!-- 列表 -->
++    <!-- 列表 / 看板（v3.5 视图切换） -->
++    <template v-if="viewMode === 'table'">
+     <el-table
+       v-loading="listLoading"
+       :data="records"
+@@ -286,6 +305,10 @@ onMounted(() => {
+         @size-change="() => { query.page = 1; load() }"
+       />
+     </div>
++    </template>
++
++    <!-- v3.5 看板：按状态分列，拖拽流转（UI-08） -->
++    <WorkorderKanbanBoard v-else :filters="kanbanFilters" @open="openDetail" />
+ 
+     <WorkorderCreateDialog ref="createRef" @created="() => { query.page = 1; load() }" />
+   </div>

@@ -1,0 +1,437 @@
+diff --git a/a/backend-resources/application.yml b/b/backend-resources/application.yml
+index abb67f1..ffbcc36 100644
+--- a/a/backend-resources/application.yml
++++ b/b/backend-resources/application.yml
+@@ -97,6 +97,10 @@ dcim:
+       # 多实例部署时定时任务互斥（单实例无副作用）
+       enabled: ${DCIM_SCHEDULER_CLUSTER_LOCK:true}
+       lease-seconds: ${DCIM_SCHEDULER_LOCK_LEASE:600}
++      # v3.5.2：租约上限（秒）——续租不可超过「加锁时刻 + 上限」，持锁实例崩溃后
++      # 锁至多在上限内自愈释放，防止无限续租让已终止实例的锁长期阻塞任务；
++      # 须大于最慢定时任务的执行时长
++      max-lease-seconds: ${DCIM_SCHEDULER_LOCK_MAX_LEASE:1800}
+   auth:
+     dev-login-enabled: ${DCIM_DEV_LOGIN_ENABLED:false}
+     # 首登强制改密的服务端强制（此前仅前端路由守卫生效，可被直接调 API 绕过）
+@@ -129,8 +133,11 @@ dcim:
+   # 本项目入口是 Caddy，它与 platform-be 同处 Docker 网络，对端地址是容器 IP
+   # （172.x.x.x）而非 127.0.0.1 —— 若只信回环，所有审计 IP 会退化成同一个容器 IP，
+   # 且登录限流的「每 IP 次数」会把全站用户塞进一个桶。
+-  # 默认含 RFC1918：172.16.0.0/12 覆盖 Docker 默认网段；可按需收紧。
+-  trusted-proxies: ${DCIM_TRUSTED_PROXIES:127.0.0.0/8,::1/128,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
++  # v3.5.2：默认信任面收敛为「回环 + Docker 默认网桥段 172.16.0.0/12」。此前默认
++  # 含全部 RFC1918（10/8、192.168/16），内网客户端直连后端端口时可伪造 XFF 冒充
++  # 任意来源 IP，绕过登录跨 IP 锁定（SE-06）与审计定位。原生部署且网关与后端
++  # 同处 10/8、192.168/16 网段的，需在 .env 显式配置 DCIM_TRUSTED_PROXIES。
++  trusted-proxies: ${DCIM_TRUSTED_PROXIES:127.0.0.0/8,::1/128,172.16.0.0/12}
+   jwt:
+     # 生产必须通过环境变量注入（>= 64 字符随机串），未设置则启动失败
+     secret: ${JWT_SECRET}
+@@ -164,6 +171,9 @@ dcim:
+   collector:
+     # 采集器 agent 鉴权密钥（X-Agent-Key，生产必须环境变量注入）
+     agent-key: ${DCIM_AGENT_KEY}
++    # v3.5.2：带外硬件快照保留天数——SnapshotRetentionJob 每日 02:40 分批清理
++    # 超期快照（≤0 表示不清理）；配套 V47 迁移已建 (asset_id, collected_at) 索引
++    snapshot-retention-days: ${DCIM_COLLECTOR_SNAPSHOT_RETENTION_DAYS:180}
+   ire:
+     # IRE 身份冲突策略：fill=自动以带外为准回填 / manual=冲突留待认领池人工裁决
+     conflict-policy: ${DCIM_IRE_POLICY:manual}
+diff --git a/b/backend-resources/db/migration/V47__v352_hardening.sql b/b/backend-resources/db/migration/V47__v352_hardening.sql
+new file mode 100644
+index 0000000..7546c28
+--- /dev/null
++++ b/b/backend-resources/db/migration/V47__v352_hardening.sql
+@@ -0,0 +1,4 @@
++-- v3.5.2 硬化：hw_snapshot 保留策略支撑索引
++-- SnapshotRetentionJob（dcim.collector.snapshot-retention-days，默认 180 天）按 collected_at
++-- 过滤分批删除过期快照；此前的 (endpoint_id, collected_at DESC) 索引无法支撑该时间过滤路径。
++CREATE INDEX IF NOT EXISTS idx_hw_snapshot_collected ON hw_snapshot (collected_at);
+diff --git a/a/backend-resources/dcim-build.properties b/b/backend-resources/dcim-build.properties
+index 3552a2b..280b536 100644
+--- a/a/backend-resources/dcim-build.properties
++++ b/b/backend-resources/dcim-build.properties
+@@ -1,3 +1,3 @@
+ # 后端构建信息（/api/healthz 与启动日志展示）
+-version=3.5.1
+-built=2026-10-10
++version=3.5.2
++built=2026-10-11
+diff --git a/a/backend-src/com/dcim/apitoken/ApiTokenService.java b/b/backend-src/com/dcim/apitoken/ApiTokenService.java
+index e847355..a0d6fc1 100644
+--- a/a/backend-src/com/dcim/apitoken/ApiTokenService.java
++++ b/b/backend-src/com/dcim/apitoken/ApiTokenService.java
+@@ -18,19 +18,26 @@ import org.springframework.stereotype.Service;
+ 
+ @Service
+ public class ApiTokenService {
+-    
++
+     private static final Logger log = LoggerFactory.getLogger(ApiTokenService.class);
+     public static final String PREFIX = "dcim_pat_";
++    /** v3.5.2：吊销跨实例广播频道（无 Redis 的单实例部署无需广播，本地缓存已同步清理） */
++    public static final String INVALIDATION_CHANNEL = "dcim:pat-invalidate";
+     private static final char[] ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789".toCharArray();
+     private static final long CACHE_MS = 60000L;
+     private static final int MAX_PER_USER = 20;
+     private final JdbcTemplate jdbc;
++    private final org.springframework.beans.factory.ObjectProvider<org.springframework.data.redis.core.StringRedisTemplate> redisProvider;
+     private final SecureRandom random = new SecureRandom();
+     private final Map<String, ApiTokenService.Cached> cache = new ConcurrentHashMap<>();
+     private final Map<Long, Long> lastTouch = new ConcurrentHashMap<>();
+ 
+-    public ApiTokenService(JdbcTemplate jdbc) {
++    public ApiTokenService(
++        JdbcTemplate jdbc,
++        org.springframework.beans.factory.ObjectProvider<org.springframework.data.redis.core.StringRedisTemplate> redisProvider
++    ) {
+         this.jdbc = jdbc;
++        this.redisProvider = redisProvider;
+     }
+ 
+     public static boolean looksLikePat(String token) {
+@@ -141,15 +148,39 @@ public class ApiTokenService {
+         if (n == 0) {
+             throw BusinessException.notFound("令牌不存在或已吊销");
+         } else {
+-            this.cache.clear();
++            this.evictAllCache();
++            this.broadcastInvalidation();
+         }
+     }
+ 
+     public void revokeAllOf(String username) {
+         this.jdbc.update("UPDATE api_token SET revoked_at = NOW() WHERE username = ? AND revoked_at IS NULL", new Object[]{username});
++        this.evictAllCache();
++        this.broadcastInvalidation();
++    }
++
++    /** v3.5.2：清空本实例校验缓存（吊销后立即生效；亦供 Redis 订阅方回调） */
++    public void evictAllCache() {
+         this.cache.clear();
+     }
+ 
++    /**
++     * v3.5.2：吊销跨实例广播。校验缓存 60s TTL，实例 A 吊销后实例 B 缓存中的旧结果
++     * 此前要等自然过期才拒绝（多实例下的吊销窗口）；发布到 Redis 频道后由
++     * {@link RedisPatInvalidator} 订阅并立即清缓存。尽力而为，失败不影响吊销结果
++     * （各实例最迟 60s 后自然失效）。
++     */
++    private void broadcastInvalidation() {
++        try {
++            org.springframework.data.redis.core.StringRedisTemplate redis = this.redisProvider.getIfAvailable();
++            if (redis != null) {
++                redis.convertAndSend(INVALIDATION_CHANNEL, String.valueOf(System.currentTimeMillis()));
++            }
++        } catch (RuntimeException e) {
++            log.debug("[pat] 吊销广播失败（各实例缓存最迟 60s 后自然失效）：{}", e.getMessage());
++        }
++    }
++
+     static String sha256(String s) {
+         try {
+             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8)));
+diff --git a/b/backend-src/com/dcim/apitoken/RedisPatInvalidator.java b/b/backend-src/com/dcim/apitoken/RedisPatInvalidator.java
+new file mode 100644
+index 0000000..633e232
+--- /dev/null
++++ b/b/backend-src/com/dcim/apitoken/RedisPatInvalidator.java
+@@ -0,0 +1,50 @@
++package com.dcim.apitoken;
++
++import com.dcim.security.RedisEnabledCondition;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Conditional;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.data.redis.connection.Message;
++import org.springframework.data.redis.connection.MessageListener;
++import org.springframework.data.redis.connection.RedisConnectionFactory;
++import org.springframework.data.redis.listener.ChannelTopic;
++import org.springframework.data.redis.listener.RedisMessageListenerContainer;
++
++/**
++ * PAT 吊销跨实例即时失效（v3.5.2）。
++ *
++ * <p>{@link ApiTokenService} 的校验结果缓存 60s：实例 A 上吊销令牌后，实例 B 缓存中的
++ * 旧结果仍会放行（最长 60s 吊销窗口）。本组件订阅 {@link ApiTokenService#INVALIDATION_CHANNEL}，
++ * 任一实例吊销即广播，全部实例立即清空缓存。仅当配置了 Redis（多实例部署的前提）时装配；
++ * 单实例无 Redis 时本地缓存已在吊销路径同步清理，无需广播。
++ */
++@Configuration(proxyBeanMethods = false)
++@Conditional(RedisEnabledCondition.class)
++public class RedisPatInvalidator implements MessageListener {
++    private static final Logger log = LoggerFactory.getLogger(RedisPatInvalidator.class);
++    private final ApiTokenService apiTokenService;
++
++    public RedisPatInvalidator(ApiTokenService apiTokenService) {
++        this.apiTokenService = apiTokenService;
++    }
++
++    @Bean
++    public RedisMessageListenerContainer dcimPatInvalidatorContainer(RedisConnectionFactory factory) {
++        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
++        container.setConnectionFactory(factory);
++        container.addMessageListener(this, new ChannelTopic(ApiTokenService.INVALIDATION_CHANNEL));
++        log.info("[pat] 已订阅 Redis 频道 {}（令牌吊销跨实例即时失效）", ApiTokenService.INVALIDATION_CHANNEL);
++        return container;
++    }
++
++    @Override
++    public void onMessage(Message message, byte[] pattern) {
++        try {
++            this.apiTokenService.evictAllCache();
++        } catch (RuntimeException e) {
++            log.warn("[pat] 吊销广播处理失败：{}", e.toString());
++        }
++    }
++}
+diff --git a/a/backend-src/com/dcim/collector/controller/EndpointController.java b/b/backend-src/com/dcim/collector/controller/EndpointController.java
+index eea972d..818f4ac 100644
+--- a/a/backend-src/com/dcim/collector/controller/EndpointController.java
++++ b/b/backend-src/com/dcim/collector/controller/EndpointController.java
+@@ -111,7 +111,13 @@ public class EndpointController {
+                 e.setDisabled(false);
+                 e.setCreatedAt(LocalDateTime.now());
+                 e.setUpdatedAt(LocalDateTime.now());
+-                this.endpointMapper.insert(e);
++                try {
++                    this.endpointMapper.insert(e);
++                } catch (org.springframework.dao.DuplicateKeyException var9) {
++                    // v3.5.2：bmc_ip 唯一约束兜底——并发创建同一 bmcIp 时上面的 selectCount
++                    // check-then-act 存在竞态窗口，由数据库约束拦下并转 409（此前会 500）
++                    throw BusinessException.conflict("带外端点已存在：" + bmcIp);
++                }
+                 return ApiResult.ok(this.toRow(e));
+             }
+         } else {
+@@ -233,8 +239,13 @@ public class EndpointController {
+                             e.setDisabled(false);
+                             e.setCreatedAt(LocalDateTime.now());
+                             e.setUpdatedAt(LocalDateTime.now());
+-                            this.endpointMapper.insert(e);
+-                            created++;
++                            try {
++                                this.endpointMapper.insert(e);
++                                created++;
++                            } catch (org.springframework.dao.DuplicateKeyException var10) {
++                                // v3.5.2：行内查重与插入之间的竞态由唯一约束兜底，记为该行错误而非整批 500
++                                errors.add("第 " + line + " 行：bmcIp 已存在（并发冲突）" + bmcIp);
++                            }
+                         } else {
+                             BmcEndpointEntity upd = new BmcEndpointEntity();
+                             upd.setId(exist.getId());
+diff --git a/a/backend-src/com/dcim/collector/service/DiscoverService.java b/b/backend-src/com/dcim/collector/service/DiscoverService.java
+index bc55278..53a8f28 100644
+--- a/a/backend-src/com/dcim/collector/service/DiscoverService.java
++++ b/b/backend-src/com/dcim/collector/service/DiscoverService.java
+@@ -268,7 +268,13 @@ public class DiscoverService {
+             endpoint.setDisabled(false);
+             endpoint.setCreatedAt(LocalDateTime.now());
+             endpoint.setUpdatedAt(LocalDateTime.now());
+-            this.endpointMapper.insert(endpoint);
++            try {
++                this.endpointMapper.insert(endpoint);
++            } catch (org.springframework.dao.DuplicateKeyException var10) {
++                // v3.5.2：多 agent 并发上报同一 bmcIp 时的竞态由唯一约束兜底，跳过该台（下轮会走更新分支）
++                log.warn("[discover] 任务 {} 并发建档冲突，跳过 bmcIp={}（下轮采集自动合并）", task.getTaskNo(), bmcIp);
++                return "SKIP";
++            }
+         } else if (d.redfishVersion() != null || d.ipmiVersion() != null) {
+             BmcEndpointEntity upd = new BmcEndpointEntity();
+             if (d.redfishVersion() != null) {
+diff --git a/b/backend-src/com/dcim/collector/service/SnapshotRetentionJob.java b/b/backend-src/com/dcim/collector/service/SnapshotRetentionJob.java
+new file mode 100644
+index 0000000..2967cd6
+--- /dev/null
++++ b/b/backend-src/com/dcim/collector/service/SnapshotRetentionJob.java
+@@ -0,0 +1,62 @@
++package com.dcim.collector.service;
++
++import java.time.LocalDateTime;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++/**
++ * hw_snapshot 保留策略（v3.5.2）。
++ *
++ * <p>带外快照此前只增不删（每端点每个采集周期一条，含全量 JSONB 快照），长期运行会无限膨胀。
++ * 每日凌晨按 collected_at 分批删除超过保留期的快照；保留期由
++ * {@code dcim.collector.snapshot-retention-days} 配置（默认 180 天，≤0 表示不清理，
++ * 退回 3.5.1 行为）。
++ *
++ * <p>分批（每批 1000 行、单晚最多 500 批）避免大事务长锁；{@code @Scheduled} 自动纳入
++ * 集群互斥（ScheduledJobLockAspect），多实例部署下整段清理只在一个实例执行。
++ */
++@Component
++public class SnapshotRetentionJob {
++    private static final Logger log = LoggerFactory.getLogger(SnapshotRetentionJob.class);
++    private static final int BATCH = 1000;
++    private static final int MAX_BATCHES = 500;
++
++    private final JdbcTemplate jdbc;
++    private final int retentionDays;
++
++    public SnapshotRetentionJob(
++        JdbcTemplate jdbc,
++        @Value("${dcim.collector.snapshot-retention-days:180}") int retentionDays
++    ) {
++        this.jdbc = jdbc;
++        this.retentionDays = retentionDays;
++    }
++
++    @Scheduled(cron = "0 40 2 * * *")
++    public void purgeExpired() {
++        if (this.retentionDays <= 0) {
++            return;
++        }
++        LocalDateTime cutoff = LocalDateTime.now().minusDays((long) this.retentionDays);
++        long total = 0L;
++
++        for (int i = 0; i < MAX_BATCHES; i++) {
++            int n = this.jdbc.update(
++                "DELETE FROM hw_snapshot WHERE id IN (SELECT id FROM hw_snapshot WHERE collected_at < ? ORDER BY id LIMIT " + BATCH + ")",
++                cutoff
++            );
++            total += (long) n;
++            if (n < BATCH) {
++                break;
++            }
++        }
++
++        if (total > 0L) {
++            log.info("[snapshot-retention] 已清理 {} 天前的历史快照 {} 行", this.retentionDays, total);
++        }
++    }
++}
+diff --git a/a/backend-src/com/dcim/common/cluster/ClusterJobLock.java b/b/backend-src/com/dcim/common/cluster/ClusterJobLock.java
+index afd80a1..72f1c0f 100644
+--- a/a/backend-src/com/dcim/common/cluster/ClusterJobLock.java
++++ b/b/backend-src/com/dcim/common/cluster/ClusterJobLock.java
+@@ -74,15 +74,18 @@ public class ClusterJobLock {
+     }
+ 
+     /**
+-     * 心跳续租：任务运行期间周期性延长租约，防止长任务（超过默认租约 600s）在运行中途
+-     * 租约到期被其它实例抢锁并发执行。仅当锁仍由本实例持有时生效。
++     * v3.5.2：带租约上限的心跳续租。心跳无限续租会让死循环 / 挂死的任务永久独占锁
++     * （v3.5.1 回归中 HealthScoreService 被已崩溃实例的残留锁阻塞约 45 分钟）。
++     * 续租后的到期时间不超过「抢锁时刻 + maxLeaseSeconds」；达到上限后调用方应停止续租，
++     * 租约自然过期，其它实例即可接管。
+      */
+-    public void renew(String name, long leaseSeconds) {
++    public void renewCapped(String name, long leaseSeconds, long acquireEpochMs, long maxLeaseSeconds) {
+         long lease = Math.max(10L, leaseSeconds);
++        long cap = Math.max(lease, maxLeaseSeconds);
+         try {
+             this.jdbc.update(
+-                "UPDATE job_lock SET locked_until = clock_timestamp() + make_interval(secs => ?) WHERE name = ? AND locked_by = ?",
+-                (double) lease, name, this.instanceId
++                "UPDATE job_lock SET locked_until = LEAST(clock_timestamp() + make_interval(secs => ?), to_timestamp(? / 1000.0) + make_interval(secs => ?)) WHERE name = ? AND locked_by = ?",
++                (double) lease, (double) acquireEpochMs, (double) cap, name, this.instanceId
+             );
+         } catch (RuntimeException e) {
+             log.warn("[cluster-lock] 续租失败 {}：{}（若锁已被其它实例接管，本实例任务完成后无法释放）", name, e.getMessage());
+diff --git a/a/backend-src/com/dcim/common/cluster/ScheduledJobLockAspect.java b/b/backend-src/com/dcim/common/cluster/ScheduledJobLockAspect.java
+index e7796bd..4ff2f83 100644
+--- a/a/backend-src/com/dcim/common/cluster/ScheduledJobLockAspect.java
++++ b/b/backend-src/com/dcim/common/cluster/ScheduledJobLockAspect.java
+@@ -26,13 +26,19 @@ public class ScheduledJobLockAspect {
+     private static final Logger log = LoggerFactory.getLogger(ScheduledJobLockAspect.class);
+     private final ClusterJobLock lock;
+     private final org.springframework.core.env.Environment env;
++    private final long maxLeaseSeconds;
+     private final java.util.concurrent.ConcurrentHashMap<String, Long> holdMs = new java.util.concurrent.ConcurrentHashMap<>();
+     /** cron 任务的保持期上限：各实例按同一 cron 几乎同时触发，10 分钟足以让慢一步的实例跳过 */
+     private static final long CRON_HOLD_CAP_MS = 600_000L;
+ 
+-    public ScheduledJobLockAspect(ClusterJobLock lock, org.springframework.core.env.Environment env) {
++    public ScheduledJobLockAspect(
++        ClusterJobLock lock,
++        org.springframework.core.env.Environment env,
++        @org.springframework.beans.factory.annotation.Value("${dcim.scheduler.cluster-lock.max-lease-seconds:1800}") long maxLeaseSeconds
++    ) {
+         this.lock = lock;
+         this.env = env;
++        this.maxLeaseSeconds = Math.max(0L, maxLeaseSeconds);
+     }
+ 
+     /** 保持期 = 周期 × 0.9（cron 取相邻两次触发的间隔，且不超过 10 分钟） */
+@@ -105,11 +111,24 @@ public class ScheduledJobLockAspect {
+         long hold = this.holdFor(name, m.getAnnotation(org.springframework.scheduling.annotation.Scheduled.class));
+         // 修复：长任务（运行超过默认租约 600s）此前会在运行中途租约到期，被其它实例抢锁并发执行。
+         // 运行期间以 租约/3 的间隔心跳续租，任务结束后停止。
++        // v3.5.2：续租带上限（默认 1800s，dcim.scheduler.cluster-lock.max-lease-seconds 可调）。
++        // 心跳无限续租会让挂死 / 死循环的任务永久独占锁（v3.5.1 回归实测残留锁阻塞 45 分钟）；
++        // 达到上限后停止续租并告警，租约自然过期，其它实例可接管。
+         long lease = this.lock.leaseSeconds();
+         java.util.concurrent.ScheduledFuture<?> hb = null;
+         if (lease > 0L) {
+             long interval = Math.max(5L, lease / 3);
+-            hb = this.heartbeats().scheduleWithFixedDelay(() -> this.lock.renew(name, lease), interval, interval, java.util.concurrent.TimeUnit.SECONDS);
++            final long capMs = started + Math.max(lease, this.maxLeaseSeconds) * 1000L;
++            final String jobName = name;
++            hb = this.heartbeats().scheduleWithFixedDelay(() -> {
++                if (System.currentTimeMillis() >= capMs) {
++                    log.warn("[cluster-lock] {} 执行时间超过租约上限 {}s，停止续租（锁到期后其它实例可接管；请检查该任务是否挂死）",
++                        jobName, Math.max(lease, ScheduledJobLockAspect.this.maxLeaseSeconds));
++                    // 抛出异常终止本任务的后续心跳（ScheduledExecutorService 周期任务语义）
++                    throw new IllegalStateException("cluster-lock lease cap reached: " + jobName);
++                }
++                this.lock.renewCapped(jobName, lease, started, Math.max(lease, this.maxLeaseSeconds));
++            }, interval, interval, java.util.concurrent.TimeUnit.SECONDS);
+         }
+         try {
+             return pjp.proceed();
+diff --git a/a/backend-src/com/dcim/security/ClientIp.java b/b/backend-src/com/dcim/security/ClientIp.java
+index 0140ea4..08afc5c 100644
+--- a/a/backend-src/com/dcim/security/ClientIp.java
++++ b/b/backend-src/com/dcim/security/ClientIp.java
+@@ -10,10 +10,14 @@ import org.springframework.stereotype.Component;
+ 
+ @Component
+ public class ClientIp {
+-    private static final String DEFAULT_TRUSTED = "127.0.0.0/8,::1/128,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16";
++    // v3.5.2：默认信任面收敛为「回环 + Docker 默认网桥段」。此前默认包含全部 RFC1918
++    // （10/8、192.168/16），内网客户端直连后端端口时可伪造 X-Forwarded-For 冒充任意来源 IP，
++    // 绕过登录跨 IP 锁定（SE-06）与审计定位。原生部署且网关与后端同处 10/8、192.168/16
++    // 网段时，需在配置中显式声明 dcim.trusted-proxies（见 .env.example 说明）。
++    private static final String DEFAULT_TRUSTED = "127.0.0.0/8,::1/128,172.16.0.0/12";
+     private final List<ClientIp.Net> trusted;
+ 
+-    public ClientIp(@Value("${dcim.trusted-proxies:127.0.0.0/8,::1/128,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}") String trustedProxies) {
++    public ClientIp(@Value("${dcim.trusted-proxies:127.0.0.0/8,::1/128,172.16.0.0/12}") String trustedProxies) {
+         this.trusted = parse(trustedProxies);
+     }
+ 
+@@ -23,15 +27,23 @@ public class ClientIp {
+             String xff = request.getHeader("X-Forwarded-For");
+             if (xff != null && !xff.isBlank()) {
+                 String[] hops = xff.split(",");
++                // v3.5.2：标准算法——从最右一跳向左跳过可信代理，取第一个非可信地址即真实客户端；
++                // 客户端伪造的前缀条目天然被忽略。全链可信时退回最右一跳（最近的直接对端）。
++                String rightmost = null;
+ 
+                 for (int i = hops.length - 1; i >= 0; i--) {
+                     String hop = hops[i].trim();
+                     if (!hop.isEmpty()) {
+-                        return hop;
++                        if (rightmost == null) {
++                            rightmost = hop;
++                        }
++                        if (!this.isTrusted(hop)) {
++                            return hop;
++                        }
+                     }
+                 }
+ 
+-                return remote;
++                return rightmost != null ? rightmost : remote;
+             } else {
+                 return remote;
+             }

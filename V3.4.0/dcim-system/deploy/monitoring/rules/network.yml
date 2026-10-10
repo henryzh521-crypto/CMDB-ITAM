@@ -1,0 +1,28 @@
+# 网络设备与机房设施告警（snmp_exporter 指标）
+groups:
+  - name: network
+    rules:
+      - alert: SnmpCollectFailed
+        expr: up{job="snmp"} == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} SNMP 采集失败"
+          description: "{{ $labels.instance }} SNMP 无响应（团体字 / ACL / 设备故障）。"
+      - alert: InterfaceDown
+        expr: ifOperStatus == 2 and on (instance, ifIndex) ifAdminStatus == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 端口 {{ $labels.ifName }} 状态 Down"
+          description: "管理状态为 Up 但运行状态为 Down，检查线缆 / 光模块 / 对端设备。"
+      - alert: InterfaceErrors
+        expr: rate(ifInErrors[10m]) > 1 or rate(ifOutErrors[10m]) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.asset_name }} 端口 {{ $labels.ifName }} 错包持续增长"
+          description: "可能为光模块老化或线缆质量问题。"

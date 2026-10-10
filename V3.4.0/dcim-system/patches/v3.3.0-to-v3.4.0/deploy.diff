@@ -1,0 +1,583 @@
+diff --git a/pkg/VERSION b/pkg/VERSION
+index 15a2799..1809198 100644
+--- a/pkg/VERSION
++++ b/pkg/VERSION
+@@ -1 +1 @@
+-3.3.0
++3.4.0
+diff --git a/pkg/dcimctl b/pkg/dcimctl
+index 85564ea..b7ad320 100755
+--- a/pkg/dcimctl
++++ b/pkg/dcimctl
+@@ -154,8 +154,9 @@ case "$cmd" in
+         exit $rc ;;
+       reload)
+         "$0" monitoring check || { echo "✗ 配置校验未通过，未执行热加载"; exit 1; }
+-        running dcim-prometheus && docker exec dcim-prometheus wget -qO- --post-data= http://127.0.0.1:9090/-/reload && echo "✓ Prometheus 已热加载"
+-        running dcim-alertmanager && docker exec dcim-alertmanager wget -qO- --post-data= http://127.0.0.1:9093/-/reload && echo "✓ Alertmanager 已热加载"
++        # v3.4：Prometheus 不再开放 /-/reload、/-/quit（--web.enable-lifecycle 已关闭），改为发送 SIGHUP 热加载
++        running dcim-prometheus && docker kill -s HUP dcim-prometheus >/dev/null && echo "✓ Prometheus 已热加载（SIGHUP）"
++        running dcim-alertmanager && docker kill -s HUP dcim-alertmanager >/dev/null && echo "✓ Alertmanager 已热加载（SIGHUP）"
+         running dcim-blackbox && docker restart dcim-blackbox >/dev/null && echo "✓ Blackbox 已重启"
+         true ;;
+       targets)
+diff --git a/pkg/deploy/.env.example b/pkg/deploy/.env.example
+index e3bc697..73715ec 100644
+--- a/pkg/deploy/.env.example
++++ b/pkg/deploy/.env.example
+@@ -7,7 +7,7 @@
+ # ============================================================
+ 
+ # ── 版本 / 镜像 ────────────────────────────────────────────
+-DCIM_VERSION=3.3.0
++DCIM_VERSION=3.4.0
+ # 公共镜像的仓库前缀（Docker Hub 镜像站或内网私有仓库），例：docker.m.daocloud.io / registry.local:5000
+ IMAGE_REGISTRY=docker.m.daocloud.io
+ BACKEND_BASE_IMAGE=docker.m.daocloud.io/library/eclipse-temurin:17-jre
+@@ -73,8 +73,21 @@ STORAGE_TYPE=minio
+ DCIM_METRICS_STORE=tdengine
+ # 操作日志在线保留月数（《网络安全法》/ 等保 2.0 要求不少于 6 个月）
+ AUDIT_RETAIN_MONTHS=6
+-# 接口限流：每客户端 IP 每分钟请求数（0 = 关闭）
+-RATE_LIMIT_PER_MINUTE=600
++# 接口限流（v3.4）：每客户端 IP 每分钟的防洪闸（0 = 关闭全部限流）；
++# 另有按用户的令牌桶：普通接口每用户每秒 20 次（突发 40）、匿名每 IP 每秒 10 次（突发 20）、导出/导入/批量每用户每分钟 10 次
++RATE_LIMIT_PER_MINUTE=3000
++RATE_LIMIT_USER_RPS=20
++RATE_LIMIT_USER_BURST=40
++RATE_LIMIT_ANON_RPS=10
++RATE_LIMIT_ANON_BURST=20
++RATE_LIMIT_HEAVY_PER_MINUTE=10
++# 登录防护（v3.4）：同一账号 15 分钟内跨 IP 失败 30 次即锁定 15 分钟；近 30 天登录成功过的 IP 不受影响；管理员可在「用户管理」解锁
++LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL=30
++LOGIN_ACCOUNT_LOCK_MINUTES=15
++LOGIN_TRUSTED_IP_DAYS=30
++# 数据库连接池（v3.4）：每个后端实例最多 DB_POOL_MAX 条连接；多实例时 实例数 × DB_POOL_MAX 须小于 PostgreSQL max_connections（200）
++DB_POOL_MAX=20
++DB_POOL_TIMEOUT_MS=10000
+ # Webhook 是否允许推送到内网地址（回环/云元数据/本栈容器始终禁止）
+ WEBHOOK_ALLOW_PRIVATE=true
+ # 禁止推送到平台所在容器网段（v3.3，建议保持 true）
+@@ -128,3 +141,7 @@ BE_MEM_LIMIT=1536M
+ PG_MEM_LIMIT=2G
+ PG_SHARED_BUFFERS=512MB
+ PG_EFFECTIVE_CACHE=1536MB
++
++# PostgreSQL / MinIO 容器的 seccomp（v3.4）：默认 seccomp:unconfined 兼容老内核 / 老 Docker（默认 seccomp 曾导致 PostgreSQL 反复崩溃）。
++# 宿主 Docker 较新时建议改为 no-new-privileges:true（即启用 Docker 默认 seccomp 配置），改后观察 dcim-postgres 日志。
++SECCOMP_OPT=seccomp:unconfined
+diff --git a/pkg/deploy/docker-compose.yml b/pkg/deploy/docker-compose.yml
+index be829a5..2ac4bee 100644
+--- a/pkg/deploy/docker-compose.yml
++++ b/pkg/deploy/docker-compose.yml
+@@ -72,7 +72,7 @@ services:
+       retries: 10
+       start_period: 30s
+     security_opt:
+-      - seccomp:unconfined   # 老内核宿主默认 seccomp 会拦部分系统调用导致 PG 反复崩溃
++      - ${SECCOMP_OPT:-seccomp:unconfined}   # 老内核宿主默认 seccomp 会拦部分系统调用导致 PG 反复崩溃
+     shm_size: 256mb
+     restart: unless-stopped
+     deploy:
+@@ -111,7 +111,7 @@ services:
+ 
+   # ─── MinIO（工单附件对象存储，仅内网）───
+   minio:
+-    image: ${MINIO_IMAGE:-docker.1ms.run/bitnamilegacy/minio:latest}
++    image: ${MINIO_IMAGE:-docker.1ms.run/bitnamilegacy/minio:latest}  # v3.4：install.sh 首次拉取后会把它锁定为镜像摘要写入 .env
+     container_name: dcim-minio
+     environment:
+       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?请先设置 MINIO_ACCESS_KEY}
+@@ -120,7 +120,7 @@ services:
+     volumes:
+       - ${DATA_DIR:-../data}/minio-data:/bitnami/minio/data
+     security_opt:
+-      - seccomp:unconfined
++      - ${SECCOMP_OPT:-seccomp:unconfined}
+     healthcheck:
+       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/minio/health/live || mc ready local"]
+       interval: 15s
+@@ -197,7 +197,7 @@ services:
+       dockerfile: deploy/docker/backend.Dockerfile
+       args:
+         BASE_IMAGE: ${BACKEND_BASE_IMAGE:-docker.m.daocloud.io/library/eclipse-temurin:17-jre}
+-    image: dcim-platform-be:${DCIM_VERSION:-3.3.0}
++    image: dcim-platform-be:${DCIM_VERSION:-3.4.0}
+     container_name: dcim-platform-be
+     depends_on:
+       postgres:
+@@ -244,7 +244,20 @@ services:
+       DCIM_ADMIN_INITIAL_PASSWORD: ${DCIM_ADMIN_INITIAL_PASSWORD:-}
+       DCIM_DEV_LOGIN_ENABLED: "false"
+       AUDIT_RETAIN_MONTHS: ${AUDIT_RETAIN_MONTHS:-6}
+-      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-600}
++      # 接口限流（v3.4）：每 IP 每分钟防洪闸（0 = 关闭全部限流）+ 按用户的令牌桶
++      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-3000}
++      RATE_LIMIT_USER_RPS: ${RATE_LIMIT_USER_RPS:-20}
++      RATE_LIMIT_USER_BURST: ${RATE_LIMIT_USER_BURST:-40}
++      RATE_LIMIT_ANON_RPS: ${RATE_LIMIT_ANON_RPS:-10}
++      RATE_LIMIT_ANON_BURST: ${RATE_LIMIT_ANON_BURST:-20}
++      RATE_LIMIT_HEAVY_PER_MINUTE: ${RATE_LIMIT_HEAVY_PER_MINUTE:-10}
++      # 登录防护（v3.4）：账号跨 IP 失败上限 / 锁定分钟 / 可信 IP 天数
++      LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL: ${LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL:-30}
++      LOGIN_ACCOUNT_LOCK_MINUTES: ${LOGIN_ACCOUNT_LOCK_MINUTES:-15}
++      LOGIN_TRUSTED_IP_DAYS: ${LOGIN_TRUSTED_IP_DAYS:-30}
++      # 数据库连接池（v3.4）：多实例时 实例数 × DB_POOL_MAX 须小于 postgres 的 max_connections（200）
++      DB_POOL_MAX: ${DB_POOL_MAX:-20}
++      DB_POOL_TIMEOUT_MS: ${DB_POOL_TIMEOUT_MS:-10000}
+       WEBHOOK_ALLOW_PRIVATE: ${WEBHOOK_ALLOW_PRIVATE:-true}
+       # 禁止 Webhook 推送到平台所在容器网段（防止按 IP 访问 Prometheus/Alertmanager/MinIO 等内部服务）
+       WEBHOOK_BLOCK_LOCAL_SUBNETS: ${WEBHOOK_BLOCK_LOCAL_SUBNETS:-true}
+@@ -273,7 +286,7 @@ services:
+       retries: 5
+       start_period: 90s
+     security_opt:
+-      - seccomp:unconfined
++      - seccomp:unconfined   # 应用容器已启用 no-new-privileges；默认 seccomp 在老 Docker 上会让 Java 线程创建失败
+       - no-new-privileges:true
+     restart: unless-stopped
+     deploy:
+@@ -289,10 +302,10 @@ services:
+       dockerfile: deploy/docker/web.Dockerfile
+       args:
+         BASE_IMAGE: ${WEB_BASE_IMAGE:-docker.m.daocloud.io/library/nginx:1.27-alpine}
+-    image: dcim-platform-web:${DCIM_VERSION:-3.3.0}
++    image: dcim-platform-web:${DCIM_VERSION:-3.4.0}
+     container_name: dcim-platform-web
+     security_opt:
+-      - seccomp:unconfined
++      - seccomp:unconfined   # 应用容器已启用 no-new-privileges；默认 seccomp 在老 Docker 上会让 Java 线程创建失败
+       - no-new-privileges:true
+     healthcheck:
+       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+@@ -314,7 +327,7 @@ services:
+       dockerfile: Dockerfile
+       args:
+         BASE_IMAGE: ${AGENT_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim}
+-    image: dcim-collector-agent:${DCIM_VERSION:-3.3.0}
++    image: dcim-collector-agent:${DCIM_VERSION:-3.4.0}
+     container_name: dcim-collector-agent
+     # 默认随栈启动（.env 中 COMPOSE_PROFILES=collector）；采集器部署在其他管理节点时去掉该值即可
+     profiles: ["collector"]
+@@ -340,7 +353,7 @@ services:
+     image: ${IMAGE_REGISTRY:-docker.m.daocloud.io}/library/caddy:2-alpine
+     container_name: dcim-caddy
+     security_opt:
+-      - seccomp:unconfined
++      - seccomp:unconfined   # 应用容器已启用 no-new-privileges；默认 seccomp 在老 Docker 上会让 Java 线程创建失败
+       - no-new-privileges:true
+     depends_on:
+       platform-be:
+@@ -420,7 +433,8 @@ services:
+       - --storage.tsdb.path=/prometheus
+       - --storage.tsdb.retention.time=${PROM_RETENTION:-30d}
+       - --storage.tsdb.retention.size=${PROM_RETENTION_SIZE:-50GB}
+-      - --web.enable-lifecycle
++      # v3.4：不再开启 --web.enable-lifecycle（任何能访问 9090 的进程都能 POST /-/quit 关停监控）；
++      # 热加载改为 dcimctl monitoring reload 发送 SIGHUP
+       - --web.external-url=${PROM_EXTERNAL_URL:-http://localhost:9090}
+     volumes:
+       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+diff --git a/pkg/deploy/docker/backend-entrypoint.sh b/pkg/deploy/docker/backend-entrypoint.sh
+index 2bffeac..03a854f 100755
+--- a/pkg/deploy/docker/backend-entrypoint.sh
++++ b/pkg/deploy/docker/backend-entrypoint.sh
+@@ -1,9 +1,18 @@
+ #!/bin/sh
+ # 后端启动：瘦包（含 lib/）走 classpath 启动，胖包走 -jar
++# v3.3.1：存在多个 dcim-platform-*.jar 时取版本号最高的一个并告警。
++#   v3.3.0 及以前按文件名取第一个——新安装包解压覆盖到旧目录后，旧的 dcim-platform-3.2.0.jar 排在前面，
++#   实际运行的仍是旧代码（工单 assetNos 不落库等问题“修了却没生效”）。
+ set -e
+ cd /app
+-JAR="$(ls /app/dcim-platform-*.jar 2>/dev/null | head -n1)"
+-[ -n "$JAR" ] || { echo "未找到 /app/dcim-platform-*.jar" >&2; exit 1; }
++JARS="$(ls /app/dcim-platform-*.jar 2>/dev/null | sort -V)"
++[ -n "$JARS" ] || { echo "未找到 /app/dcim-platform-*.jar" >&2; exit 1; }
++JAR="$(echo "$JARS" | tail -n1)"
++if [ "$(echo "$JARS" | wc -l)" -gt 1 ]; then
++  echo "! 发现多个后端 jar，使用版本最高的 $(basename "$JAR")；请从 artifacts/backend/ 移除其余旧包：" >&2
++  echo "$JARS" | sed '$d' | sed 's|^|    |' >&2
++fi
++echo "启动后端：$(basename "$JAR")"
+ if [ -d /app/lib ]; then
+   exec java $JAVA_OPTS -cp "$JAR:/app/lib/*" com.dcim.PlatformApplication "$@"
+ else
+diff --git a/pkg/deploy/native/platform.env.template b/pkg/deploy/native/platform.env.template
+index 677efbb..8aff3ab 100644
+--- a/pkg/deploy/native/platform.env.template
++++ b/pkg/deploy/native/platform.env.template
+@@ -19,7 +19,16 @@ UPLOAD_DIR=@UPLOAD_DIR@
+ # GPU 指标：memory（单机内存环形缓冲）/ tdengine（需补充 TDENGINE_URL/USERNAME/PASSWORD）
+ DCIM_METRICS_STORE=memory
+ AUDIT_RETAIN_MONTHS=6
+-RATE_LIMIT_PER_MINUTE=600
++RATE_LIMIT_PER_MINUTE=3000
++RATE_LIMIT_USER_RPS=20
++RATE_LIMIT_USER_BURST=40
++RATE_LIMIT_HEAVY_PER_MINUTE=10
++LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL=30
++LOGIN_ACCOUNT_LOCK_MINUTES=15
++LOGIN_TRUSTED_IP_DAYS=30
++# 数据库连接池（v3.4）：每实例连接上限 / 借连接最长等待（毫秒，超时返回 503）
++DB_POOL_MAX=20
++DB_POOL_TIMEOUT_MS=10000
+ # Webhook：原生部署时本机网段常与企业 OA 同网段，默认不封；如需封禁本机网段改为 true
+ WEBHOOK_BLOCK_LOCAL_SUBNETS=false
+ # 仅信任本机 nginx 传来的 X-Forwarded-For
+diff --git a/pkg/deploy/native/run-backend.sh b/pkg/deploy/native/run-backend.sh
+index 32109fe..b91369c 100755
+--- a/pkg/deploy/native/run-backend.sh
++++ b/pkg/deploy/native/run-backend.sh
+@@ -1,9 +1,17 @@
+ #!/bin/sh
+ # 原生模式后端启动脚本（systemd ExecStart 调用；也可手工前台运行）
++# v3.3.1：存在多个 dcim-platform-*.jar 时取版本号最高的一个并告警（以前按文件名取第一个，会误用旧包）
+ set -e
+ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ A="$ROOT/artifacts/backend"
+-JAR="$(ls "$A"/dcim-platform-*.jar | head -n1)"
++JARS="$(ls "$A"/dcim-platform-*.jar 2>/dev/null | sort -V)"
++[ -n "$JARS" ] || { echo "未找到 $A/dcim-platform-*.jar" >&2; exit 1; }
++JAR="$(echo "$JARS" | tail -n1)"
++if [ "$(echo "$JARS" | wc -l)" -gt 1 ]; then
++  echo "! 发现多个后端 jar，使用版本最高的 $(basename "$JAR")；请移除其余旧包：" >&2
++  echo "$JARS" | sed '$d' | sed 's|^|    |' >&2
++fi
++echo "启动后端：$(basename "$JAR")"
+ if [ -d "$A/lib" ]; then
+   exec java $JAVA_OPTS -cp "$JAR:$A/lib/*" com.dcim.PlatformApplication "$@"
+ else
+diff --git a/pkg/docs/TEST-REPORT-3.4.md b/pkg/docs/TEST-REPORT-3.4.md
+new file mode 100644
+index 0000000..92380d3
+--- /dev/null
++++ b/pkg/docs/TEST-REPORT-3.4.md
+@@ -0,0 +1,131 @@
++# v3.4.0 回归测试报告
++
++- 时间：2026-10-07 12:16:03（安装包检查于 2026-10-07 12:20:24 对最终 zip 解压目录运行）
++- 被测：混合打包后端 dcim-platform-3.4.0.jar（与安装包内 jar 的 SHA-256 一致），双实例共用 PostgreSQL 16 + Redis；前端为安装包内构建产物；库内 100,102 台资产
++- 结果：通过 80 · 失败 0 · 错误 0 · 跳过 0
++- 复跑：见 tests/README.md
++
++## 冒烟（smoke）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| SM-01 | 健康检查返回 up 且报告后端版本 | P0 | ✅ 通过 | 版本 3.4.0 |
++| SM-02 | 匿名访问健康检查不返回 JVM / 连接池明细 | P1 | ✅ 通过 |  |
++| SM-03 | 管理员能登录并取得当前用户、模块、操作与字段权限 | P0 | ✅ 通过 |  |
++| SM-04 | OpenAPI 中全部无路径参数的 GET 接口不返回 5xx | P0 | ✅ 通过 | 112 个接口；依赖未配置而降级 1 个：/api/monitoring/rules（未配置 Prometheus 地址（监控设置 / dcim.） |
++| SM-05 | 未登录访问业务接口返回 401 | P0 | ✅ 通过 |  |
++
++## 接口契约（contract）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| CT-01 | OpenAPI 文档结构有效、版本与后端一致、operationId 不重复 | P1 | ✅ 通过 | 345 个操作 |
++| CT-02 | 写接口都声明了所需权限（x-permission），例外须在白名单 | P0 | ✅ 通过 | 白名单内 18 个 |
++| CT-03 | 工单建单入参别名都在文档中声明（relatedAssets 的 x-aliases） | P1 | ✅ 通过 |  |
++| CT-04 | 统一响应结构 {code, msg, data}：成功 code=0，失败 code=HTTP 状态 | P0 | ✅ 通过 |  |
++| CT-05 | 缺必填字段返回 400 且提示字段 | P1 | ✅ 通过 |  |
++| CT-06 | 工单关联资产：11 种常见写法全部落库（assetNos 回归） | P0 | ✅ 通过 |  |
++| CT-07 | 认不出的资产字段返回 400，不静默丢弃 | P0 | ✅ 通过 |  |
++| CT-08 | PUT 更新工单可整体替换关联资产；已关闭工单返回 409 | P1 | ✅ 通过 |  |
++| CT-09 | 删除工单最后一条资产行后 relatedAssets 清空 | P1 | ✅ 通过 |  |
++| CT-10 | 唯一键冲突返回 409 并指出字段 | P1 | ✅ 通过 |  |
++
++## 权限矩阵（permission）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| PM-01 | 只读角色：可查资产、不能新建资产 | P0 | ✅ 通过 |  |
++| PM-02 | 未授予模块：访问工单返回 403 | P0 | ✅ 通过 |  |
++| PA-01 | 未授予删除：删除 / 批量删除资产返回 403 并说明原因 | P0 | ✅ 通过 |  |
++| PA-02 | 显式授予删除：可删除待上架资产；/auth/me 的 actions 同步 | P0 | ✅ 通过 |  |
++| PA-03 | 导出被禁止：资产导出、工单导出都返回 403 | P1 | ✅ 通过 |  |
++| PS-01 | 工单 SELF：列表只含本人相关，他人工单详情 404 | P0 | ✅ 通过 |  |
++| PS-02 | 工单 DEPT：可见同部门同事的工单，不可见其他部门 | P1 | ✅ 通过 |  |
++| PS-03 | 资产 SELF：按编号导出也不能拿到他人资产（v3.3 绕过修复） | P0 | ✅ 通过 |  |
++| PF-01 | 读：列表、详情、子资产、变更记录剔除隐藏字段，并声明 X-Field-Hidden | P0 | ✅ 通过 |  |
++| PF-02 | 写：原样回传只读字段可保存；改动只读或隐藏字段返回 403；新建带隐藏字段 403 | P0 | ✅ 通过 |  |
++| PF-03 | 写：批量修改与状态流转里出现受限字段返回 403 | P1 | ✅ 通过 |  |
++| PF-04 | 导出不含隐藏列 | P0 | ✅ 通过 |  |
++| PF-05 | 搜索：不能用隐藏的 SN / 管理 IP 反查资产；不能按隐藏字段筛选 | P0 | ✅ 通过 |  |
++| PF-06 | 有字段限制的角色不能批量导入 | P1 | ✅ 通过 |  |
++| PF-07 | 工单：费用与附件隐藏；改只读的描述 / 关联资产返回 403 | P0 | ✅ 通过 |  |
++| PF-08 | 多角色合并：另一个角色未隐藏 SN，则 SN 可见（取最宽） | P1 | ✅ 通过 |  |
++| PF-09 | 管理员不受字段规则约束 | P1 | ✅ 通过 |  |
++| PF-10 | 角色保存：未知字段 / 未支持模块返回 400 | P2 | ✅ 通过 |  |
++| PC-01 | 非管理员不能把自己没有的删除权限授出去（新建角色 / 分配已有角色） | P0 | ✅ 通过 |  |
++| PC-02 | 非管理员不能授出比自己宽的数据范围或更松的字段规则 | P0 | ✅ 通过 |  |
++
++## 安全回归（security）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| SE-01 | 系统管理写权限用户不能给自己授予管理员、不能重置 / 停用 admin | P0 | ✅ 通过 |  |
++| SE-02 | 退出登录后旧 access token 立即失效 | P0 | ✅ 通过 |  |
++| SE-03 | 改密后该账号所有旧 access token 失效 | P0 | ✅ 通过 |  |
++| SE-04 | 同一 refresh token 16 路并发只能换发一次 | P0 | ✅ 通过 |  |
++| SE-05 | 登录耗时不暴露用户名是否存在 | P1 | ✅ 通过 | 存在 94 ms / 不存在 93 ms |
++| SE-06 | 账号跨 IP 失败 30 次即锁定：新 IP 被拒、可信 IP 不受影响、管理员可解锁 | P0 | ✅ 通过 |  |
++| SE-07 | 接口限流：同一用户瞬时请求超出突发上限返回 429 + Retry-After，稍后恢复 | P1 | ✅ 通过 | 75/120 被限流 |
++| SE-08 | 重操作限流：同一用户每分钟导出超过 10 次返回 429 | P2 | ✅ 通过 |  |
++| SE-09 | 审计：新建类操作记录对象号，返回值能序列化 | P1 | ✅ 通过 |  |
++| SE-10 | Webhook 不能指向平台内部的监控栈 | P0 | ✅ 通过 |  |
++
++## 并发正确性（concurrency）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| CC-01 | 8 路并发录入同一 SN：1 个成功，其余 409，无 500 | P0 | ✅ 通过 |  |
++| CC-02 | 同一版本号并发修改资产：只有 1 个成功，其余 409 | P0 | ✅ 通过 |  |
++| CC-03 | 8 路并发流转同一工单：只有 1 个成功，无 500 | P1 | ✅ 通过 |  |
++| CC-04 | 8 路并发给同一工单添加同一资产：只建 1 行 | P1 | ✅ 通过 |  |
++| CC-05 | 40 路并发建单（超过连接池默认 20）：全部成功且工单号不重复 | P0 | ✅ 通过 |  |
++| CC-06 | 有 Webhook 订阅时 30 路并发建单：全部成功，每张工单恰好一条投递记录 | P0 | ✅ 通过 | 30 条投递记录与 30 张工单一一对应 |
++
++## 性能基线（performance）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| PERF-01 | 资产列表第 1 页 p50 ≤ 60 ms | P1 | ✅ 通过 | p50 18 ms / p90 23 ms（预算 60 ms） |
++| PERF-02 | 资产列表深分页（第 4000 页） p50 ≤ 100 ms | P1 | ✅ 通过 | p50 38 ms / p90 40 ms（预算 100 ms） |
++| PERF-03 | 资产关键字搜索 p50 ≤ 80 ms | P1 | ✅ 通过 | p50 25 ms / p90 26 ms（预算 80 ms） |
++| PERF-04 | 全局搜索（IP 片段） p50 ≤ 120 ms | P1 | ✅ 通过 | p50 50 ms / p90 66 ms（预算 120 ms） |
++| PERF-05 | 工单列表 p50 ≤ 60 ms | P1 | ✅ 通过 | p50 15 ms / p90 19 ms（预算 60 ms） |
++| PERF-06 | 运营总览（缓存） p50 ≤ 60 ms | P1 | ✅ 通过 | p50 7 ms / p90 10 ms（预算 60 ms） |
++| PERF-07 | 容量-机房（缓存） p50 ≤ 60 ms | P1 | ✅ 通过 | p50 8 ms / p90 9 ms（预算 60 ms） |
++| PERF-08 | 监控总览 p50 ≤ 120 ms | P1 | ✅ 通过 | p50 53 ms / p90 57 ms（预算 120 ms） |
++| PERF-20 | 资产列表 20 路并发（10 个用户）吞吐 ≥ 80 req/s、无错误 | P1 | ✅ 通过 | 157 req/s |
++
++## 浏览器端到端（e2e）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| UI-01 | 管理员登录后运营总览渲染，无 5xx、无脚本错误 | P0 | ✅ 通过 |  |
++| UI-02 | 通过界面创建带关联资产的工单，后端行项目正确落库 | P0 | ✅ 通过 |  |
++| UI-03 | 字段受限用户：资产列表不显示隐藏列，没有删除 / 导入按钮 | P0 | ✅ 通过 |  |
++| UI-04 | 角色编辑页可配置字段权限并保存 | P1 | ✅ 通过 |  |
++| UI-05 | 接口文档页可浏览，关于对话框显示前后端版本一致 | P2 | ✅ 通过 |  |
++| UI-06 | 暗色模式刷新后保持 | P2 | ✅ 通过 |  |
++
++## 多实例一致性（cluster）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| CL-01 | 两个实例运行同一版本 | P0 | ✅ 通过 |  |
++| CL-02 | 在实例 A 退出登录，实例 B 立即拒绝旧令牌 | P0 | ✅ 通过 |  |
++| CL-03 | 管理员在实例 A 停用账号，该账号在实例 B 的会话立即失效 | P0 | ✅ 通过 |  |
++| CL-04 | 登录失败计数跨实例累计：A、B 各失败 15 次后账号锁定 | P0 | ✅ 通过 |  |
++| CL-05 | 同一用户的限流额度跨实例共享 | P1 | ✅ 通过 | 放行 46/120，用时 0.3 秒 |
++| CL-06 | 定时任务每周期只在一个实例上执行（job_lock.run_count） | P0 | ✅ 通过 | 185 秒内执行次数 {'SlaEscalationService.scheduledRun': 3, 'InspectionScheduler.tick': 3} |
++
++## 安装包检查（deploy）
++
++| 编号 | 用例 | 级别 | 结果 | 说明 |
++|---|---|---|---|---|
++| DP-01 | 全部 shell 脚本语法正确 | P0 | ✅ 通过 | 11 个脚本 |
++| DP-02 | docker-compose.yml 在两种 seccomp 设置下都能通过校验 | P0 | ✅ 通过 |  |
++| DP-03 | 安装包里没有 .env、私钥、数据目录 | P0 | ✅ 通过 |  |
++| DP-04 | 没有全局可写文件，脚本可执行 | P1 | ✅ 通过 |  |
++| DP-05 | 版本号一致：VERSION、后端包名、.env.example、compose 默认值 | P0 | ✅ 通过 | v3.4.0 |
++| DP-06 | 已发布的数据库迁移未被改动（与登记的校验和一致） | P0 | ✅ 通过 | 已登记 45 个，当前 45 个 |
++| DP-07 | 启动脚本在新旧 jar 并存时选版本最高的 | P0 | ✅ 通过 |  |
++| DP-08 | Prometheus 未开启远程生命周期接口，热加载用 SIGHUP | P1 | ✅ 通过 |  |
+diff --git a/pkg/docs/UPGRADE-3.4.md b/pkg/docs/UPGRADE-3.4.md
+new file mode 100644
+index 0000000..f65d1c1
+--- /dev/null
++++ b/pkg/docs/UPGRADE-3.4.md
+@@ -0,0 +1,112 @@
++# 智算资产管理平台 v3.4.0 升级说明
++
++v3.4.0 以**权限模型补齐、平台防护、多实例部署和测试体系**为主。可从 v3.2.x / v3.3.x 直接升级。
++全部改动经 `tests/` 下 80 个自动化用例（9 个套件）在 10 万资产、双实例环境上回归通过。
++
++> 从 v3.2.0 升级的，请先阅读 `docs/UPGRADE-3.3.md` 第一节（v3.2.0 安装包密钥外泄与轮换）。
++
++---
++
++## 一、⚠ 升级前必读：删除权限复位
++
++v3.3 及以前，后端写死「只有管理员能删除」，角色权限矩阵里给非管理员勾选的「删除」**从未生效**。
++v3.4 起「删除」改为按角色显式授予，勾选即生效。为了不在升级的瞬间放大权限，迁移 V45 会：
++
++1. 把所有非 ADMIN 角色上已勾选的「删除」复位为不允许；
++2. 在操作日志里写一条 `RESET_DELETE_PERM` 记录，列出受影响的「角色:模块」。
++
++升级后请管理员在「系统管理 → 操作日志」按动作 `RESET_DELETE_PERM` 查看名单，到「角色管理 → 编辑 → 删除」列按需重新授予。
++在此之前，非管理员的使用体验与 v3.3 相同（不能删除）。
++
++---
++
++## 二、升级步骤
++
++### Docker 部署
++
++```bash
++# 在旧安装目录
++./dcimctl backup                                 # 先手工备份一次
++./dcimctl upgrade /path/to/dcim-system-3.4.0     # 复制 .env/证书 → 自动备份 → 构建 → 启动
++```
++
++- 首次启动执行数据库迁移 V45（秒级）。
++- `.env` 会被沿用；新增配置项都有默认值，不改也能运行（见第四节）。
++- 安装程序会把 `artifacts/backend/` 中残留的旧版 jar 移到 `artifacts/stale-jars-<时间>/`，避免「覆盖解压后仍跑旧包」（v3.3.1 的根因）。
++
++### 原生部署（systemd）
++
++替换 `artifacts/` 后执行 `./install.sh --native`。启动脚本会在多个 jar 并存时选择**版本号最高**的一个。
++如 `/etc/dcim/platform.env` 是自行维护的，可参照 `deploy/native/platform.env.template` 补上第四节的新配置项（不补则用默认值）。
++
++### 升级后自检
++
++```bash
++ADMIN_PW='<admin口令>' EXPECT_VERSION=3.4.0 python3 tests/run_all.py -s smoke
++```
++
++5 项全部通过即说明运行的是 3.4.0、接口无 5xx、登录与权限链路正常。界面右上角「关于本系统」也会显示前后端版本，不一致时会标红。
++
++### 回滚
++
++V45 只新增一列、复位删除勾选、替换一个视图（列与语义不变），v3.3 后端可在 V45 之后的库上继续运行
++（Flyway 默认忽略「未来版本」的迁移）。回滚时换回旧目录即可；复位掉的删除勾选在 v3.3 本来就不生效，无需恢复。
++
++---
++
++## 三、行为变化（请通知用户）
++
++| 变化 | 说明 |
++|---|---|
++| 删除改为显式授予 | 见第一节。删除按钮只对有删除权限的用户显示 |
++| 工单导出需要「导出」权限 | v3.3 工单导出只校验读权限；现在与资产导出一致，角色未勾选「导出」时返回 403 |
++| 接口限流 | 每个登录用户每秒 20 次（突发 40）、匿名每 IP 每秒 10 次（突发 20）、导出 / 导入 / 批量操作每用户每分钟 10 次；超出返回 429 和 `Retry-After`。每 IP 的总闸由每分钟 600 次放宽到 3000 次，NAT 后的多人不再互相挤占 |
++| 账号锁定 | 同一账号 15 分钟内跨 IP 累计失败 30 次即锁定 15 分钟（防分布式撞库）；近 30 天在某 IP 登录成功过的，从该 IP 登录不受影响。管理员可在「用户管理」看到「锁定」标记并一键解锁 |
++| 字段级权限（新） | 角色可对资产、工单的字段设置「隐藏」或「只读」。隐藏字段不出现在列表、详情、导出、搜索结果中，也不能用于筛选；改动受限字段返回 403。有字段限制的用户不能批量导入。现有角色没有字段规则，升级后行为不变 |
++| 多角色合并 | 字段取最宽：任一角色可见即可见；数据范围同样取最宽 |
++| 授权上限扩展 | 非管理员授权时，除模块读写外，删除权限、数据范围、字段规则也不能超过自己 |
++| 连接池耗尽 | 返回 503 + `Retry-After`，不再返回 500；每实例连接池默认 20 条（原为 10） |
++| Webhook | 投递记录与业务数据在同一事务提交：业务回滚则不投递，进程崩溃也不丢事件。新建 / 启用的 Webhook 在其他实例上最迟 5 秒生效 |
++| 分类树 | 有资产或物料读权限即可读取分类树（v3.3 需要「分类」模块权限，导致资产页下拉为空） |
++| 运营总览 | 没有报表权限的用户看到提示页，不再连续弹出 403 |
++
++---
++
++## 四、新增配置项（均有默认值）
++
++| 配置项 | 默认 | 说明 |
++|---|---|---|
++| `RATE_LIMIT_PER_MINUTE` | 3000 | 每 IP 每分钟总闸；0 = 关闭全部限流 |
++| `RATE_LIMIT_USER_RPS` / `RATE_LIMIT_USER_BURST` | 20 / 40 | 每用户令牌桶 |
++| `RATE_LIMIT_ANON_RPS` / `RATE_LIMIT_ANON_BURST` | 10 / 20 | 未登录请求按 IP 的令牌桶 |
++| `RATE_LIMIT_HEAVY_PER_MINUTE` | 10 | 导出 / 导入 / 模板 / 批量操作 |
++| `LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL` | 30 | 跨 IP 失败多少次锁定账号 |
++| `LOGIN_ACCOUNT_LOCK_MINUTES` | 15 | 锁定时长 |
++| `LOGIN_TRUSTED_IP_DAYS` | 30 | 登录成功的 IP 被信任多少天 |
++| `DB_POOL_MAX` | 20 | 每实例数据库连接上限；多实例时 实例数 × 该值 须小于 PostgreSQL `max_connections`（编排为 200） |
++| `DB_POOL_TIMEOUT_MS` | 10000 | 借连接最长等待，超时返回 503 |
++| `SECCOMP_OPT` | `seccomp:unconfined` | 仅作用于 postgres、minio 容器；宿主 Docker 较新时建议改为 `no-new-privileges:true` 以启用默认 seccomp |
++
++限流与登录计数都存放在 Redis，多实例之间共享；未配置 Redis 时退化为单实例内存计数。
++
++---
++
++## 五、新增与改进
++
++- **字段级权限**：角色编辑页新增「字段权限」区，按模块选择隐藏 / 只读字段；后端在统一入口与出口执行（响应剔除并声明 `X-Field-Hidden` 头、请求体比对现值、导出列过滤、搜索谓词排除）
++- **接口文档**：登录后访问「接口文档」页面或 `/api/openapi.json`（OpenAPI 3.0，运行时生成），每个接口标注所需权限、字段策略和入参别名；文档不对匿名开放
++- **关于本系统**：右上角菜单显示前端与后端版本、构建日期，不一致时提示
++- **角色列表搜索**：按编码 / 名称搜索，不区分大小写
++- **用户管理**：显示账号锁定状态与剩余时间，可解锁
++- **多实例部署**：定时任务锁持有到周期的 90%，跨实例的时钟偏差与执行耗时不再导致同一周期重复执行；`job_lock.run_count` 记录执行次数便于核对
++- **性能**：容量页功率聚合改写（10 万资产下约快 25~30%）并缓存 30 秒；审计记录补齐对象号
++- **部署加固**：Prometheus 关闭远程生命周期接口（`--web.enable-lifecycle` 可被未授权调用关停），`./dcimctl monitoring reload` 改用 SIGHUP 热加载；仍使用 `latest` 标签的 MinIO 镜像在安装时锁定为已拉取的摘要，避免日后重建时悄悄换版本
++
++---
++
++## 六、源码、补丁与测试
++
++- `source/backend/`：完整后端源码（v3.4.0），见其中 README
++- `patches/v3.3.0-to-v3.4.0/`：相对 v3.3.0 的补丁（后端 / 前端 / 部署 / 测试），含 v3.3.1 热补丁内容
++- 交付 jar 继续采用「混合打包」：未改动的类保持原始字节码，只有受改动影响的类重新编译
++- `tests/`：新的回归测试套件，用法见 `tests/README.md`。v3.3 的零散脚本（sec_tests.py、perf_tests.py、crawl.py、ui_check.py）已被其完全覆盖并移除
+diff --git a/pkg/install.sh b/pkg/install.sh
+index 051fa4a..6fdd885 100755
+--- a/pkg/install.sh
++++ b/pkg/install.sh
+@@ -22,7 +22,7 @@ set -euo pipefail
+ 
+ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ cd "$ROOT"
+-VERSION="$(cat VERSION 2>/dev/null || echo 3.3.0)"
++VERSION="$(cat VERSION 2>/dev/null || echo 3.4.0)"
+ 
+ MODE=docker
+ UPGRADE_FROM=""
+@@ -93,6 +93,18 @@ preflight_common() {
+   [ -f "artifacts/backend/dcim-platform-${VERSION}.jar" ] || ls artifacts/backend/dcim-platform-*.jar >/dev/null 2>&1 \
+     || die "未找到后端产物 artifacts/backend/（请使用完整安装包，或先执行 ./build.sh）"
+   [ -f artifacts/web/dist/index.html ] || die "未找到前端产物 artifacts/web/dist（请使用完整安装包，或先执行 ./build.sh）"
++  # v3.4：新包解压覆盖到旧目录时会残留旧版后端 jar（v3.3.0 的启动脚本会误用它），移到备份目录
++  if [ -f "artifacts/backend/dcim-platform-${VERSION}.jar" ]; then
++    local j stale=()
++    for j in artifacts/backend/dcim-platform-*.jar; do
++      [ "$(basename "$j")" = "dcim-platform-${VERSION}.jar" ] || stale+=("$j")
++    done
++    if [ ${#stale[@]} -gt 0 ]; then
++      local sd; sd="artifacts/stale-jars-$(date +%Y%m%d%H%M%S)"
++      mkdir -p "$sd" && mv "${stale[@]}" "$sd/"
++      c_ylw "! 已把残留的旧版后端包移出 artifacts/backend/：${stale[*]##*/}"
++    fi
++  fi
+   local mem_kb disk_kb
+   mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+   [ "$mem_kb" -ge 3800000 ] || c_ylw "! 内存约 $((mem_kb/1024)) MB，建议 ≥ 4 GB（推荐 8 GB）"
+@@ -205,7 +217,7 @@ prepare_env() {
+   set_env HTTPS_PORT "$HTTPS_PORT"
+   # v3.3：容器部署默认禁止 Webhook 推送到平台自身所在的容器网段
+   [ -n "$(get_env WEBHOOK_BLOCK_LOCAL_SUBNETS)" ] || set_env WEBHOOK_BLOCK_LOCAL_SUBNETS true
+-  if [[ "$(get_env DCIM_ADMIN_INITIAL_PASSWORD)" =~ $DCIM_WEAK_ADMIN_PW_RE ]]; then
++  if weak_admin_pw "$(get_env DCIM_ADMIN_INITIAL_PASSWORD)"; then
+     c_ylw "! DCIM_ADMIN_INITIAL_PASSWORD 为常见弱口令，已替换为随机口令（仅首次建库生效）"
+     set_env DCIM_ADMIN_INITIAL_PASSWORD "Dc$(rand_pw 14)#9"
+   fi
+@@ -245,6 +257,11 @@ prepare_env() {
+     # 未启用内置监控栈：清空默认地址（对接已有 Prometheus 时在 .env 或「监控设置」中填写）
+     set_env PROMETHEUS_URL ""
+   fi
++  # v3.4：v3.3 及以前默认「每 IP 每分钟 600 次」，多人共用出口 IP 时容易误拦；仍是旧默认值的改为新的防洪闸默认值
++  if [ "$(get_env RATE_LIMIT_PER_MINUTE)" = "600" ]; then
++    set_env RATE_LIMIT_PER_MINUTE 3000
++    c_ylw "! RATE_LIMIT_PER_MINUTE 由旧默认 600 调整为 3000（v3.4 起另有按用户的限流）"
++  fi
+   chmod 600 "$ENV_FILE"
+   grep -qE "^[A-Z_]+=CHANGEME" "$ENV_FILE" && die "deploy/.env 仍有 CHANGEME 占位值，请补全后重试"
+   [ "$(get_env DCIM_ALLOW_LEAKED_SECRETS)" = true ] || check_leaked_secrets
+@@ -370,9 +387,24 @@ SH
+     sleep 4
+     [ "$i" = 90 ] && { "${DC[@]}" ps; die "后端 6 分钟内未就绪，请执行 ./dcimctl logs platform-be 查看原因"; }
+   done
++  pin_floating_images
+   "${DC[@]}" ps
+ }
+ 
++# v3.4：把仍用 latest 标签的镜像锁定为当前已拉取的摘要，避免日后重建时悄悄换版本（目前只有 MinIO）
++pin_floating_images() {
++  local cur ref digest
++  cur="$(get_env MINIO_IMAGE)"
++  ref="${cur:-docker.1ms.run/bitnamilegacy/minio:latest}"
++  case "$ref" in *@sha256:*) return 0 ;; esac
++  case "$ref" in *:latest|*/minio) ;; *) return 0 ;; esac
++  digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null | head -n1)"
++  if [ -n "$digest" ]; then
++    set_env MINIO_IMAGE "$digest"
++    c_grn "✓ MinIO 镜像已锁定为当前版本：$digest"
++  fi
++}
++
+ summary_docker() {
+   local host pw
+   host="$(detect_host)"

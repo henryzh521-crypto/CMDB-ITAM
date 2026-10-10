@@ -1,0 +1,1745 @@
+diff --git a/backend-resources/application.yml b/backend-resources/application.yml
+index db17249..e738695 100644
+--- a/backend-resources/application.yml
++++ b/backend-resources/application.yml
+@@ -223,6 +223,25 @@ dcim:
+   gpu:
+     # 健康度评分调度间隔（毫秒，默认 1h）
+     score-fixed-delay-ms: ${GPU_SCORE_DELAY_MS:3600000}
++  # 实时推送 SSE（v3.5）：站内信按用户推送、领域事件按频道广播。
++  # enabled=false 时端点返回 503，前端自动降级 30s 轮询（回到 3.4 行为）。
++  # 心跳为自建守护线程（不走 @Scheduled，避免被集群锁拦成单实例心跳）。
++  sse:
++    enabled: ${SSE_ENABLED:true}
++    # 每实例最大并发连接（防 fd / 内存耗尽，超限 503 触发前端降级轮询）
++    max-connections-per-instance: ${SSE_MAX_CONNECTIONS:200}
++    # 心跳间隔毫秒（注释帧 :ping 维持中间层不掐空闲连接）
++    heartbeat-ms: ${SSE_HEARTBEAT_MS:25000}
++  # 联动闭环（v3.5）
++  linkage:
++    # 盘点完成存在差异 → 自动生成「盘点差异」工单（与完成同事务，建单失败则整体回滚）
++    inventory-diff-ticket:
++      enabled: ${INVENTORY_DIFF_TICKET_ENABLED:true}
++    # 低库存联动：off=仅原有 webhook 事件 / notify=站内信通知仓库管理员 / ticket=通知并自动创建补货工单
++    low-stock:
++      mode: ${LOW_STOCK_MODE:notify}
++      # ticket 模式创建的工单类型（须存在于 workflow_config）
++      wo-type: ${LOW_STOCK_WO_TYPE:补货}
+ 
+ # 企微扫码登录（默认关闭：不装配 HttpWecomApiClient、不外呼）
+ # 开启后 /api/auth/wecom/login 走真实企微 OAuth，dev-login 强制 403（安全红线）
+diff --git a/backend-resources/db/migration/V46__v35_linkage_sse.sql b/backend-resources/db/migration/V46__v35_linkage_sse.sql
+new file mode 100644
+index 0000000..8ca40fd
+--- /dev/null
++++ b/backend-resources/db/migration/V46__v35_linkage_sse.sql
+@@ -0,0 +1,17 @@
++-- ============================================================
++-- V46__v35_linkage_sse.sql — v3.5 联动工单类型
++--   1. workflow_config 注册两个免审联动工单类型：
++--      - 盘点差异：InventoryDiffTicketService 在盘点完成且存在差异时
++--        自动创建（与完成同事务，差异明细附在描述里）
++--      - 补货：LowStockService ticket 模式在库存低于安全线时
++--        自动创建（建议量 = 安全库存 - 当前库存，幂等防重）
++--   2. notification (username, read_flag) 索引已由 V6 idx_notification_user
++--      覆盖（SSE「我的未读数」与通知列表同一查询模式），无需新增
++--   3. 不建新表：差异工单 / 补货工单复用 workorder，联动配置走 yml
++-- 全部幂等（ON CONFLICT DO NOTHING）
++-- ============================================================
++
++INSERT INTO workflow_config (wo_type, need_approval, approval_roles, built_in) VALUES
++  ('盘点差异', FALSE, '[]', TRUE),
++  ('补货',     FALSE, '[]', TRUE)
++ON CONFLICT (wo_type) DO NOTHING;
+diff --git a/backend-resources/dcim-build.properties b/backend-resources/dcim-build.properties
+index 85b85ad..8e66e5e 100644
+--- a/backend-resources/dcim-build.properties
++++ b/backend-resources/dcim-build.properties
+@@ -1,3 +1,3 @@
+ # 后端构建信息（/api/healthz 与启动日志展示）
+-version=3.4.0
+-built=2026-10-07
++version=3.5.0
++built=2026-10-10
+diff --git a/backend-src/com/dcim/asset/controller/AssetController.java b/backend-src/com/dcim/asset/controller/AssetController.java
+index 64b9c0a..9211165 100644
+--- a/backend-src/com/dcim/asset/controller/AssetController.java
++++ b/backend-src/com/dcim/asset/controller/AssetController.java
+@@ -181,8 +181,31 @@ public class AssetController {
+         @RequestParam(required = false) String parentAssetNo
+     ) {
+         Page<AssetEntity> p = new Page(page, size);
+-        this.assetMapper.selectPage(p, this.buildListWrapper(keyword, statusBiz, categoryCode, regionCode, roomCode, parentAssetNo));
+-        return ApiResult.ok(PageResult.of(p, this::toRow));
++        LambdaQueryWrapper<AssetEntity> qw = this.buildListWrapper(keyword, statusBiz, categoryCode, regionCode, roomCode, parentAssetNo);
++        if ((page - 1L) * size >= 500L) {
++            // 深分页（offset ≥ 500）：直接 OFFSET 需要对跳过的每一行回表（10 万行级表第 4000 页实测 54ms）。
++            // 先只取排序列上的主键——命中 (created_at, asset_no) WHERE deleted_at IS NULL 部分索引的
++            // index-only scan（免回表，实测 ~12ms），再按主键批量取整行并还原排序。
++            Page<AssetEntity> keyPage = new Page(page, size);
++            this.assetMapper.selectPage(keyPage, qw.select(AssetEntity::getAssetNo));
++            List<String> nos = keyPage.getRecords().stream().map(AssetEntity::getAssetNo).toList();
++            List<AssetEntity> rows;
++            if (nos.isEmpty()) {
++                rows = List.of();
++            } else {
++                Map<String, AssetEntity> byNo = new java.util.HashMap<>();
++                for (AssetEntity e : this.assetMapper.selectList(Wrappers.<AssetEntity>lambdaQuery().in(AssetEntity::getAssetNo, nos))) {
++                    byNo.put(e.getAssetNo(), e);
++                }
++                rows = nos.stream().map(byNo::get).filter(e -> e != null).toList();
++            }
++            Page<AssetEntity> rp = new Page(page, size, keyPage.getTotal());
++            rp.setRecords(rows);
++            return ApiResult.ok(PageResult.of(rp, this::toRow));
++        } else {
++            this.assetMapper.selectPage(p, qw);
++            return ApiResult.ok(PageResult.of(p, this::toRow));
++        }
+     }
+ 
+     @GetMapping({"/{assetNo}"})
+diff --git a/backend-src/com/dcim/ci/controller/CiRelationController.java b/backend-src/com/dcim/ci/controller/CiRelationController.java
+index 3eeb457..f02b4f6 100644
+--- a/backend-src/com/dcim/ci/controller/CiRelationController.java
++++ b/backend-src/com/dcim/ci/controller/CiRelationController.java
+@@ -147,6 +147,21 @@ public class CiRelationController {
+         }
+     }
+ 
++    /** v3.5：全量拓扑（网络拓扑页；roomCode 可选，过滤单机房） */
++    @GetMapping({"/graph"})
++    @RequirePerm(
++        module = "assets"
++    )
++    public ApiResult<Map<String, Object>> graph(@RequestParam(required = false) String roomCode) {
++        CiGraphService.FullGraph g = this.graph.fullGraph(roomCode);
++        Map<String, Object> out = new LinkedHashMap<>();
++        out.put("nodes", g.nodes());
++        out.put("edges", g.edges());
++        out.put("truncated", g.truncated());
++        out.put("summary", g.summary());
++        return ApiResult.ok(out);
++    }
++
+     private static Map<String, Long> summary(CiGraphService.Graph g) {
+         Map<String, Long> m = new LinkedHashMap<>();
+ 
+diff --git a/backend-src/com/dcim/ci/service/CiGraphService.java b/backend-src/com/dcim/ci/service/CiGraphService.java
+index ee30d4b..ad1987d 100644
+--- a/backend-src/com/dcim/ci/service/CiGraphService.java
++++ b/backend-src/com/dcim/ci/service/CiGraphService.java
+@@ -110,6 +110,103 @@ public class CiGraphService {
+         return new CiGraphService.Graph(root, nodes, edges, truncated);
+     }
+ 
++    /**
++     * v3.5：全量拓扑（网络拓扑页）。
++     * 机房→机柜→设备隐含层级 + ci_relation 显式关系一次性组装；
++     * roomCode 非空时仅返回该机房及其机柜/设备；沿用 MAX_NODES=500 截断防护。
++     */
++    public CiGraphService.FullGraph fullGraph(String roomCode) {
++        String room = roomCode == null ? null : roomCode.trim();
++        if (room != null && room.isEmpty()) {
++            room = null;
++        }
++
++        Map<String, CiGraphService.Node> nodes = new LinkedHashMap<>();
++        List<CiGraphService.Edge> edges = new ArrayList<>();
++        boolean truncated = false;
++
++        List<Map<String, Object>> rooms = room == null
++            ? this.jdbc.queryForList("SELECT room_code, name FROM machine_room ORDER BY room_code")
++            : this.jdbc.queryForList("SELECT room_code, name FROM machine_room WHERE room_code = ? ORDER BY room_code", new Object[]{room});
++        if (room != null && rooms.isEmpty()) {
++            throw BusinessException.notFound("机房不存在：" + room);
++        }
++
++        for (Map<String, Object> r : rooms) {
++            if (nodes.size() >= MAX_NODES) {
++                truncated = true;
++                break;
++            }
++
++            String code = String.valueOf(r.get("room_code"));
++            nodes.put("ROOM:" + code, new CiGraphService.Node("ROOM", code, r.get("name") == null ? code : String.valueOf(r.get("name")), null, 0));
++        }
++
++        if (!truncated) {
++            List<Map<String, Object>> racks = room == null
++                ? this.jdbc.queryForList("SELECT rack_code, room_code, COALESCE(NULLIF(location_name, ''), rack_code) AS name FROM rack ORDER BY rack_code")
++                : this.jdbc.queryForList("SELECT rack_code, room_code, COALESCE(NULLIF(location_name, ''), rack_code) AS name FROM rack WHERE room_code = ? ORDER BY rack_code", new Object[]{room});
++
++            for (Map<String, Object> r : racks) {
++                if (nodes.size() >= MAX_NODES) {
++                    truncated = true;
++                    break;
++                }
++
++                String code = String.valueOf(r.get("rack_code"));
++                nodes.put("RACK:" + code, new CiGraphService.Node("RACK", code, String.valueOf(r.get("name")), null, 0));
++                if (r.get("room_code") != null) {
++                    edges.add(new CiGraphService.Edge("ROOM:" + r.get("room_code"), "RACK:" + code, "CONTAINS", "机房内机柜", true));
++                }
++            }
++        }
++
++        if (!truncated) {
++            int remaining = MAX_NODES - nodes.size();
++            String assetSql = room == null
++                ? "SELECT asset_no, name, status_biz, rack_code, parent_asset_no FROM asset WHERE deleted_at IS NULL ORDER BY asset_no LIMIT ?"
++                : "SELECT asset_no, name, status_biz, rack_code, parent_asset_no FROM asset WHERE deleted_at IS NULL AND rack_code IN (SELECT rack_code FROM rack WHERE room_code = ?) ORDER BY asset_no LIMIT ?";
++            List<Map<String, Object>> assets = room == null
++                ? this.jdbc.queryForList(assetSql, new Object[]{remaining + 1})
++                : this.jdbc.queryForList(assetSql, new Object[]{room, remaining + 1});
++            if (assets.size() > remaining) {
++                truncated = true;
++                assets = new ArrayList<>(assets.subList(0, remaining));
++            }
++
++            for (Map<String, Object> a : assets) {
++                String no = String.valueOf(a.get("asset_no"));
++                String key = "ASSET:" + no;
++                nodes.put(key, new CiGraphService.Node("ASSET", no, a.get("name") == null ? no : String.valueOf(a.get("name")), a.get("status_biz") == null ? null : String.valueOf(a.get("status_biz")), 0));
++                if (a.get("rack_code") != null && a.get("parent_asset_no") == null) {
++                    edges.add(new CiGraphService.Edge("RACK:" + a.get("rack_code"), key, "CONTAINS", "机柜内设备", true));
++                }
++                if (a.get("parent_asset_no") != null) {
++                    edges.add(new CiGraphService.Edge(key, "ASSET:" + a.get("parent_asset_no"), "PART_OF", "部件所属宿主", true));
++                }
++            }
++        }
++
++        Set<String> keys = nodes.keySet();
++        for (Map<String, Object> r : this.jdbc.queryForList("SELECT src_type, src_id, rel_type, dst_type, dst_id FROM ci_relation WHERE valid_to IS NULL ORDER BY id")) {
++            String from = r.get("src_type") + ":" + r.get("src_id");
++            String to = r.get("dst_type") + ":" + r.get("dst_id");
++            if (keys.contains(from) && keys.contains(to)) {
++                String rel = String.valueOf(r.get("rel_type"));
++                edges.add(new CiGraphService.Edge(from, to, rel, REL_TYPES.getOrDefault(rel, rel), false));
++            }
++        }
++
++        edges.removeIf(e -> !keys.contains(e.from()) || !keys.contains(e.to()));
++        Map<String, Long> summary = new LinkedHashMap<>();
++
++        for (CiGraphService.Node n : nodes.values()) {
++            summary.merge(n.type(), 1L, Long::sum);
++        }
++
++        return new CiGraphService.FullGraph(new ArrayList<>(nodes.values()), edges, truncated, summary);
++    }
++
+     private List<CiGraphService.Neighbor> neighbors(String type, String id, boolean downstream) {
+         List<CiGraphService.Neighbor> out = new ArrayList<>();
+         String sql = downstream
+@@ -225,6 +322,10 @@ public class CiGraphService {
+     public static record Graph(CiGraphService.Node root, List<CiGraphService.Node> nodes, List<CiGraphService.Edge> edges, boolean truncated) {
+     }
+ 
++    /** v3.5：全量拓扑（无根节点；summary = 各类型节点数） */
++    public static record FullGraph(List<CiGraphService.Node> nodes, List<CiGraphService.Edge> edges, boolean truncated, Map<String, Long> summary) {
++    }
++
+     private static record Neighbor(String type, String id, String rel, String label, boolean implicit) {
+     }
+ 
+diff --git a/backend-src/com/dcim/common/event/EventTypes.java b/backend-src/com/dcim/common/event/EventTypes.java
+index 0d0802f..810a650 100644
+--- a/backend-src/com/dcim/common/event/EventTypes.java
++++ b/backend-src/com/dcim/common/event/EventTypes.java
+@@ -21,6 +21,8 @@ public final class EventTypes {
+     public static final String ASSET_WARRANTY_EXPIRING = "asset.warranty_expiring";
+     public static final String CONTRACT_EXPIRING = "contract.expiring";
+     public static final String PROBLEM_STATUS_CHANGED = "problem.status_changed";
++    public static final String WORKORDER_SLA_ESCALATED = "workorder.sla_escalated";
++    public static final String INVENTORY_DIFF = "inventory.diff";
+     public static final String PING = "ping";
+     public static final Map<String, String> CATALOG;
+ 
+@@ -49,6 +51,8 @@ public final class EventTypes {
+         m.put("asset.warranty_expiring", "资产保修即将到期（按提醒节点，默认 60/30/7 天）");
+         m.put("contract.expiring", "合同即将到期（按提醒节点，默认 90/30/7 天）");
+         m.put("problem.status_changed", "问题单状态流转");
++        m.put("workorder.sla_escalated", "工单 SLA 超时升级（提醒处理人与上级）");
++        m.put("inventory.diff", "盘点完成存在差异（盘亏 / 盘盈 / 错位 / 物料差额）");
+         CATALOG = Collections.unmodifiableMap(m);
+     }
+ }
+diff --git a/backend-src/com/dcim/common/event/SseEventRelay.java b/backend-src/com/dcim/common/event/SseEventRelay.java
+new file mode 100644
+index 0000000..55e776c
+--- /dev/null
++++ b/backend-src/com/dcim/common/event/SseEventRelay.java
+@@ -0,0 +1,115 @@
++package com.dcim.common.event;
++
++import com.dcim.common.sse.SsePushService;
++import jakarta.annotation.PreDestroy;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Component;
++import org.springframework.transaction.event.TransactionPhase;
++import org.springframework.transaction.event.TransactionalEventListener;
++
++/**
++ * 领域事件 → SSE 频道广播（v3.5）。
++ *
++ * <p>事务提交后才广播（AFTER_COMMIT + fallbackExecution）：回滚的业务不外泄。
++ * SSE 只承载「某频道有变化」的轻量信号，前端据此刷新列表 / 红点；通知正文走
++ * NotificationAdapter 落库后的按用户推送，两者互补。
++ *
++ * <p><b>风暴抑制（前导 + 尾随合并）：</b>批量导入等单事务可产生上万事件，若逐条
++ * 广播，事件数 × 每实例连接数即数十万次内存写。同一 {@code channel:type} 在
++ * {@value #COALESCE_MS}ms 窗口内：首条立即广播（前导沿，保证低延迟），后续挂起，
++ * 窗口结束补发最后一条（尾随沿，保证不漏末梢变化）。广播次数被压到常数级。
++ * 尾随定时用自建守护线程 —— 禁 @Scheduled（会被集群互斥锁拦成单实例，理由见
++ * SseConnectionRegistry）。
++ */
++@Component
++public class SseEventRelay {
++    private static final Logger log = LoggerFactory.getLogger(SseEventRelay.class);
++    /** 只转发这些频道（DomainEvent 类型前缀）；其余（如 webhook ping）不进 SSE */
++    private static final Set<String> CHANNELS = Set.of("asset", "workorder", "stock", "inventory", "alert", "change", "problem", "contract");
++    private static final long COALESCE_MS = 500L;
++    private final SsePushService ssePush;
++    private final Map<String, Long> lastBroadcastAt = new ConcurrentHashMap<>();
++    private final Map<String, DomainEvent> pendingTail = new ConcurrentHashMap<>();
++    private final ScheduledExecutorService tailScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
++        Thread t = new Thread(r, "sse-event-coalesce");
++        t.setDaemon(true);
++        return t;
++    });
++
++    public SseEventRelay(SsePushService ssePush) {
++        this.ssePush = ssePush;
++    }
++
++    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
++    public void onDomainEvent(DomainEvent event) {
++        try {
++            String channel = channelOf(event.type());
++            if (channel == null) {
++                return;
++            }
++            String key = channel + ":" + event.type();
++            long now = System.currentTimeMillis();
++            Long last = this.lastBroadcastAt.get(key);
++            if (last == null || now - last >= COALESCE_MS) {
++                this.lastBroadcastAt.put(key, now);
++                this.ssePush.broadcast(this.toPayload(event, channel));
++            } else {
++                // 窗口内：挂起最新一条，窗口结束补发；先到期的 flush 先 remove，后到的空转
++                this.pendingTail.put(key, event);
++                this.tailScheduler.schedule(() -> this.flushTail(key), COALESCE_MS - (now - last), TimeUnit.MILLISECONDS);
++            }
++        } catch (RuntimeException e) {
++            log.warn("[sse] 事件 {} 广播失败（不影响业务）：{}", event.type(), e.toString());
++        }
++    }
++
++    @PreDestroy
++    void stop() {
++        this.tailScheduler.shutdownNow();
++    }
++
++    private void flushTail(String key) {
++        DomainEvent event = this.pendingTail.remove(key);
++        if (event != null) {
++            this.lastBroadcastAt.put(key, System.currentTimeMillis());
++            String channel = channelOf(event.type());
++            if (channel != null) {
++                this.ssePush.broadcast(this.toPayload(event, channel));
++            }
++        }
++    }
++
++    private static String channelOf(String type) {
++        if (type == null) {
++            return null;
++        }
++        int i = type.indexOf('.');
++        if (i <= 0) {
++            return null;
++        }
++        String channel = type.substring(0, i);
++        return CHANNELS.contains(channel) ? channel : null;
++    }
++
++    private Map<String, Object> toPayload(DomainEvent event, String channel) {
++        Map<String, Object> payload = new LinkedHashMap<>();
++        payload.put("kind", "event");
++        payload.put("channel", channel);
++        payload.put("type", event.type());
++        payload.put("objType", event.objType());
++        payload.put("objId", event.objId());
++        payload.put("occurredAt", event.occurredAt() == null ? null : event.occurredAt().toString());
++        Map<String, Object> data = new LinkedHashMap<>(event.data());
++        data.remove("snapshot"); // 资产快照可能很大（全量字段），SSE 只做变化信号
++        payload.put("data", data);
++        return payload;
++    }
++}
+diff --git a/backend-src/com/dcim/common/event/UnifiedEventPublisher.java b/backend-src/com/dcim/common/event/UnifiedEventPublisher.java
+new file mode 100644
+index 0000000..2731dc4
+--- /dev/null
++++ b/backend-src/com/dcim/common/event/UnifiedEventPublisher.java
+@@ -0,0 +1,50 @@
++package com.dcim.common.event;
++
++import com.dcim.common.notify.NotificationPort;
++import org.springframework.stereotype.Service;
++
++/**
++ * 统一事件 / 通知门面（v3.5）。
++ *
++ * <p>组合既有 {@link DomainEventPublisher}（Spring 事件 → 事务性发件箱 / Webhook
++ * 投递，语义不变）与 {@link NotificationPort}（站内信，NotificationAdapter 落库后
++ * 自动叠加 SSE 按用户实时推送）。联动链路一处调用即完成
++ * 「领域事件 + 站内信 + 实时推送」三路分发；既有 DomainEventPublisher 调用点不动。
++ */
++@Service
++public class UnifiedEventPublisher {
++    private final DomainEventPublisher events;
++    private final NotificationPort notifications;
++
++    public UnifiedEventPublisher(DomainEventPublisher events, NotificationPort notifications) {
++        this.events = events;
++        this.notifications = notifications;
++    }
++
++    /** 只发领域事件（发件箱 / Webhook / SSE 频道广播）。 */
++    public void publish(DomainEvent event) {
++        this.events.publish(event);
++    }
++
++    /** 只发站内信（落库 + SSE 按用户实时推送）。 */
++    public void notifyUser(String username, String type, String title, String content, String refId) {
++        this.notifications.notifyUser(username, type, title, content, refId);
++    }
++
++    /** 只发给指定角色的站内信（落库 + SSE 按用户实时推送）。 */
++    public void notifyRole(String roleCode, String type, String title, String content, String refId) {
++        this.notifications.notifyRole(roleCode, type, title, content, refId);
++    }
++
++    /** 领域事件 + 给指定用户的站内信（含 SSE 实时推送）。 */
++    public void publishAndNotifyUser(DomainEvent event, String username, String type, String title, String content, String refId) {
++        this.events.publish(event);
++        this.notifications.notifyUser(username, type, title, content, refId);
++    }
++
++    /** 领域事件 + 给指定角色的站内信（含 SSE 实时推送）。 */
++    public void publishAndNotifyRole(DomainEvent event, String roleCode, String type, String title, String content, String refId) {
++        this.events.publish(event);
++        this.notifications.notifyRole(roleCode, type, title, content, refId);
++    }
++}
+diff --git a/backend-src/com/dcim/common/sse/RedisSseRelay.java b/backend-src/com/dcim/common/sse/RedisSseRelay.java
+new file mode 100644
+index 0000000..0609421
+--- /dev/null
++++ b/backend-src/com/dcim/common/sse/RedisSseRelay.java
+@@ -0,0 +1,64 @@
++package com.dcim.common.sse;
++
++import com.dcim.security.RedisEnabledCondition;
++import com.fasterxml.jackson.core.type.TypeReference;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.io.IOException;
++import java.util.Map;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Conditional;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.data.redis.connection.Message;
++import org.springframework.data.redis.connection.MessageListener;
++import org.springframework.data.redis.connection.RedisConnectionFactory;
++import org.springframework.data.redis.listener.ChannelTopic;
++import org.springframework.data.redis.listener.RedisMessageListenerContainer;
++
++/**
++ * Redis pub/sub → SSE 跨实例转发（v3.5）。
++ *
++ * <p>仅当配置了 Redis（REDIS_HOST 非空，见 {@link RedisEnabledCondition}）时装配；
++ * 订阅 {@link SsePushService#CHANNEL}，把其他实例发布的信封交给
++ * {@link SsePushService#onRelayed} 在本机分发。
++ *
++ * <p>SSE 停用（dcim.sse.enabled=false）时不订阅任何频道 —— 连接本身也建不起来，
++ * 完整回到 3.4 行为（整体回退开关的一部分）。
++ */
++@Configuration(proxyBeanMethods = false)
++@Conditional(RedisEnabledCondition.class)
++public class RedisSseRelay implements MessageListener {
++    private static final Logger log = LoggerFactory.getLogger(RedisSseRelay.class);
++    private final SsePushService pushService;
++    private final ObjectMapper objectMapper;
++    private final boolean sseEnabled;
++
++    public RedisSseRelay(SsePushService pushService, ObjectMapper objectMapper, @Value("${dcim.sse.enabled:true}") boolean sseEnabled) {
++        this.pushService = pushService;
++        this.objectMapper = objectMapper;
++        this.sseEnabled = sseEnabled;
++    }
++
++    @Bean
++    public RedisMessageListenerContainer dcimSseRelayContainer(RedisConnectionFactory factory) {
++        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
++        container.setConnectionFactory(factory);
++        if (this.sseEnabled) {
++            container.addMessageListener(this, new ChannelTopic(SsePushService.CHANNEL));
++            log.info("[sse] 已订阅 Redis 频道 {}（跨实例转发）", SsePushService.CHANNEL);
++        }
++        return container;
++    }
++
++    @Override
++    public void onMessage(Message message, byte[] pattern) {
++        try {
++            Map<String, Object> envelope = this.objectMapper.readValue(message.getBody(), new TypeReference<Map<String, Object>>() {});
++            this.pushService.onRelayed(envelope);
++        } catch (RuntimeException | IOException e) {
++            log.warn("[sse] 跨实例信封解析失败：{}", e.toString());
++        }
++    }
++}
+diff --git a/backend-src/com/dcim/common/sse/SseConnectionRegistry.java b/backend-src/com/dcim/common/sse/SseConnectionRegistry.java
+new file mode 100644
+index 0000000..d6a8309
+--- /dev/null
++++ b/backend-src/com/dcim/common/sse/SseConnectionRegistry.java
+@@ -0,0 +1,175 @@
++package com.dcim.common.sse;
++
++import com.dcim.common.BusinessException;
++import jakarta.annotation.PostConstruct;
++import jakarta.annotation.PreDestroy;
++import java.io.IOException;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Component;
++import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
++
++/**
++ * SSE 连接注册表（v3.5）。
++ *
++ * <p>每个在线连接对应一个 {@link SseEmitter}，键为 {@code username:connId}
++ * （同一用户可开多个标签页，互不干扰）。超时设 0（生命周期自管），
++ * 由心跳注释帧探测死连接并就地清理。
++ *
++ * <p><b>为什么心跳不用 @Scheduled：</b>ScheduledJobLockAspect 会对所有 @Scheduled
++ * 方法做集群互斥加锁 —— 双实例部署时只有抢到锁的实例能跑心跳，另一实例的连接
++ * 会被中间层按空闲超时掐断。因此这里自建单线程守护 ScheduledExecutorService，
++ * 每个实例独立心跳（各实例只对自己持有的连接负责，无需互斥）。
++ *
++ * <p><b>连接数上限：</b>SseEmitter 是异步长连接，占 fd 与内存，超过上限直接 503，
++ * 前端 EventSource 收到错误后降级为轮询（见通知中心前端实现）。
++ */
++@Component
++public class SseConnectionRegistry {
++    private static final Logger log = LoggerFactory.getLogger(SseConnectionRegistry.class);
++    private final ConcurrentHashMap<String, SseEmitter> emitters = new ConcurrentHashMap<>();
++    private final AtomicLong connSeq = new AtomicLong();
++    private final boolean enabled;
++    private final int maxConnections;
++    private final long heartbeatMs;
++    private ScheduledExecutorService heartbeat;
++
++    public SseConnectionRegistry(
++        @Value("${dcim.sse.enabled:true}") boolean enabled,
++        @Value("${dcim.sse.max-connections-per-instance:200}") int maxConnections,
++        @Value("${dcim.sse.heartbeat-ms:25000}") long heartbeatMs
++    ) {
++        this.enabled = enabled;
++        this.maxConnections = maxConnections;
++        this.heartbeatMs = heartbeatMs;
++    }
++
++    @PostConstruct
++    void start() {
++        if (!this.enabled || this.heartbeatMs <= 0) {
++            return;
++        }
++        this.heartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
++            Thread t = new Thread(r, "sse-heartbeat");
++            t.setDaemon(true);
++            return t;
++        });
++        this.heartbeat.scheduleWithFixedDelay(this::beat, this.heartbeatMs, this.heartbeatMs, TimeUnit.MILLISECONDS);
++        log.info("[sse] 心跳已启动：{}ms，每实例连接上限 {}", this.heartbeatMs, this.maxConnections);
++    }
++
++    @PreDestroy
++    void stop() {
++        if (this.heartbeat != null) {
++            this.heartbeat.shutdownNow();
++        }
++        for (Map.Entry<String, SseEmitter> e : this.emitters.entrySet()) {
++            this.quietComplete(e.getValue());
++        }
++        this.emitters.clear();
++    }
++
++    /** 建立连接：注册 emitter 并立即发送 connected 帧（客户端可据此确认链路可用）。 */
++    public SseEmitter register(String username) {
++        if (!this.enabled) {
++            throw new BusinessException(503, "SSE 推送已停用");
++        } else if (this.emitters.size() >= this.maxConnections) {
++            // 超限 503：前端 EventSource onerror 后降级为轮询（风险对策：fd 耗尽防护）
++            throw new BusinessException(503, "SSE 连接数已达本实例上限（" + this.maxConnections + "），请稍后重试或使用轮询模式");
++        }
++        String key = username + ":" + this.connSeq.incrementAndGet();
++        // 不能用 0（无超时）：Spring 将 0 原样传给 Tomcat 的 ASYNC_SETTIMEOUT，coyote 只对 >0 排期，
++        // 0 被忽略后实际生效容器默认 30s —— async 超时 dispatch 会把 response 置为 errored，
++        // 此后广播 / 心跳对该连接的写入全部失败（连接僵尸化，客户端却毫无感知）。
++        // 显式 24h 兜底：真正的生命周期由 25s 心跳探测 + onTimeout/onError/onCompletion 回调清理。
++        SseEmitter emitter = new SseEmitter(86_400_000L);
++        emitter.onCompletion(() -> this.remove(key, emitter));
++        emitter.onTimeout(() -> this.remove(key, emitter));
++        emitter.onError(t -> this.remove(key, emitter));
++        this.emitters.put(key, emitter);
++        try {
++            emitter.send(SseEmitter.event().name("connected").data(Map.of("ok", true)));
++        } catch (RuntimeException | IOException e) {
++            this.remove(key, emitter);
++            throw new BusinessException(503, "SSE 连接建立失败");
++        }
++        log.debug("[sse] {} 上线，当前 {} 连接", key, this.emitters.size());
++        return emitter;
++    }
++
++    /** 向指定用户的全部本机连接推送，返回送达数；失败的连接就地清理。 */
++    public int sendToUser(String username, Object payload) {
++        if (username == null || username.isBlank()) {
++            return 0;
++        }
++        String prefix = username + ":";
++        int sent = 0;
++        for (Map.Entry<String, SseEmitter> e : this.emitters.entrySet()) {
++            if (e.getKey().startsWith(prefix)) {
++                sent += this.send(e.getKey(), e.getValue(), payload);
++            }
++        }
++        return sent;
++    }
++
++    /** 向本机全部连接广播，返回送达数；失败的连接就地清理。 */
++    public int broadcast(Object payload) {
++        int sent = 0;
++        for (Map.Entry<String, SseEmitter> e : this.emitters.entrySet()) {
++            sent += this.send(e.getKey(), e.getValue(), payload);
++        }
++        return sent;
++    }
++
++    public int count() {
++        return this.emitters.size();
++    }
++
++    private int send(String key, SseEmitter emitter, Object payload) {
++        try {
++            emitter.send(SseEmitter.event().name("message").data(payload));
++            return 1;
++        } catch (RuntimeException | IOException e) {
++            log.debug("[sse] 推送失败，移除连接 {}：{}", key, e.toString());
++            this.remove(key, emitter);
++            return 0;
++        }
++    }
++
++    private void beat() {
++        for (Map.Entry<String, SseEmitter> e : this.emitters.entrySet()) {
++            try {
++                // 注释帧（:ping）：只保活，不产生客户端事件
++                e.getValue().send(SseEmitter.event().comment("ping"));
++            } catch (RuntimeException | IOException ex) {
++                this.remove(e.getKey(), e.getValue());
++            }
++        }
++    }
++
++    private void remove(String key, SseEmitter emitter) {
++        boolean removed = this.emitters.remove(key, emitter);
++        if (removed) {
++            log.debug("[sse] {} 下线，当前 {} 连接", key, this.emitters.size());
++        }
++        this.quietComplete(emitter);
++    }
++
++    private void quietComplete(SseEmitter emitter) {
++        try {
++            emitter.complete();
++        } catch (Exception ignored) {
++            // 必须吞掉一切异常：Spring 6.1 的 AsyncRequestNotUsableException（IOException 子类）
++            // 会以 sneaky-throw 方式从 complete() 逃逸（静态签名不声明，catch RuntimeException 防不住）。
++            // 若放任其逃逸：中断 broadcast 循环（其余连接收不到推送）、污染业务请求线程
++            // （事务已提交却返回 500）、并杀死心跳调度线程（死连接永不清理）。
++        }
++    }
++}
+diff --git a/backend-src/com/dcim/common/sse/SsePushService.java b/backend-src/com/dcim/common/sse/SsePushService.java
+new file mode 100644
+index 0000000..9953d94
+--- /dev/null
++++ b/backend-src/com/dcim/common/sse/SsePushService.java
+@@ -0,0 +1,103 @@
++package com.dcim.common.sse;
++
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.UUID;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.ObjectProvider;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.stereotype.Service;
++
++/**
++ * SSE 推送门面（v3.5）：本机直发 + Redis pub/sub 跨实例转发。
++ *
++ * <p>双实例部署时用户连在任一实例上：推送先发本机全部目标连接，再把信封
++ * （发送实例标识 + 目标用户 + 载荷）发布到 {@value #CHANNEL}，其他实例的
++ * {@link RedisSseRelay} 订阅后在本机分发；自己的回声按实例标识跳过，
++ * 保证每条消息在每实例恰好分发一次。
++ *
++ * <p>未配置 Redis（REDIS_HOST 空 → 无 StringRedisTemplate）时自动降级为单机模式：
++ * 仅本机连接收到实时推送，其余由前端 30s 轮询兜底，功能不中断。
++ *
++ * <p>所有方法均为尽力而为：任何失败只记 WARN，不向业务线程抛异常。
++ */
++@Service
++public class SsePushService {
++    /** Redis pub/sub 频道：SSE 跨实例转发信封 */
++    public static final String CHANNEL = "dcim:sse";
++    private static final Logger log = LoggerFactory.getLogger(SsePushService.class);
++    private final SseConnectionRegistry registry;
++    private final ObjectProvider<StringRedisTemplate> redisProvider;
++    private final ObjectMapper objectMapper;
++    private final boolean enabled;
++    /** 本实例标识（跨实例信封去回声用） */
++    private final String instanceId;
++
++    public SsePushService(
++        SseConnectionRegistry registry,
++        ObjectProvider<StringRedisTemplate> redisProvider,
++        ObjectMapper objectMapper,
++        @Value("${dcim.sse.enabled:true}") boolean enabled
++    ) {
++        this.registry = registry;
++        this.redisProvider = redisProvider;
++        this.objectMapper = objectMapper;
++        this.enabled = enabled;
++        this.instanceId = UUID.randomUUID().toString().substring(0, 8);
++    }
++
++    /** 推送给指定用户的全部在线连接（本机直发 + 其他实例转发）。返回本机送达数。 */
++    public int pushUser(String username, Object payload) {
++        if (!this.enabled || username == null || username.isBlank()) {
++            return 0;
++        }
++        int sent = this.registry.sendToUser(username, payload);
++        this.relay(username, payload);
++        return sent;
++    }
++
++    /** 广播给全部在线连接（本机直发 + 其他实例转发）。返回本机送达数。 */
++    public int broadcast(Object payload) {
++        if (!this.enabled) {
++            return 0;
++        }
++        int sent = this.registry.broadcast(payload);
++        this.relay(null, payload);
++        return sent;
++    }
++
++    /** RedisSseRelay 收到其他实例的信封后回灌本机分发。 */
++    public void onRelayed(Map<String, Object> envelope) {
++        if (!this.enabled || this.instanceId.equals(envelope.get("inst"))) {
++            return;
++        }
++        Object payload = envelope.get("payload");
++        Object user = envelope.get("user");
++        if (user == null) {
++            this.registry.broadcast(payload);
++        } else {
++            this.registry.sendToUser(String.valueOf(user), payload);
++        }
++    }
++
++    private void relay(String username, Object payload) {
++        StringRedisTemplate redis = this.redisProvider.getIfAvailable();
++        if (redis == null) {
++            return; // 无 Redis：单机模式，仅本机分发
++        }
++        try {
++            Map<String, Object> envelope = new LinkedHashMap<>();
++            envelope.put("inst", this.instanceId);
++            envelope.put("user", username);
++            envelope.put("payload", payload);
++            redis.convertAndSend(CHANNEL, this.objectMapper.writeValueAsString(envelope));
++        } catch (RuntimeException | JsonProcessingException e) {
++            // Redis 抖动只影响跨实例推送，本机已直发；不抛给业务线程
++            log.warn("[sse] Redis 转发失败（本机已送达）：{}", e.toString());
++        }
++    }
++}
+diff --git a/backend-src/com/dcim/monitoring/controller/MonitoringController.java b/backend-src/com/dcim/monitoring/controller/MonitoringController.java
+index 1fee3b2..44e186f 100644
+--- a/backend-src/com/dcim/monitoring/controller/MonitoringController.java
++++ b/backend-src/com/dcim/monitoring/controller/MonitoringController.java
+@@ -47,6 +47,7 @@ public class MonitoringController {
+     private final MonitorProfileMapper profileMapper;
+     private final ServiceDiscoveryService sd;
+     private final JdbcTemplate jdbc;
++    private volatile Object[] monitoredCountCache;
+ 
+     @GetMapping({"/overview"})
+     @RequirePerm(
+@@ -82,6 +83,14 @@ public class MonitoringController {
+     }
+ 
+     private long countMonitoredAssets() {
++        // 10 万行级资产表按「受监控状态 + 有 IP」做 COUNT 要扫数万索引行回表（实测 85ms+），
++        // 而总览页其余数字（countTargetsCached）均带 60s 缓存——这里对齐，避免它独自拖慢监控总览。
++        // 监控设置变更走 MonitoringSettings.invalidate()/save 时同步失效，普通资产增删的 60s 滞后可接受。
++        long now = System.currentTimeMillis();
++        Object[] c = this.monitoredCountCache;
++        if (c != null && now - (Long) c[0] < 60_000L) {
++            return (Long) c[1];
++        }
+         List<String> st = this.settings.monitoredStatuses();
+         String in = String.join(",", Collections.nCopies(st.size(), "?"));
+         Long n = (Long)this.jdbc
+@@ -92,7 +101,9 @@ public class MonitoringController {
+                 Long.class,
+                 st.toArray()
+             );
+-        return n == null ? 0L : n;
++        long v = n == null ? 0L : n;
++        this.monitoredCountCache = new Object[]{now, v};
++        return v;
+     }
+ 
+     @GetMapping({"/assets/{assetNo}/metrics"})
+diff --git a/backend-src/com/dcim/monitoring/service/PrometheusClient.java b/backend-src/com/dcim/monitoring/service/PrometheusClient.java
+index 76e1976..af9e236 100644
+--- a/backend-src/com/dcim/monitoring/service/PrometheusClient.java
++++ b/backend-src/com/dcim/monitoring/service/PrometheusClient.java
+@@ -20,9 +20,12 @@ import org.springframework.web.client.RestClientException;
+ @Component
+ public class PrometheusClient {
+     private static final Pattern SAFE_LABEL = Pattern.compile("^[A-Za-z0-9_.:\\-]{1,100}$");
++    private static final long TARGET_HEALTH_TTL_MS = 30_000L;
+     private final MonitoringSettings settings;
+     private final ObjectMapper om;
+     private final RestClient rest;
++    private volatile Map<String, Map<String, Object>> targetHealthCache;
++    private volatile long targetHealthCachedAt;
+ 
+     public PrometheusClient(MonitoringSettings settings, ObjectMapper om) {
+         this.settings = settings;
+@@ -119,33 +122,43 @@ public class PrometheusClient {
+     }
+ 
+     public Map<String, Map<String, Object>> targetHealth() {
+-        JsonNode data = this.get("/api/v1/targets", Map.of("state", "active"));
+-        Map<String, Map<String, Object>> out = new LinkedHashMap<>();
+-
+-        for (JsonNode t : data.path("activeTargets")) {
+-            String job = t.path("labels").path("job").asText(t.path("scrapePool").asText());
+-            Map<String, Object> s = out.computeIfAbsent(job, k -> {
+-                Map<String, Object> m = new LinkedHashMap<>();
+-                m.put("up", 0);
+-                m.put("down", 0);
+-                m.put("total", 0);
+-                m.put("errors", new ArrayList());
+-                return m;
+-            });
+-            boolean up = "up".equals(t.path("health").asText());
+-            s.put(up ? "up" : "down", (Integer)s.get(up ? "up" : "down") + 1);
+-            s.put("total", (Integer)s.get("total") + 1);
+-            List<Map<String, String>> errs = (List<Map<String, String>>)s.get("errors");
+-            if (!up && errs.size() < 5) {
+-                Map<String, String> e = new LinkedHashMap<>();
+-                e.put("instance", t.path("labels").path("instance").asText());
+-                e.put("assetNo", t.path("labels").path("asset_no").asText(null));
+-                e.put("error", t.path("lastError").asText());
+-                errs.add(e);
++        // /api/v1/targets 在目标数多时单次就要 100~300ms，而 target 健康状态本身随
++        // scrape 周期（15~30s）才变化一次：缓存 30s 既保住监控总览的交互预算，又不损失新鲜度。
++        // 失败（BusinessException）不缓存，避免 Prometheus 抖动把错误态钉死 30 秒。
++        Map<String, Map<String, Object>> cached = this.targetHealthCache;
++        if (cached != null && System.currentTimeMillis() - this.targetHealthCachedAt < TARGET_HEALTH_TTL_MS) {
++            return cached;
++        } else {
++            JsonNode data = this.get("/api/v1/targets", Map.of("state", "active"));
++            Map<String, Map<String, Object>> out = new LinkedHashMap<>();
++
++            for (JsonNode t : data.path("activeTargets")) {
++                String job = t.path("labels").path("job").asText(t.path("scrapePool").asText());
++                Map<String, Object> s = out.computeIfAbsent(job, k -> {
++                    Map<String, Object> m = new LinkedHashMap<>();
++                    m.put("up", 0);
++                    m.put("down", 0);
++                    m.put("total", 0);
++                    m.put("errors", new ArrayList());
++                    return m;
++                });
++                boolean up = "up".equals(t.path("health").asText());
++                s.put(up ? "up" : "down", (Integer)s.get(up ? "up" : "down") + 1);
++                s.put("total", (Integer)s.get("total") + 1);
++                List<Map<String, String>> errs = (List<Map<String, String>>)s.get("errors");
++                if (!up && errs.size() < 5) {
++                    Map<String, String> e = new LinkedHashMap<>();
++                    e.put("instance", t.path("labels").path("instance").asText());
++                    e.put("assetNo", t.path("labels").path("asset_no").asText(null));
++                    e.put("error", t.path("lastError").asText());
++                    errs.add(e);
++                }
+             }
+-        }
+ 
+-        return out;
++            this.targetHealthCache = out;
++            this.targetHealthCachedAt = System.currentTimeMillis();
++            return out;
++        }
+     }
+ 
+     public List<Map<String, Object>> rules() {
+diff --git a/backend-src/com/dcim/security/JwtAuthFilter.java b/backend-src/com/dcim/security/JwtAuthFilter.java
+index 343d41d..ef2e7b0 100644
+--- a/backend-src/com/dcim/security/JwtAuthFilter.java
++++ b/backend-src/com/dcim/security/JwtAuthFilter.java
+@@ -141,10 +141,25 @@ public class JwtAuthFilter extends OncePerRequestFilter {
+                 }
+             }
+ 
++            // v3.5：EventSource 无法携带 Authorization 头，仅 SSE 端点额外接受 ?token= 查询参数。
++            // 令牌进 URL 有泄露面（访问日志 / 浏览器历史），故严格限定路径，且网关层对该
++            // 路径的访问日志已去除 query（见 deploy/Caddyfile 与 UPGRADE-3.5 文档）。
++            if (this.isSseEndpoint(request)) {
++                String queryToken = request.getParameter("token");
++                if (queryToken != null && !queryToken.isBlank()) {
++                    return queryToken;
++                }
++            }
++
+             return null;
+         }
+     }
+ 
++    private boolean isSseEndpoint(HttpServletRequest request) {
++        String path = request.getRequestURI();
++        return "/api/notifications/sse".equals(path) || "/api/v1/notifications/sse".equals(path);
++    }
++
+     private boolean allowWhileMustChangePwd(HttpServletRequest request) {
+         String path = request.getRequestURI();
+         if (MUST_CHANGE_PWD_ALLOW_EXACT.contains(path)) {
+diff --git a/backend-src/com/dcim/security/UserRateLimitFilter.java b/backend-src/com/dcim/security/UserRateLimitFilter.java
+index ac98e1f..9c6024d 100644
+--- a/backend-src/com/dcim/security/UserRateLimitFilter.java
++++ b/backend-src/com/dcim/security/UserRateLimitFilter.java
+@@ -169,6 +169,9 @@ public class UserRateLimitFilter extends OncePerRequestFilter {
+             || path.startsWith("/api/healthz")
+             || path.startsWith("/api/collector/")
+             || path.startsWith("/api/monitoring/sd")
+-            || path.startsWith("/api/monitoring/ingest/");
++            || path.startsWith("/api/monitoring/ingest/")
++            // SSE 建连豁免：每标签页仅一次低频请求，注册表自带 200 连接上限与心跳清理；
++            // 若按普通请求计数，429 会触发 EventSource 全体重连风暴，反而放大压力
++            || path.equals("/api/notifications/sse");
+     }
+ }
+diff --git a/backend-src/com/dcim/system/controller/SseController.java b/backend-src/com/dcim/system/controller/SseController.java
+new file mode 100644
+index 0000000..49057c8
+--- /dev/null
++++ b/backend-src/com/dcim/system/controller/SseController.java
+@@ -0,0 +1,45 @@
++package com.dcim.system.controller;
++
++import com.dcim.common.BusinessException;
++import com.dcim.common.sse.SseConnectionRegistry;
++import com.dcim.security.CurrentUser;
++import com.dcim.security.LoginUser;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
++
++/**
++ * SSE 实时推送端点（v3.5）。
++ *
++ * <p>浏览器 EventSource 无法携带 Authorization 头，JwtAuthFilter 仅对本路径
++ * 额外接受 {@code ?token=} 查询参数（泄露面控制：严格限定路径 + 网关层对该
++ * 路径的访问日志去除 query，见 deploy/Caddyfile 与 UPGRADE-3.5 文档）。
++ *
++ * <p>连接注册进 {@link SseConnectionRegistry} 后由服务端心跳维持；停用 / 超限
++ * 返回 503，前端 EventSource onerror 后降级为 30s 轮询。
++ */
++@RestController
++@RequestMapping({"/api/notifications"})
++public class SseController {
++    private final SseConnectionRegistry registry;
++    private final boolean enabled;
++
++    public SseController(SseConnectionRegistry registry, @Value("${dcim.sse.enabled:true}") boolean enabled) {
++        this.registry = registry;
++        this.enabled = enabled;
++    }
++
++    @GetMapping({"/sse"})
++    public SseEmitter sse() {
++        LoginUser u = CurrentUser.get();
++        if (u == null) {
++            throw BusinessException.unauthorized("未登录或会话已过期");
++        } else if (!this.enabled) {
++            throw new BusinessException(503, "SSE 推送已停用");
++        } else {
++            return this.registry.register(u.username());
++        }
++    }
++}
+diff --git a/backend-src/com/dcim/system/service/NotificationAdapter.java b/backend-src/com/dcim/system/service/NotificationAdapter.java
+index c7d7075..31ea2d4 100644
+--- a/backend-src/com/dcim/system/service/NotificationAdapter.java
++++ b/backend-src/com/dcim/system/service/NotificationAdapter.java
+@@ -1,9 +1,8 @@
+ package com.dcim.system.service;
+ 
+-import com.baomidou.mybatisplus.core.conditions.Wrapper;
+-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+ import com.dcim.common.notify.NotificationPort;
++import com.dcim.common.sse.SsePushService;
+ import com.dcim.system.entity.NotificationEntity;
+ import com.dcim.system.entity.UserEntity;
+ import com.dcim.system.entity.UserRoleEntity;
+@@ -11,19 +10,24 @@ import com.dcim.system.mapper.NotificationMapper;
+ import com.dcim.system.mapper.UserMapper;
+ import com.dcim.system.mapper.UserRoleMapper;
+ import java.time.LocalDateTime;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Component;
+ import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
+ 
+ @Component
+ public class NotificationAdapter implements NotificationPort {
+-    
++
+     private static final Logger log = LoggerFactory.getLogger(NotificationAdapter.class);
+     private final NotificationMapper notificationMapper;
+     private final UserRoleMapper userRoleMapper;
+     private final UserMapper userMapper;
++    private final SsePushService ssePush;
+ 
+     @Transactional
+     @Override
+@@ -64,12 +68,53 @@ public class NotificationAdapter implements NotificationPort {
+         n.setReadFlag(false);
+         n.setCreatedAt(LocalDateTime.now());
+         this.notificationMapper.insert(n);
++        this.pushRealtime(this.toPayload(n));
++    }
++
++    /**
++     * 站内信落库后叠加 SSE 实时推送（v3.5）。有事务时注册到提交后回调 ——
++     * 业务回滚的通知不会推送出去；无事务上下文则立即推送。
++     * 推送失败只记 WARN，绝不影响站内信与业务主流程。
++     */
++    private void pushRealtime(Map<String, Object> payload) {
++        Runnable push = () -> {
++            try {
++                this.ssePush.pushUser((String) payload.get("username"), payload);
++            } catch (RuntimeException e) {
++                log.warn("[sse] 通知实时推送失败（不影响业务）：{}", e.toString());
++            }
++        };
++        if (TransactionSynchronizationManager.isSynchronizationActive()) {
++            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++                @Override
++                public void afterCommit() {
++                    push.run();
++                }
++            });
++        } else {
++            push.run();
++        }
++    }
++
++    /** SSE 帧载荷：与 NotificationController /my 接口的行结构保持一致，前端可直接合并。 */
++    private Map<String, Object> toPayload(NotificationEntity n) {
++        Map<String, Object> row = new LinkedHashMap<>();
++        row.put("kind", "notification");
++        row.put("id", n.getId());
++        row.put("username", n.getUsername());
++        row.put("type", n.getType());
++        row.put("title", n.getTitle());
++        row.put("content", n.getContent());
++        row.put("refId", n.getRefId());
++        row.put("readFlag", n.getReadFlag());
++        row.put("createdAt", n.getCreatedAt() == null ? null : n.getCreatedAt().toString());
++        return row;
+     }
+ 
+-    
+-    public NotificationAdapter(final NotificationMapper notificationMapper, final UserRoleMapper userRoleMapper, final UserMapper userMapper) {
++    public NotificationAdapter(final NotificationMapper notificationMapper, final UserRoleMapper userRoleMapper, final UserMapper userMapper, final SsePushService ssePush) {
+         this.notificationMapper = notificationMapper;
+         this.userRoleMapper = userRoleMapper;
+         this.userMapper = userMapper;
++        this.ssePush = ssePush;
+     }
+ }
+diff --git a/backend-src/com/dcim/warehouse/controller/InventoryTaskController.java b/backend-src/com/dcim/warehouse/controller/InventoryTaskController.java
+index 6179e47..704ee20 100644
+--- a/backend-src/com/dcim/warehouse/controller/InventoryTaskController.java
++++ b/backend-src/com/dcim/warehouse/controller/InventoryTaskController.java
+@@ -20,6 +20,7 @@ import com.dcim.warehouse.entity.InventoryTaskEntity;
+ import com.dcim.warehouse.mapper.InventoryItemMapper;
+ import com.dcim.warehouse.mapper.InventoryTaskMapper;
+ import com.dcim.warehouse.mapper.WarehouseAssetQueryMapper;
++import com.dcim.warehouse.service.InventoryDiffTicketService;
+ import com.dcim.warehouse.service.StockMovementService;
+ import jakarta.validation.Valid;
+ import jakarta.validation.constraints.NotBlank;
+@@ -57,6 +58,7 @@ public class InventoryTaskController {
+     private final InventoryItemMapper itemMapper;
+     private final WarehouseAssetQueryMapper assetQueryMapper;
+     private final StockMovementService stockMovementService;
++    private final InventoryDiffTicketService inventoryDiffTicketService;
+     private final SeqNoGenerator seqNoGenerator;
+     private final JdbcTemplate jdbc;
+ 
+@@ -410,6 +412,10 @@ public class InventoryTaskController {
+             this.applyCountAdjustments(task);
+         }
+ 
++        // v3.5 联动：存在差异则自动生成「盘点差异」工单（与完成同事务，
++        // 建单失败连带回滚完成操作——一致性优先；开关可关）
++        this.inventoryDiffTicketService.createDiffTicketIfNeeded(task);
++
+         this.taskMapper
+             .update(
+                 null,
+@@ -585,6 +591,7 @@ public class InventoryTaskController {
+         final InventoryItemMapper itemMapper,
+         final WarehouseAssetQueryMapper assetQueryMapper,
+         final StockMovementService stockMovementService,
++        final InventoryDiffTicketService inventoryDiffTicketService,
+         final SeqNoGenerator seqNoGenerator,
+         final JdbcTemplate jdbc
+     ) {
+@@ -592,6 +599,7 @@ public class InventoryTaskController {
+         this.itemMapper = itemMapper;
+         this.assetQueryMapper = assetQueryMapper;
+         this.stockMovementService = stockMovementService;
++        this.inventoryDiffTicketService = inventoryDiffTicketService;
+         this.seqNoGenerator = seqNoGenerator;
+         this.jdbc = jdbc;
+     }
+diff --git a/backend-src/com/dcim/warehouse/service/InventoryDiffTicketService.java b/backend-src/com/dcim/warehouse/service/InventoryDiffTicketService.java
+new file mode 100644
+index 0000000..bec3589
+--- /dev/null
++++ b/backend-src/com/dcim/warehouse/service/InventoryDiffTicketService.java
+@@ -0,0 +1,200 @@
++package com.dcim.warehouse.service;
++
++import com.baomidou.mybatisplus.core.toolkit.Wrappers;
++import com.dcim.common.event.DomainEvent;
++import com.dcim.common.event.EventTypes;
++import com.dcim.common.event.UnifiedEventPublisher;
++import com.dcim.security.CurrentUser;
++import com.dcim.security.LoginUser;
++import com.dcim.warehouse.entity.InventoryItemEntity;
++import com.dcim.warehouse.entity.InventoryTaskEntity;
++import com.dcim.warehouse.mapper.InventoryItemMapper;
++import com.dcim.workorder.entity.WorkorderEntity;
++import com.dcim.workorder.service.WoAssetLineInput;
++import com.dcim.workorder.service.WorkorderService;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Service;
++
++/**
++ * 盘点差异 → 「盘点差异」工单联动（v3.5）。
++ *
++ * <p>盘点任务完成时，若存在差异明细（资产盘亏 / 盘盈 / 错位，或物料实盘数量与账面快照
++ * 不一致），自动创建一张「盘点差异」工单汇总差异，避免差异只停留在盘点报表里无人跟进。
++ *
++ * <p><b>一致性优先：</b>与 complete 在同一事务内执行——建单失败（如工单类型未配置、
++ * 校验不过）会连带回滚整个完成操作，「任务已完成」与「差异已建单」要么都发生要么都
++ * 不发生。因此调用方必须处于事务中（InventoryTaskController.complete 为 @Transactional）。
++ *
++ * <p><b>开关：</b>{@code dcim.linkage.inventory-diff-ticket.enabled=false} 时直接跳过
++ * （回退 3.4 行为）。工单类型「盘点差异」由 V46 迁移注册到 workflow_config（免审）。
++ */
++@Service
++public class InventoryDiffTicketService {
++    private static final Logger log = LoggerFactory.getLogger(InventoryDiffTicketService.class);
++    private static final String WO_TYPE = "盘点差异";
++    /** 描述中差异明细的最大行数（防超大任务的描述失控，超出部分引导去盘点明细页看全量） */
++    private static final int MAX_DETAIL_LINES = 50;
++    private static final Set<String> ASSET_DIFF_RESULTS = Set.of("盘亏", "盘盈", "错位");
++
++    private final InventoryItemMapper itemMapper;
++    private final WorkorderService workorderService;
++    private final UnifiedEventPublisher events;
++    private final boolean enabled;
++
++    public InventoryDiffTicketService(
++        InventoryItemMapper itemMapper,
++        WorkorderService workorderService,
++        UnifiedEventPublisher events,
++        @Value("${dcim.linkage.inventory-diff-ticket.enabled:true}") boolean enabled
++    ) {
++        this.itemMapper = itemMapper;
++        this.workorderService = workorderService;
++        this.events = events;
++        this.enabled = enabled;
++    }
++
++    /**
++     * 盘点完成时调用（须处于 complete 的事务内）：存在差异则建「盘点差异」工单，
++     * 并发布 {@code inventory.diff} 领域事件（webhook 发件箱 + SSE 广播）。
++     *
++     * @return 创建的工单号；无差异或开关关闭返回 null
++     */
++    public String createDiffTicketIfNeeded(InventoryTaskEntity task) {
++        if (!this.enabled || task == null) {
++            return null;
++        }
++        List<InventoryItemEntity> items = this.itemMapper
++            .selectList(Wrappers.<InventoryItemEntity>lambdaQuery().eq(InventoryItemEntity::getTaskNo, task.getTaskNo()));
++        List<InventoryItemEntity> diffItems = new ArrayList<>();
++        for (InventoryItemEntity item : items) {
++            if (this.isDiff(item)) {
++                diffItems.add(item);
++            }
++        }
++        if (diffItems.isEmpty()) {
++            return null;
++        }
++        String title = "盘点差异 " + task.getTaskNo() + "「" + task.getName() + "」";
++        WorkorderEntity wo = this.workorderService
++            .create(
++                WO_TYPE,
++                title,
++                this.buildDescription(task, diffItems),
++                "高",
++                this.assetLinesOf(diffItems),
++                this.materialCodesOf(diffItems),
++                null,
++                null,
++                null,
++                null,
++                null,
++                null,
++                null,
++                null,
++                null,
++                null
++            );
++        this.events.publish(DomainEvent.of(EventTypes.INVENTORY_DIFF, "inventory_task", task.getTaskNo(), this.actor(), this.eventData(task, diffItems)));
++        String woNo = wo.getWoNo();
++        log.info("[linkage] 盘点 {} 发现 {} 项差异，已生成「{}」工单 {}", task.getTaskNo(), diffItems.size(), WO_TYPE, woNo);
++        return woNo;
++    }
++
++    /** 差异判定：资产行看盘点结论（盘亏/盘盈/错位）；物料行看实盘数量与账面快照是否一致。 */
++    private boolean isDiff(InventoryItemEntity item) {
++        if (item.getAssetNo() != null && !item.getAssetNo().isBlank()) {
++            return item.getResult() != null && ASSET_DIFF_RESULTS.contains(item.getResult());
++        }
++        if (item.getCountedQty() == null || item.getExpected() == null) {
++            return false;
++        }
++        Object book = item.getExpected().get("qty");
++        return book != null && ((Number) book).intValue() != item.getCountedQty();
++    }
++
++    private String buildDescription(InventoryTaskEntity task, List<InventoryItemEntity> diffItems) {
++        StringBuilder sb = new StringBuilder();
++        sb
++            .append("盘点任务 ")
++            .append(task.getTaskNo())
++            .append("「")
++            .append(task.getName())
++            .append("」已完成，共发现 ")
++            .append(diffItems.size())
++            .append(" 项差异，请核查差异原因并跟进处理（补录 / 赔偿 / 账面修正 / 报废）。\n\n差异清单：\n");
++        int lines = 0;
++        for (InventoryItemEntity item : diffItems) {
++            if (lines >= MAX_DETAIL_LINES) {
++                sb.append("…… 其余 ").append(diffItems.size() - lines).append(" 项略，详见盘点任务明细页\n");
++                break;
++            }
++            sb.append("- ").append(this.describe(item)).append('\n');
++            lines++;
++        }
++        return sb.toString();
++    }
++
++    private String describe(InventoryItemEntity item) {
++        if (item.getAssetNo() != null && !item.getAssetNo().isBlank()) {
++            Map<String, Object> exp = item.getExpected() == null ? Map.of() : item.getExpected();
++            String where = exp.get("rackCode") + "-" + exp.get("unitNo");
++            String note = item.getDiffNote() == null || item.getDiffNote().isBlank() ? "" : "，备注：" + item.getDiffNote().trim();
++            return "资产 " + item.getAssetNo() + "：" + item.getResult() + "（应位 " + where + note + "）";
++        }
++        Object book = item.getExpected() == null ? null : item.getExpected().get("qty");
++        int bookQty = book == null ? 0 : ((Number) book).intValue();
++        int counted = item.getCountedQty() == null ? 0 : item.getCountedQty();
++        int d = counted - bookQty;
++        return "物料 " + item.getMaterialCode() + " @ " + item.getWarehouseCode() + "：账面 " + bookQty + "，实盘 " + counted + "，差 " + (d > 0 ? "+" : "") + d;
++    }
++
++    private List<WoAssetLineInput> assetLinesOf(List<InventoryItemEntity> diffItems) {
++        List<WoAssetLineInput> lines = new ArrayList<>();
++        for (InventoryItemEntity item : diffItems) {
++            if (item.getAssetNo() != null && !item.getAssetNo().isBlank()) {
++                WoAssetLineInput line = new WoAssetLineInput();
++                line.setAssetNo(item.getAssetNo().trim());
++                lines.add(line);
++            }
++        }
++        return lines;
++    }
++
++    private List<String> materialCodesOf(List<InventoryItemEntity> diffItems) {
++        Set<String> codes = new LinkedHashSet<>();
++        for (InventoryItemEntity item : diffItems) {
++            if (item.getMaterialCode() != null && !item.getMaterialCode().isBlank()) {
++                codes.add(item.getMaterialCode().trim());
++            }
++        }
++        return new ArrayList<>(codes);
++    }
++
++    private Map<String, Object> eventData(InventoryTaskEntity task, List<InventoryItemEntity> diffItems) {
++        Map<String, Object> data = new LinkedHashMap<>();
++        data.put("taskNo", task.getTaskNo());
++        data.put("taskName", task.getName());
++        data.put("targetType", task.getTargetType());
++        data.put("diffCount", diffItems.size());
++        Map<String, Integer> byResult = new LinkedHashMap<>();
++        for (InventoryItemEntity item : diffItems) {
++            boolean isAsset = item.getAssetNo() != null && !item.getAssetNo().isBlank();
++            byResult.merge(isAsset && item.getResult() != null ? item.getResult() : "物料差额", 1, Integer::sum);
++        }
++        data.put("byResult", byResult);
++        return data;
++    }
++
++    private String actor() {
++        LoginUser u = CurrentUser.get();
++        return u == null ? "system" : u.username();
++    }
++}
+diff --git a/backend-src/com/dcim/warehouse/service/LowStockService.java b/backend-src/com/dcim/warehouse/service/LowStockService.java
+new file mode 100644
+index 0000000..3350c21
+--- /dev/null
++++ b/backend-src/com/dcim/warehouse/service/LowStockService.java
+@@ -0,0 +1,211 @@
++package com.dcim.warehouse.service;
++
++import com.dcim.common.notify.NotificationPort;
++import com.dcim.security.ActorContext;
++import com.dcim.workorder.entity.WorkorderEntity;
++import com.dcim.workorder.service.WorkorderService;
++import jakarta.annotation.PreDestroy;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++import org.springframework.transaction.support.TransactionTemplate;
++
++/**
++ * 低库存联动（v3.5）。
++ *
++ * <p>{@code WebhookDispatcher.checkLowStock} 在业务事务 BEFORE_COMMIT 阶段命中
++ * 「stock &lt; safety」时回调 {@link #onLowStock}。本服务把联动工作推迟到
++ * <b>事务提交后</b> 的单线程守护任务里（尽力而为，任何失败只记日志，绝不影响出入库）：
++ * <ul>
++ *   <li><b>off</b> —— 不联动（仅保留原有 stock.low webhook 事件，回退 3.4 行为）</li>
++ *   <li><b>notify</b> —— 站内信通知仓库管理员（R-WAREHOUSE，通知自动叠加 SSE 实时推送）</li>
++ *   <li><b>ticket</b> —— 通知 + 以系统操作人（admin）身份自动创建补货工单，
++ *       建议补货量 = 安全库存 − 当前库存</li>
++ * </ul>
++ *
++ * <p><b>不在 BEFORE_COMMIT 里做重活：</b>建单要走 WorkorderService 的完整校验链，
++ * 在业务事务内抛错会污染事务（v3.4 CC-05 双连接教训）；出入库回滚时 afterCommit
++ * 不触发，联动自然取消。禁用 @Scheduled / Spring 托管调度 —— 自建守护线程
++ * （理由见 SseConnectionRegistry）。
++ *
++ * <p><b>幂等（防重复建单），三层防线：</b>
++ * <ol>
++ *   <li>实例内存防抖：60s 内同物料只处理一次（挡住连续出库的高频触发；跨实例场景由下层兜底）</li>
++ *   <li>material 行 FOR UPDATE：并发的低库存处理在同一物料行上自然串行化——锁住的正是
++ *       要核对的数据行本身，同时避开 pg_advisory_xact_lock 的 void 返回值在
++ *       JdbcTemplate 上的类型处理问题；拿锁后重查库存，已回升则跳过</li>
++ *   <li>开放工单查重：存在未完结（待处理/待审批/处理中）的同类型补货单且关联物料 CSV
++ *       精确命中本物料（排除逻辑删除行）则跳过</li>
++ * </ol>
++ */
++@Service
++public class LowStockService {
++    private static final Logger log = LoggerFactory.getLogger(LowStockService.class);
++    /** 实例内防抖窗口：同物料 60s 内只联动一次（通知是提醒性质，无需每次出库都提醒） */
++    static final long DEDUP_MS = 60_000L;
++    private static final String NOTIFY_TYPE = "STOCK_LOW";
++    private static final String WAREHOUSE_ROLE = "R-WAREHOUSE";
++
++    private final JdbcTemplate jdbc;
++    private final TransactionTemplate transactionTemplate;
++    private final ActorContext actorContext;
++    private final WorkorderService workorderService;
++    private final NotificationPort notificationPort;
++    private final String mode;
++    private final String woType;
++    private final Map<String, Long> lastSeenAt = new ConcurrentHashMap<>();
++    private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
++        Thread t = new Thread(r, "low-stock-linkage");
++        t.setDaemon(true);
++        return t;
++    });
++
++    public LowStockService(
++        JdbcTemplate jdbc,
++        TransactionTemplate transactionTemplate,
++        ActorContext actorContext,
++        WorkorderService workorderService,
++        NotificationPort notificationPort,
++        @Value("${dcim.linkage.low-stock.mode:notify}") String mode,
++        @Value("${dcim.linkage.low-stock.wo-type:补货}") String woType
++    ) {
++        this.jdbc = jdbc;
++        this.transactionTemplate = transactionTemplate;
++        this.actorContext = actorContext;
++        this.workorderService = workorderService;
++        this.notificationPort = notificationPort;
++        this.mode = mode == null ? "notify" : mode.trim();
++        this.woType = woType == null || woType.isBlank() ? "补货" : woType.trim();
++    }
++
++    /**
++     * checkLowStock 命中时回调（处于业务事务内）：仅注册 afterCommit 钩子，
++     * 实际联动在事务提交后由守护线程执行；off 模式零开销直接返回。
++     */
++    public void onLowStock(String materialCode, String name, int stock, int safetyStock, String unit, String triggerLogNo) {
++        if (this.isOff() || materialCode == null || materialCode.isBlank()) {
++            return;
++        }
++        long now = System.currentTimeMillis();
++        Long last = this.lastSeenAt.get(materialCode);
++        if (last != null && now - last < DEDUP_MS) {
++            return;
++        }
++        this.lastSeenAt.put(materialCode, now);
++        String code = materialCode.trim();
++        Runnable job = () -> this.handle(code, name, stock, safetyStock, unit, triggerLogNo);
++        // 触发时的快照仅用于 notify 模式的文案；ticket 模式在事务内重查最新值
++        if (TransactionSynchronizationManager.isSynchronizationActive()) {
++            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++                @Override
++                public void afterCommit() {
++                    LowStockService.this.submit(job);
++                }
++            });
++        } else {
++            this.submit(job);
++        }
++    }
++
++    private boolean isOff() {
++        return "off".equalsIgnoreCase(this.mode);
++    }
++
++    private void submit(Runnable job) {
++        try {
++            this.executor.execute(() -> {
++                try {
++                    job.run();
++                } catch (RuntimeException e) {
++                    log.warn("[linkage] 低库存联动处理失败（不影响出入库）：{}", e.toString(), e);
++                }
++            });
++        } catch (RuntimeException e) {
++            log.warn("[linkage] 低库存联动任务提交失败：{}", e.toString());
++        }
++    }
++
++    private void handle(String code, String name, int stock, int safetyStock, String unit, String triggerLogNo) {
++        if ("ticket".equalsIgnoreCase(this.mode)) {
++            this.handleTicket(code, name, unit, triggerLogNo);
++        } else {
++            this.notifyWarehouse(code, name, stock, safetyStock, unit);
++        }
++    }
++
++    /** notify 模式：站内信通知仓库管理员（NotificationAdapter 落库后自动叠加 SSE 实时推送）。 */
++    private void notifyWarehouse(String code, String name, int stock, int safetyStock, String unit) {
++        String title = "物料库存低于安全线";
++        String content = "物料 " + code + "「" + name + "」当前库存 " + stock + (unit == null ? "" : " " + unit)
++            + "，已低于安全库存 " + safetyStock + "，请及时安排补货";
++        this.notificationPort.notifyRole(WAREHOUSE_ROLE, NOTIFY_TYPE, title, content, code);
++    }
++
++    /** ticket 模式：新事务内行锁 → 重查 → 查重 → 建单；建单成功后通知仓库管理员。 */
++    private void handleTicket(String code, String name, String unit, String triggerLogNo) {
++        String woNo = this.transactionTemplate.execute(status -> this.createTicketIfAbsent(code, name, unit, triggerLogNo));
++        if (woNo != null) {
++            String title = "物料低库存已自动创建补货工单";
++            String content = "物料 " + code + "「" + name + "」库存低于安全线，系统已自动创建补货工单 "
++                + woNo + "，请及时跟进采购 / 入库（触发流水：" + (triggerLogNo == null ? "未知" : triggerLogNo) + "）";
++            this.notificationPort.notifyRole(WAREHOUSE_ROLE, NOTIFY_TYPE, title, content, woNo);
++        }
++    }
++
++    /**
++     * 在调用方事务（executor 线程开启的新事务）内执行：material 行锁 → 重查库存 →
++     * 开放补货单查重 → 建单。返回新建工单号；库存已回升 / 已有开放单 / 配置异常返回 null。
++     */
++    private String createTicketIfAbsent(String code, String name, String unit, String triggerLogNo) {
++        Map<String, Object> m = this.jdbc
++            .queryForMap("SELECT name, unit, COALESCE(stock, 0) AS stock, COALESCE(safety_stock, 0) AS safety FROM material WHERE material_code = ? FOR UPDATE", code);
++        String materialName = m.get("name") == null ? name : String.valueOf(m.get("name"));
++        String materialUnit = m.get("unit") == null ? unit : String.valueOf(m.get("unit"));
++        int stock = ((Number) m.get("stock")).intValue();
++        int safety = ((Number) m.get("safety")).intValue();
++        if (safety <= 0 || stock >= safety) {
++            log.info("[linkage] 物料 {} 低库存联动跳过：库存已回升或安全库存无效（stock={}, safety={}）", code, stock, safety);
++            return null;
++        }
++        Integer open = this.jdbc
++            .queryForObject(
++                "SELECT COUNT(*) FROM workorder WHERE deleted_at IS NULL AND wo_type = ?"
++                    + " AND status IN ('待处理','待审批','处理中')"
++                    + " AND (',' || COALESCE(related_materials, '') || ',') LIKE '%,' || ? || ',%'",
++                Integer.class,
++                this.woType,
++                code
++            );
++        if (open != null && open > 0) {
++            log.info("[linkage] 物料 {} 已存在未完结的「{}」工单，跳过重复建单", code, this.woType);
++            return null;
++        }
++        int suggest = safety - stock;
++        String title = "补货：" + materialName + "（" + code + "）";
++        String desc = "物料 " + code + "「" + materialName + "」当前库存 " + stock + (materialUnit == null ? "" : " " + materialUnit)
++            + "，低于安全库存 " + safety + "，建议补货 " + suggest + "。本工单由系统在库存低于安全线时自动创建（触发流水："
++            + (triggerLogNo == null ? "未知" : triggerLogNo) + "），请仓库管理员跟进采购 / 入库。";
++        WorkorderEntity wo = this.actorContext
++            .runAs(
++                null,
++                () -> this.workorderService
++                    .create(this.woType, title, desc, "高", null, List.of(code), suggest, null, null, null, null, null, null, null, null, null)
++            );
++        log.info("[linkage] 物料 {} 低库存自动创建「{}」工单 {}（stock={}, safety={}, 建议量={}）", code, this.woType, wo.getWoNo(), stock, safety, suggest);
++        return wo.getWoNo();
++    }
++
++    @PreDestroy
++    void stop() {
++        this.executor.shutdownNow();
++    }
++}
+diff --git a/backend-src/com/dcim/webhook/service/WebhookDispatcher.java b/backend-src/com/dcim/webhook/service/WebhookDispatcher.java
+index 6a64263..c59ce08 100644
+--- a/backend-src/com/dcim/webhook/service/WebhookDispatcher.java
++++ b/backend-src/com/dcim/webhook/service/WebhookDispatcher.java
+@@ -1,6 +1,7 @@
+ package com.dcim.webhook.service;
+ 
+ import com.dcim.common.event.DomainEvent;
++import com.dcim.warehouse.service.LowStockService;
+ import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+@@ -42,15 +43,17 @@ public class WebhookDispatcher {
+     private final WebhookService webhookService;
+     private final JdbcTemplate jdbc;
+     private final TransactionTemplate savepoint;
++    private final LowStockService lowStockService;
+     static final long SUBSCRIPTION_TTL_MS = 5000L;
+     private volatile Set<String> subscribed;
+     private volatile long subscribedAt;
+ 
+-    public WebhookDispatcher(WebhookService webhookService, JdbcTemplate jdbc, PlatformTransactionManager txm) {
++    public WebhookDispatcher(WebhookService webhookService, JdbcTemplate jdbc, PlatformTransactionManager txm, LowStockService lowStockService) {
+         this.webhookService = webhookService;
+         this.jdbc = jdbc;
+         this.savepoint = new TransactionTemplate(txm);
+         this.savepoint.setPropagationBehavior(TransactionDefinition.PROPAGATION_NESTED);
++        this.lowStockService = lowStockService;
+     }
+ 
+     @TransactionalEventListener(
+@@ -59,7 +62,11 @@ public class WebhookDispatcher {
+     )
+     public void onEvent(DomainEvent event) {
+         try {
+-            if (!this.anySubscriber(event.type())) {
++            // v3.5.1：低库存联动（站内信 / 自动补货单）是平台内部能力，只由 dcim.linkage.low-stock.mode
++            // 决定，不能被「无人订阅 webhook」门控——否则没配 Webhook 的部署里联动整体失效（CT-13 回归）。
++            // stock.movement 因此总是进入保存点：无订阅时 enqueue 对不匹配事件自然返回 0（不写投递行），
++            // 额外开销只是一条端点 SELECT；出入库并非批量导入热点，其余事件类型的跳过优化保持不变。
++            if (!"stock.movement".equals(event.type()) && !this.anySubscriber(event.type())) {
+                 return;
+             }
+             this.savepoint.executeWithoutResult(status -> {
+@@ -122,6 +129,18 @@ public class WebhookDispatcher {
+                     data.put("unit", m.get("unit"));
+                     data.put("trigger", event.data().get("logNo"));
+                     this.webhookService.enqueue(DomainEvent.of("stock.low", "material", event.objId(), event.actor(), data));
++                    // v3.5 联动：站内信通知 / 自动补货单。此处处于业务事务 BEFORE_COMMIT，
++                    // LowStockService 只注册 afterCommit 钩子，实际联动在提交后异步执行
++                    // （尽力而为，绝不影响出入库与 webhook 投递）
++                    this.lowStockService
++                        .onLowStock(
++                            String.valueOf(m.get("material_code")),
++                            String.valueOf(m.get("name")),
++                            stock,
++                            safety,
++                            String.valueOf(m.get("unit")),
++                            String.valueOf(event.data().get("logNo"))
++                        );
+                 }
+             }
+         }
+diff --git a/backend-src/com/dcim/workorder/service/SlaEscalationService.java b/backend-src/com/dcim/workorder/service/SlaEscalationService.java
+index 625e9ec..a2ad43a 100644
+--- a/backend-src/com/dcim/workorder/service/SlaEscalationService.java
++++ b/backend-src/com/dcim/workorder/service/SlaEscalationService.java
+@@ -3,6 +3,9 @@ package com.dcim.workorder.service;
+ import com.baomidou.mybatisplus.core.conditions.Wrapper;
+ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
++import com.dcim.common.event.DomainEvent;
++import com.dcim.common.event.EventTypes;
++import com.dcim.common.event.UnifiedEventPublisher;
+ import com.dcim.common.notify.NotificationPort;
+ import com.dcim.workorder.entity.SlaConfigEntity;
+ import com.dcim.workorder.entity.WorkorderEntity;
+@@ -10,7 +13,9 @@ import com.dcim.workorder.mapper.SlaConfigMapper;
+ import com.dcim.workorder.mapper.WorkorderMapper;
+ import com.dcim.workorder.sla.SlaPolicy;
+ import java.time.LocalDateTime;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.jdbc.core.JdbcTemplate;
+@@ -28,6 +33,7 @@ public class SlaEscalationService {
+     private final WorkorderMapper workorderMapper;
+     private final SlaConfigMapper slaConfigMapper;
+     private final NotificationPort notificationPort;
++    private final UnifiedEventPublisher events;
+     private final JdbcTemplate jdbc;
+     private final TransactionTemplate transactionTemplate;
+ 
+@@ -98,6 +104,17 @@ public class SlaEscalationService {
+                 if (cfg != null && cfg.getEscalateTo() != null && !cfg.getEscalateTo().isBlank()) {
+                     this.notificationPort.notifyRole(cfg.getEscalateTo().trim(), "SLA", title, content, wo.getWoNo());
+                 }
++                // v3.5：补发领域事件（webhook 发件箱 + SSE 广播）；此处处于 runOnce 的事务内，
++                // BEFORE_COMMIT 入发件箱、AFTER_COMMIT 才广播，站内信保持上面不动
++                Map<String, Object> data = new LinkedHashMap<>();
++                data.put("woNo", wo.getWoNo());
++                data.put("title", wo.getTitle());
++                data.put("woType", wo.getWoType());
++                data.put("priority", wo.getPriority());
++                data.put("times", times);
++                data.put("deadline", wo.getSlaResolveDeadline() == null ? null : wo.getSlaResolveDeadline().toString());
++                data.put("handler", wo.getHandler());
++                this.events.publish(DomainEvent.of(EventTypes.WORKORDER_SLA_ESCALATED, "workorder", wo.getWoNo(), "system", data));
+             }
+         }
+ 
+@@ -106,12 +123,14 @@ public class SlaEscalationService {
+ 
+     
+     public SlaEscalationService(
+-        final WorkorderMapper workorderMapper, final SlaConfigMapper slaConfigMapper, final NotificationPort notificationPort, final JdbcTemplate jdbc,
++        final WorkorderMapper workorderMapper, final SlaConfigMapper slaConfigMapper, final NotificationPort notificationPort, final UnifiedEventPublisher events,
++        final JdbcTemplate jdbc,
+         final TransactionTemplate transactionTemplate
+     ) {
+         this.workorderMapper = workorderMapper;
+         this.slaConfigMapper = slaConfigMapper;
+         this.notificationPort = notificationPort;
++        this.events = events;
+         this.jdbc = jdbc;
+         this.transactionTemplate = transactionTemplate;
+     }
+diff --git a/backend-src/com/dcim/workorder/service/WorkorderService.java b/backend-src/com/dcim/workorder/service/WorkorderService.java
+index 6e6096b..dbccc42 100644
+--- a/backend-src/com/dcim/workorder/service/WorkorderService.java
++++ b/backend-src/com/dcim/workorder/service/WorkorderService.java
+@@ -1817,8 +1817,19 @@ public class WorkorderService {
+                 this.notificationPort
+                     .notifyUser(before.getApplicantUsername(), "WO_REJECT", "工单被驳回", summary + " 被驳回，意见：" + (opinion == null ? "" : opinion), woNo);
+                 break;
++            case "开始处理":
++                this.notificationPort.notifyUser(before.getApplicantUsername(), "WO_STARTED", "工单已开始处理", summary + " 已开始处理，当前状态：" + to, woNo);
++                break;
+             case "完成工单":
+                 this.notificationPort.notifyUser(before.getApplicantUsername(), "WO_DONE", "工单已完成", summary + " 已完成", woNo);
++                break;
++            case "关闭": {
++                // v3.5：补全关闭通知（申请人与处理人都需知情，关闭意见随通知带出）
++                String closedContent = summary + " 已关闭" + (opinion == null || opinion.isBlank() ? "" : "，关闭意见：" + opinion.trim());
++                this.notificationPort.notifyUser(before.getApplicantUsername(), "WO_CLOSED", "工单已关闭", closedContent, woNo);
++                this.notificationPort.notifyUser(before.getHandler(), "WO_CLOSED", "工单已关闭", closedContent, woNo);
++                break;
++            }
+         }
+     }
+ 

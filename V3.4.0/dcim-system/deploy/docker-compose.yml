@@ -1,0 +1,569 @@
+# ============================================================
+# 智算资产管理平台 v3.5 — Docker Compose 生产部署
+#
+# 服务：postgres / redis / minio / tdengine / platform-be / platform-web /
+#       caddy（统一入口 80/443）/ collector-agent / backup（定时备份 + 每周恢复验证）
+#       监控（profile monitoring）：prometheus / alertmanager / blackbox-exporter
+#       可选 profile：ipmi（ipmi-exporter）、snmp（snmp-exporter）、grafana
+#
+# 推荐用安装目录下的 ./dcimctl 操作（封装了 --env-file 与 -f）：
+#   ./dcimctl start | stop | status | logs [服务] | backup | upgrade ...
+# 等价的原生命令（安装目录下执行）：
+#   docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
+#
+# v3.3：
+#   * 平台 / 前端 / 入口 / 监控容器加 no-new-privileges；Webhook 默认禁止访问本容器网段
+#   * 新增 DCIM_CRYPTO_KEY_OLD（加密密钥轮换）、DCIM_ALLOW_LEAKED_SECRETS（外泄密钥应急开关）
+#   * collector-agent 仅在安装包含 collector-agent/ 源码时启用（install.sh 自动判断）
+#
+# 与 v3.0 的差异：
+#   * 后端/前端镜像改为「预编译产物 + 运行时镜像」，目标机无需 Maven/Node，也不再在构建期联网下载依赖
+#   * 镜像源前缀统一为 IMAGE_REGISTRY（默认 docker.m.daocloud.io），内网可改为私有仓库
+#   * 新装环境不再初始化已下线旧系统的 dcim 库；老环境升级时数据目录原样复用
+#   * 新增 tdengine-init：首次启动把 TDengine root 口令改为 TDENGINE_PASSWORD（此前需人工 ALTER，漏做则指标写入全失败）
+#   * 后端健康检查不再依赖镜像内 curl（运行时镜像零 apt 安装，可离线构建）
+# ============================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  # ─── PostgreSQL 16 ───
+  postgres:
+    image: ${POSTGRES_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/library/postgres:16-alpine}
+    container_name: dcim-postgres
+    environment:
+      POSTGRES_DB: platform
+      POSTGRES_USER: dcim
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?请先设置 PG_PASSWORD}
+      TZ: ${TZ:-Asia/Shanghai}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - ${DATA_DIR:-../data}/pgdata:/var/lib/postgresql/data
+      # 幂等：platform 库不存在时创建（老环境 POSTGRES_DB=dcim 初始化的数据目录也能用）
+      - ./init-databases.sh:/docker-entrypoint-initdb.d/90-platform-db.sh:ro
+      - ${DATA_DIR:-../data}/pg-backups:/backups
+    ports:
+      # 仅回环：远程运维请走 SSH 隧道，避免内网对数据库口令爆破
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+        -c effective_cache_size=${PG_EFFECTIVE_CACHE:-1536MB}
+        -c maintenance_work_mem=128MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c work_mem=8MB
+        -c min_wal_size=1GB
+        -c max_wal_size=4GB
+        -c shared_preload_libraries=pg_stat_statements
+        -c log_min_duration_statement=500
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dcim -d platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    security_opt:
+      - ${SECCOMP_OPT:-seccomp:unconfined}   # 老内核宿主默认 seccomp 会拦部分系统调用导致 PG 反复崩溃
+    shm_size: 256mb
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${PG_MEM_LIMIT:-2G}
+    logging: *default-logging
+
+  # ─── Redis（会话 refresh token / 用户权限缓存 / 接口限流）───
+  redis:
+    image: ${REDIS_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/library/redis:7-alpine}
+    container_name: dcim-redis
+    command: >
+      redis-server
+        --requirepass ${REDIS_PASSWORD:?请先设置 REDIS_PASSWORD}
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 256mb
+        --maxmemory-policy volatile-lru
+        --save 60 1000
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - ${DATA_DIR:-../data}/redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    logging: *default-logging
+
+  # ─── MinIO（工单附件对象存储，仅内网）───
+  minio:
+    image: ${MINIO_IMAGE:-docker.1ms.run/bitnamilegacy/minio:latest}  # v3.4：install.sh 首次拉取后会把它锁定为镜像摘要写入 .env
+    container_name: dcim-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?请先设置 MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?请先设置 MINIO_SECRET_KEY}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ${DATA_DIR:-../data}/minio-data:/bitnami/minio/data
+    security_opt:
+      - ${SECCOMP_OPT:-seccomp:unconfined}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/minio/health/live || mc ready local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging: *default-logging
+
+  # ─── TDengine（GPU 指标时序库，taosAdapter REST :6041）───
+  tdengine:
+    image: ${TDENGINE_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/tdengine/tdengine:3.3.2.0}
+    container_name: dcim-tdengine
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      TDENGINE_PASSWORD: ${TDENGINE_PASSWORD:?请先设置 TDENGINE_PASSWORD}
+    volumes:
+      - ${DATA_DIR:-../data}/tdengine-data:/var/lib/taos
+      - ${DATA_DIR:-../data}/tdengine-log:/var/log/taos
+    ports:
+      - "127.0.0.1:${TDENGINE_PORT:-6041}:6041"
+    healthcheck:
+      # 以目标口令能登录才算健康（首次启动需 tdengine-init 改完口令后才会变 healthy）
+      test: ["CMD-SHELL", "taos -uroot -p\"$${TDENGINE_PASSWORD}\" -s 'SELECT SERVER_VERSION();' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging: *default-logging
+
+  # ─── 一次性：把 TDengine root 口令从镜像默认 taosdata 改为 TDENGINE_PASSWORD（幂等）───
+  #     此前需人工 ALTER USER，新装环境漏做则后端 GPU 指标写入全部鉴权失败。
+  #     改口令失败只告警不阻断（后端照常启动，指标写入会在日志里报错）。
+  tdengine-init:
+    image: ${TDENGINE_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/tdengine/tdengine:3.3.2.0}
+    container_name: dcim-tdengine-init
+    depends_on:
+      tdengine:
+        condition: service_started
+    environment:
+      TDENGINE_PASSWORD: ${TDENGINE_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        i=0
+        while [ $$i -lt 60 ]; do
+          i=$$((i+1))
+          if taos -h tdengine -uroot -p"$${TDENGINE_PASSWORD}" -s "SELECT SERVER_VERSION();" >/dev/null 2>&1; then
+            echo "[tdengine-init] 口令已是目标值"; exit 0
+          fi
+          if taos -h tdengine -uroot -ptaosdata -s "ALTER USER root PASS '$${TDENGINE_PASSWORD}';" >/dev/null 2>&1; then
+            echo "[tdengine-init] 已将 root 口令由默认值改为 TDENGINE_PASSWORD"; exit 0
+          fi
+          sleep 3
+        done
+        echo "[tdengine-init] 警告：3 分钟内无法以默认或目标口令登录 TDengine，请人工核对（不阻断后端启动）" >&2
+        exit 0
+    restart: "no"
+    logging: *default-logging
+
+  # ─── 平台后端（Spring Boot :8081；启动自动执行 Flyway 迁移）───
+  platform-be:
+    build:
+      context: ..
+      dockerfile: deploy/docker/backend.Dockerfile
+      args:
+        BASE_IMAGE: ${BACKEND_BASE_IMAGE:-docker.m.daocloud.io/library/eclipse-temurin:17-jre}
+    image: dcim-platform-be:${DCIM_VERSION:-3.5.2}
+    container_name: dcim-platform-be
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      tdengine-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${PLATFORM_BE_PORT:-8081}:8081"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/platform
+      SPRING_DATASOURCE_USERNAME: dcim
+      SPRING_DATASOURCE_PASSWORD: ${PG_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?请先设置 JWT_SECRET（openssl rand -hex 64）}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+      DCIM_CRYPTO_KEY: ${DCIM_CRYPTO_KEY:?请先设置 DCIM_CRYPTO_KEY（openssl rand -base64 32）}
+      # 密钥轮换：旧加密密钥（逗号分隔）。后端启动时把旧密文重加密为新密钥，完成后可清空
+      DCIM_CRYPTO_KEY_OLD: ${DCIM_CRYPTO_KEY_OLD:-}
+      DCIM_ALLOW_LEAKED_SECRETS: ${DCIM_ALLOW_LEAKED_SECRETS:-false}
+      DCIM_AGENT_KEY: ${DCIM_AGENT_KEY:?请先设置 DCIM_AGENT_KEY（openssl rand -hex 32）}
+      STORAGE_TYPE: ${STORAGE_TYPE:-minio}
+      UPLOAD_DIR: /app/data/uploads
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-dcim-attachments}
+      DCIM_METRICS_STORE: ${DCIM_METRICS_STORE:-tdengine}
+      # v3.5.2：带外快照保留天数（0 = 不清理；每日凌晨分批删除超期快照）
+      DCIM_COLLECTOR_SNAPSHOT_RETENTION_DAYS: ${DCIM_COLLECTOR_SNAPSHOT_RETENTION_DAYS:-180}
+      TDENGINE_URL: http://tdengine:6041
+      TDENGINE_USERNAME: root
+      TDENGINE_PASSWORD: ${TDENGINE_PASSWORD}
+      TDENGINE_DATABASE: ${TDENGINE_DATABASE:-dcim_metrics}
+      WECOM_ENABLED: ${WECOM_ENABLED:-false}
+      WECOM_CORP_ID: ${WECOM_CORP_ID:-}
+      WECOM_AGENT_ID: ${WECOM_AGENT_ID:-}
+      WECOM_SECRET: ${WECOM_SECRET:-}
+      DCIM_ADMIN_INITIAL_PASSWORD: ${DCIM_ADMIN_INITIAL_PASSWORD:-}
+      DCIM_DEV_LOGIN_ENABLED: "false"
+      AUDIT_RETAIN_MONTHS: ${AUDIT_RETAIN_MONTHS:-6}
+      # 接口限流（v3.4）：每 IP 每分钟防洪闸（0 = 关闭全部限流）+ 按用户的令牌桶
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-3000}
+      RATE_LIMIT_USER_RPS: ${RATE_LIMIT_USER_RPS:-20}
+      RATE_LIMIT_USER_BURST: ${RATE_LIMIT_USER_BURST:-40}
+      RATE_LIMIT_ANON_RPS: ${RATE_LIMIT_ANON_RPS:-10}
+      RATE_LIMIT_ANON_BURST: ${RATE_LIMIT_ANON_BURST:-20}
+      RATE_LIMIT_HEAVY_PER_MINUTE: ${RATE_LIMIT_HEAVY_PER_MINUTE:-10}
+      # 登录防护（v3.4）：账号跨 IP 失败上限 / 锁定分钟 / 可信 IP 天数
+      LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL: ${LOGIN_MAX_FAIL_PER_ACCOUNT_GLOBAL:-30}
+      LOGIN_ACCOUNT_LOCK_MINUTES: ${LOGIN_ACCOUNT_LOCK_MINUTES:-15}
+      LOGIN_TRUSTED_IP_DAYS: ${LOGIN_TRUSTED_IP_DAYS:-30}
+      # 数据库连接池（v3.4）：多实例时 实例数 × DB_POOL_MAX 须小于 postgres 的 max_connections（200）
+      DB_POOL_MAX: ${DB_POOL_MAX:-20}
+      DB_POOL_TIMEOUT_MS: ${DB_POOL_TIMEOUT_MS:-10000}
+      WEBHOOK_ALLOW_PRIVATE: ${WEBHOOK_ALLOW_PRIVATE:-true}
+      # 禁止 Webhook 推送到平台所在容器网段（防止按 IP 访问 Prometheus/Alertmanager/MinIO 等内部服务）
+      WEBHOOK_BLOCK_LOCAL_SUBNETS: ${WEBHOOK_BLOCK_LOCAL_SUBNETS:-true}
+      # 监控接入令牌（Prometheus 服务发现 / Alertmanager 回调共用）与 Prometheus 地址
+      MONITORING_TOKEN: ${MONITORING_TOKEN:-}
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      # LDAP / AD 统一登录（可选，见 docs/DEPLOY.md 第 9 节）
+      LDAP_ENABLED: ${LDAP_ENABLED:-false}
+      LDAP_URL: ${LDAP_URL:-}
+      LDAP_BASE_DN: ${LDAP_BASE_DN:-}
+      LDAP_BIND_DN: ${LDAP_BIND_DN:-}
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD:-}
+      LDAP_USER_FILTER: ${LDAP_USER_FILTER:-(&(objectClass=user)(sAMAccountName={0}))}
+      LDAP_NAME_ATTR: ${LDAP_NAME_ATTR:-displayName}
+      LDAP_GROUP_ROLE_MAP: ${LDAP_GROUP_ROLE_MAP:-}
+      LDAP_DEFAULT_ROLE: ${LDAP_DEFAULT_ROLE:-VIEWER}
+      JDBC_QUERY_TIMEOUT: ${JDBC_QUERY_TIMEOUT:-120}
+      JAVA_OPTS: ${JAVA_OPTS:--Xms512m -Xmx1024m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError}
+    volumes:
+      - ${DATA_DIR:-../data}/uploads:/app/data/uploads
+    healthcheck:
+      # /api/healthz：匿名只读探针，真实执行 SELECT 1，DB 不可用回 503
+      test: ["CMD-SHELL", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    security_opt:
+      - seccomp:unconfined   # 应用容器已启用 no-new-privileges；默认 seccomp 在老 Docker 上会让 Java 线程创建失败
+      - no-new-privileges:true
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${BE_MEM_LIMIT:-1536M}
+    logging: *default-logging
+
+  # ─── 前端（nginx 静态 SPA；/api 由 Caddy 分流）───
+  platform-web:
+    build:
+      context: ..
+      dockerfile: deploy/docker/web.Dockerfile
+      args:
+        BASE_IMAGE: ${WEB_BASE_IMAGE:-docker.m.daocloud.io/library/nginx:1.27-alpine}
+    image: dcim-platform-web:${DCIM_VERSION:-3.5.2}
+    container_name: dcim-platform-web
+    security_opt:
+      - seccomp:unconfined   # 应用容器已启用 no-new-privileges；默认 seccomp 在老 Docker 上会让 Java 线程创建失败
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    logging: *default-logging
+
+  # ─── 采集器（拉取式：发现任务 + 带外快照 + GPU 指标）───
+  #     需能路由到 BMC 带外网段；跨网段部署时可单独在管理节点运行（见 docs/DEPLOY.md）
+  collector-agent:
+    build:
+      context: ../collector-agent
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${AGENT_BASE_IMAGE:-docker.m.daocloud.io/library/python:3.12-slim}
+    image: dcim-collector-agent:${DCIM_VERSION:-3.5.2}
+    container_name: dcim-collector-agent
+    # 默认随栈启动（.env 中 COMPOSE_PROFILES=collector）；采集器部署在其他管理节点时去掉该值即可
+    profiles: ["collector"]
+    depends_on:
+      platform-be:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PLATFORM_URL: http://platform-be:8081
+      AGENT_KEY: ${DCIM_AGENT_KEY}
+      POLL_INTERVAL_SEC: ${AGENT_POLL_INTERVAL_SEC:-15}
+      # 必须显式关闭 mock：agent.py 默认 mock=True，生产会采到伪造数据
+      MOCK: ${AGENT_MOCK:-false}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *default-logging
+
+  # ─── 统一入口 Caddy（80/443；路由与安全头见 Caddyfile）───
+  caddy:
+    image: ${CADDY_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/library/caddy:2-alpine}
+    container_name: dcim-caddy
+    security_opt:
+      - seccomp:unconfined   # 应用容器已启用 no-new-privileges；默认 seccomp 在老 Docker 上会让 Java 线程创建失败
+      - no-new-privileges:true
+    depends_on:
+      platform-be:
+        condition: service_started
+      platform-web:
+        condition: service_started
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./tls:/tls:ro
+      - caddy-data:/data
+      - caddy-config:/config
+      - ${DATA_DIR:-../data}/caddy-logs:/var/log/caddy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    logging: *default-logging
+
+  # ─── 定时备份：每日 02:00 / 每周日 03:00 / 每月 1 日 04:00；每周日 05:00 自动恢复验证 ───
+  backup:
+    image: ${POSTGRES_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/library/postgres:16-alpine}
+    container_name: dcim-backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: dcim
+      PGPASSWORD: ${PG_PASSWORD}
+      PGDATABASE: platform
+      TZ: ${TZ:-Asia/Shanghai}
+      RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+    volumes:
+      - ${DATA_DIR:-../data}/pg-backups:/backups
+      - ../scripts/backup.sh:/usr/local/bin/backup.sh:ro
+      - ../scripts/restore-verify.sh:/usr/local/bin/restore-verify.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat > /etc/crontabs/root <<'CRON'
+        0 2 * * * /bin/bash /usr/local/bin/backup.sh daily >> /backups/backup.log 2>&1
+        0 3 * * 0 /bin/bash /usr/local/bin/backup.sh weekly >> /backups/backup.log 2>&1
+        0 4 1 * * /bin/bash /usr/local/bin/backup.sh monthly >> /backups/backup.log 2>&1
+        0 5 * * 0 /bin/sh /usr/local/bin/restore-verify.sh >> /backups/restore-verify.cron.log 2>&1
+        CRON
+        echo "备份计划已启动: daily=02:00 weekly=周日03:00 monthly=每月1日04:00 restore-verify=周日05:00"
+        exec crond -f -l 2
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *default-logging
+
+  # ═════════════ 监控告警（v3.2）═════════════
+  # Prometheus 从平台 CMDB 自动发现监控目标；Alertmanager 把告警推回平台（告警中心 / 自动派单 / IM 推送）。
+  # 不需要监控栈时：在 .env 的 COMPOSE_PROFILES 中去掉 monitoring。
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/prom/prometheus:}${PROMETHEUS_VERSION:-v2.54.1}
+    container_name: dcim-prometheus
+    security_opt:
+      - no-new-privileges:true
+    profiles: ["monitoring"]
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROM_RETENTION:-30d}
+      - --storage.tsdb.retention.size=${PROM_RETENTION_SIZE:-50GB}
+      # v3.4：不再开启 --web.enable-lifecycle（任何能访问 9090 的进程都能 POST /-/quit 关停监控）；
+      # 热加载改为 dcimctl monitoring reload 发送 SIGHUP
+      - --web.external-url=${PROM_EXTERNAL_URL:-http://localhost:9090}
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+      - ./monitoring/secrets:/etc/prometheus/secrets:ro
+      - ${DATA_DIR:-../data}/prometheus-data:/prometheus
+    ports:
+      # 仅回环：运维排障用 SSH 隧道访问；平台通过内部网络代理查询
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      platform-be:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${PROM_MEM_LIMIT:-4G}
+    logging: *default-logging
+
+  alertmanager:
+    image: ${ALERTMANAGER_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/prom/alertmanager:}${ALERTMANAGER_VERSION:-v0.27.0}
+    container_name: dcim-alertmanager
+    security_opt:
+      - no-new-privileges:true
+    profiles: ["monitoring"]
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --cluster.listen-address=
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./monitoring/secrets:/etc/alertmanager/secrets:ro
+      - ${DATA_DIR:-../data}/alertmanager-data:/alertmanager
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9093/-/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *default-logging
+
+  # Ping / TCP / HTTP 探测（ICMP 需要 NET_RAW）
+  blackbox-exporter:
+    image: ${BLACKBOX_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/prom/blackbox-exporter:}${BLACKBOX_VERSION:-v0.25.0}
+    container_name: dcim-blackbox
+    profiles: ["monitoring"]
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    cap_add: ["NET_RAW"]
+    volumes:
+      - ./monitoring/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *default-logging
+
+  # 可选：BMC 带外硬件传感器（COMPOSE_PROFILES 加 ipmi；凭据见 monitoring/ipmi_remote.yml）
+  ipmi-exporter:
+    image: ${IPMI_EXPORTER_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/prometheuscommunity/ipmi-exporter:}${IPMI_EXPORTER_VERSION:-v1.8.0}
+    container_name: dcim-ipmi-exporter
+    profiles: ["ipmi"]
+    command: ["--config.file=/config.yml"]
+    volumes:
+      - ./monitoring/ipmi_remote.yml:/config.yml:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *default-logging
+
+  # 可选：交换机 / PDU / UPS / 精密空调（COMPOSE_PROFILES 加 snmp；默认 community=public，见 docs/MONITORING.md）
+  snmp-exporter:
+    image: ${SNMP_EXPORTER_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/prom/snmp-exporter:}${SNMP_EXPORTER_VERSION:-v0.26.0}
+    container_name: dcim-snmp-exporter
+    profiles: ["snmp"]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *default-logging
+
+  # 可选：Grafana 自定义大盘（COMPOSE_PROFILES 加 grafana；平台内已有告警中心与资产指标页，非必需）
+  grafana:
+    image: ${GRAFANA_IMAGE:-${IMAGE_REGISTRY:-docker.m.daocloud.io}/grafana/grafana:}${GRAFANA_VERSION:-11.2.0}
+    container_name: dcim-grafana
+    security_opt:
+      - no-new-privileges:true
+    profiles: ["grafana"]
+    user: "472"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${DATA_DIR:-../data}/grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging: *default-logging
+
+volumes:
+  caddy-data:
+  caddy-config:
+
+networks:
+  default:
+    name: dcim-network

@@ -1,0 +1,17 @@
+CREATE INDEX IF NOT EXISTS idx_gpu_card_host_asset_no ON gpu_card(host_asset_no);
+CREATE INDEX IF NOT EXISTS idx_workorder_item_wo_no ON workorder_item(wo_no);
+CREATE INDEX IF NOT EXISTS idx_workorder_flow_wo_no ON workorder_flow(wo_no);
+CREATE INDEX IF NOT EXISTS idx_discover_result_task_id ON discover_result(task_id);
+CREATE INDEX IF NOT EXISTS idx_bmc_endpoint_asset_no ON bmc_endpoint(asset_no);
+CREATE INDEX IF NOT EXISTS idx_asset_finance_asset_no ON asset_finance(asset_no);
+CREATE INDEX IF NOT EXISTS idx_ci_relation_src ON ci_relation(src_type, src_id);
+CREATE INDEX IF NOT EXISTS idx_ci_relation_dst ON ci_relation(dst_type, dst_id);
+CREATE INDEX IF NOT EXISTS idx_service_tree_parent ON service_tree(parent_id);
+CREATE INDEX IF NOT EXISTS idx_stock_log_material ON stock_log(material_code);
+CREATE INDEX IF NOT EXISTS idx_depreciation_record_asset ON depreciation_record(asset_no);
+CREATE INDEX IF NOT EXISTS idx_contract_asset_asset_no ON contract_asset(asset_no);
+CREATE INDEX IF NOT EXISTS idx_contract_asset_contract_no ON contract_asset(contract_no);
+CREATE INDEX IF NOT EXISTS idx_rfid_batch_item_batch ON rfid_batch_item(batch_no);
+CREATE INDEX IF NOT EXISTS idx_rfid_scan_record_batch ON rfid_scan_record(batch_no);
+CREATE INDEX IF NOT EXISTS idx_inventory_item_task ON inventory_item(task_no);
+CREATE INDEX IF NOT EXISTS idx_asset_event_asset_no ON asset_event(asset_no, event_time);

@@ -1,0 +1,24 @@
+[Unit]
+Description=DCIM Platform Backend (智算资产管理平台后端)
+After=network-online.target postgresql.service redis-server.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dcim
+Group=dcim
+EnvironmentFile=/etc/dcim/platform.env
+WorkingDirectory=@ROOT@
+ExecStart=@ROOT@/deploy/native/run-backend.sh
+Restart=on-failure
+RestartSec=10
+SuccessExitStatus=143
+LimitNOFILE=65536
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,2273 @@
+diff --git a/tests/README.md b/tests/README.md
+new file mode 100644
+index 0000000..a658b34
+--- /dev/null
++++ b/tests/README.md
+@@ -0,0 +1,81 @@
++# 回归测试套件（v3.4）
++
++一条命令跑完 9 层、80 个用例，输出控制台结果和三种报告（`report.md` 给人看，`junit.xml` 给 CI，`report.json` 给脚本）。
++只依赖 Python 3.9+ 和 `requests`；浏览器用例另需 `playwright`，数据库相关用例另需 `psql`。条件不满足的套件或用例会**跳过**，不会报错。
++
++```bash
++pip install requests                     # 必需
++pip install playwright                   # 可选：浏览器端到端（e2e）
++
++export ADMIN_PW='管理员口令'
++python3 tests/run_all.py                 # 全部套件
++python3 tests/run_all.py -s smoke,contract,permission,security,concurrency   # 发布门禁（约 1 分钟）
++python3 tests/run_all.py -k PF- --level P0                                   # 按编号前缀 / 级别筛选
++python3 tests/run_all.py --list          # 只列出用例
++```
++
++退出码：有失败或错误时为 1，可直接作为 CI 发布门禁。
++
++## 环境变量
++
++| 变量 | 默认值 | 说明 |
++|---|---|---|
++| `BASE` | `http://127.0.0.1:8081/api` | 被测后端（建议直连后端端口：测试用 `X-Forwarded-For` 模拟多个来源 IP，后端只信任本机 / 内网代理发来的该头） |
++| `ADMIN_USER` / `ADMIN_PW` | `admin` / 无 | 管理员账号；`ADMIN_PW` 必填 |
++| `UI_BASE` | `http://127.0.0.1:4173` | 前端地址（e2e 套件） |
++| `BASE2` | 无 | 第二个后端实例，与 `BASE` 共用同一数据库和 Redis（cluster 套件） |
++| `PGHOST` `PGUSER` `PGPASSWORD` `PGDATABASE` | 无 | 数据库直连（CL-06 读取 `job_lock`） |
++| `SLOW` | 无 | 设为 `1` 才运行耗时约 3 分钟的 CL-06 |
++| `PKG_DIR` | 无 | 解压后的安装包根目录（deploy 套件） |
++| `EXPECT_VERSION` | 无 | 设置后 SM-01 校验运行版本（升级后防止跑的仍是旧包） |
++| `PERF_FACTOR` | `1` | 性能预算倍数，较慢的测试机可设 `2` |
++| `PERF_MIN_ASSETS` | `50000` | 资产少于此数时跳过性能套件；可用 `seed_scale.sql` 灌数 |
++
++## 套件
++
++| 套件 | 编号 | 内容 | 前置条件 |
++|---|---|---|---|
++| smoke 冒烟 | SM | 健康检查、版本、登录、全部无参 GET 不出 5xx、未登录 401 | 后端 |
++| contract 接口契约 | CT | OpenAPI 完整性、写接口权限声明、统一响应结构、11 种关联资产写法（assetNos 回归） | 后端 |
++| permission 权限矩阵 | PM/PA/PS/PF/PC | 模块读写、删除显式授予、导出、数据范围、字段级权限、授权上限 | 后端 |
++| security 安全回归 | SE | 越权、会话吊销、令牌重放、用户名枚举、账号锁定、限流、审计、SSRF | 后端 |
++| concurrency 并发正确性 | CC | 唯一键、乐观锁、状态流转、编号生成、连接池、事务性发件箱 | 后端 |
++| performance 性能基线 | PERF | 8 个关键接口的延迟预算 + 多用户吞吐 | ≥5 万资产 |
++| e2e 浏览器端到端 | UI | 登录、界面建单落库、字段受限界面、角色字段权限编辑、接口文档、暗色模式 | 前端 + playwright |
++| cluster 多实例一致性 | CL | 跨实例会话吊销、账号停用、登录计数、限流共享、定时任务互斥 | `BASE2` |
++| deploy 安装包检查 | DP | 脚本语法、编排校验、敏感文件、权限、版本一致、迁移未改动、选包逻辑、监控热加载 | `PKG_DIR` |
++
++## 测试数据
++
++- 用例创建的角色以 `R34-` 开头、用户以 `t34-` 开头、资产名称以 `t34-` 开头，可按前缀清理；不会修改既有业务数据。
++- 角色和用户每次运行都会复位到用例需要的状态，重复运行结果一致。
++- 不要对生产库运行 concurrency / security 套件：它们会故意制造锁定账号、限流和大量测试工单。
++
++## 新增用例
++
++在 `suites/` 下对应文件里加一个函数即可，编号在套件内唯一：
++
++```python
++@case(S, "PF-11", "隐藏字段不出现在资产树接口里", risk="借旁路接口反推隐藏值", level="P1")
++def _(ctx):
++    ctx.role("R34-FLD2", {"assets": "r"}, fields={"assets": {"hidden": ["sn"]}})
++    u = ctx.user("t34-fld2", ["R34-FLD2"])
++    st, body = u.get("/assets/tree")
++    check(st == 200 and '"sn"' not in json.dumps(body), f"HTTP {st}")
++```
++
++- `ctx.admin` 管理员会话；`ctx.role()` / `ctx.user()` 准备角色与用户；`ctx.asset()` / `ctx.workorder()` 造数据；`ctx.sql()` 直连数据库（未配置时返回 `None`）。
++- `check(条件, 失败说明)` 断言；`skip(原因)` 跳过；返回字符串会写进报告的「说明」列。
++- 新的数据库迁移随版本发布后，运行 `python3 tests/tools/register_migrations.py` 把校验和登记进 `data/migration-checksums.json`，此后任何人改动已发布迁移都会被 DP-06 拦下。
++
++## 文件
++
++```
++run_all.py              入口
++lib/framework.py        用例注册、断言、报告（JSON / JUnit / Markdown）
++lib/context.py          会话、测试数据工厂、数据库直连
++suites/s10…s90          9 个套件
++data/migration-checksums.json   已发布迁移的 SHA-256 登记
++tools/register_migrations.py    登记新迁移
++seed_scale.sql          性能测试灌数（10 万资产）
++```
+diff --git a/tests/api.py b/tests/api.py
+deleted file mode 100644
+index 573b432..0000000
+--- a/tests/api.py
++++ /dev/null
+@@ -1,73 +0,0 @@
+-"""Minimal API helpers for black-box tests against a running backend."""
+-import requests, os, time, json
+-
+-BASE = os.environ.get("BASE", "http://127.0.0.1:8081/api")
+-ADMIN_PW_INIT = os.environ.get("ADMIN_PW_INIT", "Init#Pass2026x")
+-ADMIN_PW = os.environ.get("ADMIN_PW", "Adm1n#Strong-2026")
+-STRONG = "Str0ng#Pass-{}"
+-
+-def pw_for(username, tag=""):
+-    import hashlib
+-    return "Pw#9" + hashlib.sha1((username+tag).encode()).hexdigest()[:10] + "Xy"
+-
+-
+-class Client:
+-    def __init__(self, username=None):
+-        self.s = requests.Session()
+-        self.username = username
+-
+-    def req(self, method, path, **kw):
+-        r = self.s.request(method, BASE + path, timeout=60, **kw)
+-        try:
+-            body = r.json()
+-        except Exception:
+-            body = None
+-        return r.status_code, body
+-
+-    def get(self, p, **kw): return self.req("GET", p, **kw)
+-    def post(self, p, json=None, **kw): return self.req("POST", p, json=json, **kw)
+-    def put(self, p, json=None, **kw): return self.req("PUT", p, json=json, **kw)
+-    def delete(self, p, **kw): return self.req("DELETE", p, **kw)
+-
+-    def login(self, username, password):
+-        self.username = username
+-        return self.post("/auth/login", {"username": username, "password": password})
+-
+-
+-def admin():
+-    c = Client()
+-    st, b = c.login("admin", ADMIN_PW)
+-    if st != 200:
+-        st, b = c.login("admin", ADMIN_PW_INIT)
+-        assert st == 200, (st, b)
+-        st, b = c.put("/users/admin/password", {"oldPassword": ADMIN_PW_INIT, "newPassword": ADMIN_PW})
+-        assert st == 200, (st, b)
+-        c = Client(); st, b = c.login("admin", ADMIN_PW)
+-    assert st == 200, (st, b)
+-    return c
+-
+-
+-def ensure_user(adm, username, roles, password=None):
+-    password = password or pw_for(username)
+-    tmp = pw_for(username, "tmp")
+-    st, b = adm.post("/users", {"username": username, "name": username, "password": tmp, "roleCodes": roles})
+-    if st == 409:
+-        adm.put(f"/users/{username}", {"name": username, "password": tmp, "roleCodes": roles, "status": 1})
+-    c = Client()
+-    st, b = c.login(username, tmp)
+-    assert st == 200, (username, st, b)
+-    st, b = c.put(f"/users/{username}/password", {"oldPassword": tmp, "newPassword": password})
+-    assert st == 200, (username, st, b)
+-    c = Client(); st, b = c.login(username, password)
+-    assert st == 200, (st, b)
+-    return c
+-
+-
+-def ensure_role(adm, code, module_perms, data_scopes=None, action_perms=None):
+-    payload = {"roleCode": code, "name": code, "description": "test",
+-               "modulePerms": module_perms, "dataScopes": data_scopes or {},
+-               "fieldPerms": {}, "actionPerms": action_perms or {}}
+-    st, b = adm.post("/roles", payload)
+-    if st != 200:
+-        st, b = adm.put(f"/roles/{code}", payload)
+-    assert st == 200, (st, b)
+diff --git a/tests/crawl.py b/tests/crawl.py
+deleted file mode 100644
+index 413162b..0000000
+--- a/tests/crawl.py
++++ /dev/null
+@@ -1,21 +0,0 @@
+-"""Call every GET endpoint without path variables as admin; record status + top-level data shape."""
+-import sys, os, json, re
+-sys.path.insert(0, os.path.dirname(__file__))
+-from api import admin
+-eps = [l.split('\t') for l in open(sys.argv[1]).read().splitlines()]
+-adm = admin()
+-out = {}
+-for verb, path, perm, h in eps:
+-    if verb != 'GET' or '{' in path or 'export' in path or 'template' in path or path.startswith('/api/monitoring/sd') or 'download' in path:
+-        continue
+-    st, b = adm.get(path[4:], params={'page': 1, 'size': 5})
+-    shape = None
+-    if isinstance(b, dict):
+-        d = b.get('data')
+-        shape = sorted(d.keys()) if isinstance(d, dict) else type(d).__name__
+-    out[path] = [st, shape]
+-json.dump(out, open(sys.argv[2], 'w'), ensure_ascii=False, indent=1)
+-from collections import Counter
+-print(len(out), Counter(v[0] for v in out.values()))
+-for k, v in out.items():
+-    if v[0] >= 500: print('5xx', k, v)
+diff --git a/tests/data/migration-checksums.json b/tests/data/migration-checksums.json
+new file mode 100644
+index 0000000..d24b3d1
+--- /dev/null
++++ b/tests/data/migration-checksums.json
+@@ -0,0 +1,47 @@
++{
++ "V1__baseline.sql": "ab101fca0fc0cdfea8c3eb2286a0f7c59e90b6f05b21555f43ef9eeec923d9de",
++ "V2__seed.sql": "aca880cd6296f1c2fcc857deb39f47199c2314e56228330771d275f29198891a",
++ "V3__asset_p1.sql": "04d484c07e22057ee54b4fd45a125b2138c9376b69d6f549333f51da2a42d80c",
++ "V4__room_p2.sql": "a4ec3023956b6d17ee4f2da31b5b00a4076a7b492558cfdabd430eb42594cea4",
++ "V5__warehouse_p3.sql": "521caa63127a653c483940cf03c64bb77b2347c99eac39cb985bfeedcec08b17",
++ "V6__workorder_p4.sql": "1f60df6c01229441ddef4c2e48042059574ebabc44f672fa3d856586cd648ec8",
++ "V7__wecom_login.sql": "0c0c82157c70b4807219d34f2dd21d69b8bd958d6ba9e13c4a0edfc806147be5",
++ "V8__collect_w2.sql": "a6601bee02a0daee0b80c3e3d6783fa341596744d0ccaf5088a8b9d1bb834a04",
++ "V9__asset_parent.sql": "8fbbb4802caf3ba5f249550ad3ebdcf7565e123ef085876cb6031228c2a8f316",
++ "V10__workorder_item.sql": "cf19bb43c591da163bb58f9df828f7fa39260f10307bc48cfcdc211365394d17",
++ "V11__workorder_transfer.sql": "18b34fbe2d4983c7d494e6349e32f4237a255fa56103a389df1e550fbdab7294",
++ "V12__user_role_id.sql": "29c49dc4b90ebf39fc51075f7df5015e5da0aa3fef053b8dd193947a08e03836",
++ "V13__menu_rbac_align.sql": "77d4b64e9cca9608ae44dbb2ac1c7a6d756370a8b0553b03b85297ec4cec9fcd",
++ "V14__wo_replacements.sql": "3f0a6ee415035adbf45d307c5ada5c4e854b66f3d31137118b2bada49bf8ecce",
++ "V15__warehouse_stock.sql": "1fe4ccd73db4b3395f97d69608639b351f98df059c79a0a48dc5cca8a7607d63",
++ "V16__warehouse_read_dep.sql": "780378771bc03cb4f835091953e8d12acd0d09d7c8132f65ae384a69f373ba80",
++ "V17__workorder_p5.sql": "d1f99eb9e88508e67c8107d6799288533e58ddea90c225b7306c724bcda0a366",
++ "V18__wo_part_replace.sql": "3e6c6f685d1286ca8ec93d56c16c8fef5d4c01ca8c21a2f4d6780aacb6ce0294",
++ "V19__audit_log_query_index.sql": "febef96ef292c5709624901110e707818a25186f971ccbb2f1d525606efb5bad",
++ "V20__audit_log_partitions.sql": "c9029165eed957a6a6a1f072220ad68c98462057d8818039c5932946549c5c39",
++ "V21__asset_biz_states_trim.sql": "229d80999ddc4376680b45011a81ee0f1fa3be1381f506f0d3687e6f04367e8c",
++ "V22__rack_unit_backfill_from_assets.sql": "389bc27a31e854e5da435e300ac6df0741aaa8b7a05985306a20ffc21514a55d",
++ "V23__asset_biz_states_slim_to_8.sql": "be96369b701593e77fa9f0143b7214f11d22f7ab7d0dd625e201f02c94f3f47e",
++ "V24__wo_custom_approval.sql": "0c602c30f33a1f8a8c811812a250729de64be3d278f587a795f11708fa3bc3b7",
++ "V25__workorder_attachment.sql": "0df9bd9480d730bd4e54539c8881b76f9d96d2e9396fe833d501dfbf63cf1d62",
++ "V26__role_builtin_admin_only.sql": "16532d2bcad0190e2fbf60db808c84df023d665ff551488019610084c08cfc30",
++ "V27__fin_state_lease_accrual.sql": "25df3655afe2e4f249a816d127148a13aec33d202c07967ff43d22d57d142432",
++ "V28__viewer_role.sql": "d4ab6a74b9018fb7bbd28e7afba81a6e4e8a03a363aff96c813276c30a5346da",
++ "V29__wo_repair_analysis.sql": "f16ac4d35d0fa6cfb7df0b188ca610deec18224820c32ceef07b87acb2ae84d0",
++ "V30__asset_code_rule.sql": "91b333ff166519757322233a28fb10df39a9a9b818bbded94b0f6fee705048af",
++ "V31__drop_device_model.sql": "704b7e18f9ae10e9312c81d31496e1608fd9a84a9ad10182de6ac9c6b0d4f9d0",
++ "V32__clear_zombie_model_code.sql": "77f1f5eaaa422355e8ea65b3d1315784c02f55c27559f5700fc66770da03da2e",
++ "V33__soft_delete.sql": "cd6ce6b6e591bb70f04d89a74b05558e97bd01bde0918bfbf0609a29c0b26d8f",
++ "V34__foreign_key_indexes.sql": "0eabe0d5fb828e2eb3f93624c2bdcab6fe1f2a6502f635c76eceea829a9059eb",
++ "V35__webhook.sql": "dff8400f0af220ce594a40b2053b704eaf74c809a8a22d801c74591c022f901b",
++ "V36__change_management.sql": "29fc1a8efb53b3d1dc5c50bb5c55615350d97d0b616f400acf7c81fc19dcf26f",
++ "V37__soft_delete_unique.sql": "70f6be2cfcc03f64a82875fb2d0575c5811305016d36377655b78c64524f6936",
++ "V38__itsm_integration_upgrade.sql": "a359b2162105464bb7cf70684e927dc19f3594ccdf03ddfaf89efb4e2c45f4b4",
++ "V39__monitoring.sql": "cc630c6a06407d18a6a0ae03020a41f87beaf201f3646739376fdbce20b62646",
++ "V40__capacity_ipam_cabling.sql": "fbaa9a0dd362e56190a4b294f2eb6b4231951d8ee327246767a668a9a53ad75c",
++ "V41__problem_kb_catalog.sql": "4e3690e1f6d7f25961c9398239d19a4222b05e0eff87bd696a5dad9fe2d30126",
++ "V42__api_token_ldap.sql": "2e2d11d9592f7ff69593679d25f92150cd23892c0740e6fea5ce43ce3464f8e7",
++ "V43__v33_security_perf.sql": "23b0adffbb3f2b77426c539529000766c511483184c3c21f1022ea87f8a98461",
++ "V44__report_settings.sql": "3875d468be4509a4de1a5999330d827d4f829317da0f8cca319acae417c8edbd",
++ "V45__v34_permissions_perf.sql": "be8812e4482c241e6d1162fdf269698a27e6e3ca500bbd97ba0ed34bcc0b6346"
++}
+\ No newline at end of file
+diff --git a/tests/lib/__init__.py b/tests/lib/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/lib/context.py b/tests/lib/context.py
+new file mode 100644
+index 0000000..639e17c
+--- /dev/null
++++ b/tests/lib/context.py
+@@ -0,0 +1,191 @@
++"""测试上下文：被测地址、管理员会话、测试角色 / 用户 / 资产 / 工单的创建，以及可选的数据库访问。
++
++环境变量：
++  BASE        后端 API 地址，默认 http://127.0.0.1:8081/api
++  BASE2       第二个后端实例（集群套件用），可选
++  UI_BASE     前端地址（浏览器套件用），默认 http://127.0.0.1:4173
++  ADMIN_USER / ADMIN_PW   管理员账号口令（默认 admin / 环境变量必填）
++  PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE   可选：直连数据库做数据核对（缺省时相关用例跳过）
++  PKG_DIR     安装包目录（部署检查套件用），可选
++  SLOW=1      运行耗时较长的用例（集群定时任务等）
++"""
++import hashlib, itertools, json, os, random, shutil, subprocess, time, uuid
++import requests
++
++TEST_PREFIX = "t34"
++
++
++def _pw(username):
++    return "Pw#9" + hashlib.sha1(("dcim-test:" + username).encode()).hexdigest()[:10] + "Xy"
++
++
++class Client:
++    def __init__(self, base, ip=None):
++        self.base = base.rstrip("/")
++        self.s = requests.Session()
++        self.ip = ip
++        self.username = None
++
++    def headers(self, extra=None):
++        h = {}
++        if self.ip:
++            h["X-Forwarded-For"] = self.ip
++        if extra:
++            h.update(extra)
++        return h
++
++    def req(self, method, path, **kw):
++        headers = self.headers(kw.pop("headers", None))
++        url = path if path.startswith("http") else self.base + path
++        no_retry = kw.pop("no_retry", False)
++        timeout = kw.pop("timeout", 60)
++        for attempt in range(4):
++            r = self.s.request(method, url, headers=headers, timeout=timeout, **kw)
++            # 像规范的调用方一样遵守限流：带 Retry-After 的 429 等待后重试（账号锁定等业务 429 不带该头，不重试）
++            ra = r.headers.get("Retry-After")
++            if r.status_code != 429 or not ra or no_retry or attempt == 3:
++                break
++            time.sleep(min(5.0, float(ra)))
++        try:
++            body = r.json()
++        except ValueError:
++            body = None
++        self.last = r
++        return r.status_code, body
++
++    def get(self, p, **kw):
++        return self.req("GET", p, **kw)
++
++    def post(self, p, json=None, **kw):
++        return self.req("POST", p, json=json, **kw)
++
++    def put(self, p, json=None, **kw):
++        return self.req("PUT", p, json=json, **kw)
++
++    def delete(self, p, **kw):
++        return self.req("DELETE", p, **kw)
++
++    def login(self, username, password):
++        self.username = username
++        return self.post("/auth/login", {"username": username, "password": password})
++
++
++def data(body):
++    return (body or {}).get("data") if isinstance(body, dict) else None
++
++
++def msg(body):
++    return (body or {}).get("msg", "") if isinstance(body, dict) else ""
++
++
++class Context:
++    def __init__(self):
++        self.base = os.environ.get("BASE", "http://127.0.0.1:8081/api").rstrip("/")
++        self.base2 = os.environ.get("BASE2", "").rstrip("/")
++        self.ui_base = os.environ.get("UI_BASE", "http://127.0.0.1:4173").rstrip("/")
++        self.admin_user = os.environ.get("ADMIN_USER", "admin")
++        self.admin_pw = os.environ.get("ADMIN_PW", "")
++        self.pkg_dir = os.environ.get("PKG_DIR", "")
++        self.slow = os.environ.get("SLOW", "") == "1"
++        self.run_id = time.strftime("%m%d%H%M%S") + uuid.uuid4().hex[:4]
++        self._ip_seq = itertools.count(random.randint(1, 200))
++        self._admin = None
++        self._users = {}
++        self.cache = {}
++
++    # ───────── 会话 ─────────
++    def client(self, base=None, ip=None):
++        return Client(base or self.base, ip)
++
++    def ip(self):
++        """取一个测试专用的公网段地址作为 X-Forwarded-For（后端只信任来自内网代理的 XFF，本机直连可用）"""
++        n = next(self._ip_seq)
++        net = ("203.0.113", "198.51.100")[(n // 250) % 2]   # RFC 5737 文档专用网段，不会与真实来源混淆
++        return f"{net}.{n % 250 + 1}"
++
++    @property
++    def admin(self):
++        if self._admin is None:
++            if not self.admin_pw:
++                raise RuntimeError("请设置环境变量 ADMIN_PW（管理员口令）")
++            c = self.client(ip=self.ip())
++            st, b = c.login(self.admin_user, self.admin_pw)
++            if st != 200:
++                raise RuntimeError(f"管理员登录失败：HTTP {st} {msg(b)}")
++            self._admin = c
++        return self._admin
++
++    def version(self):
++        st, b = self.client().get("/healthz")
++        return (data(b) or {}).get("version", "")
++
++    # ───────── 角色 / 用户 ─────────
++    def role(self, code, modules, actions=None, scopes=None, fields=None, name=None):
++        """创建或覆盖测试角色。modules: {"assets": "rw" | "r"}"""
++        body = {
++            "roleCode": code, "name": name or code, "description": "自动化测试角色",
++            "modulePerms": {m: {"read": True, "write": "w" in v} for m, v in modules.items()},
++            "dataScopes": {m: {"type": (scopes or {}).get(m, "ALL")} for m in modules},
++            "actionPerms": {m: {"delete": False, "export": True, **((actions or {}).get(m, {}))} for m in modules},
++            "fieldPerms": fields or {},
++        }
++        st, b = self.admin.put(f"/roles/{code}", body)
++        if st == 404 or (st >= 400 and "不存在" in msg(b)):
++            st, b = self.admin.post("/roles", body)
++        if st != 200:
++            raise RuntimeError(f"保存角色 {code} 失败：HTTP {st} {msg(b)}")
++        return code
++
++    def user(self, username, roles, department=None, fresh=False):
++        """确保测试用户存在且只持有 roles，返回已登录的会话（每个用户固定一个来源 IP）"""
++        key = (username, tuple(roles))
++        if not fresh and key in self._users:
++            return self._users[key]
++        pw = _pw(username)
++        tmp = _pw(username + ":tmp")
++        st, b = self.admin.post("/users", {"username": username, "name": username, "password": tmp, "roleCodes": list(roles),
++                                           "department": department})
++        if st == 409 or "已存在" in msg(b):
++            self.admin.put(f"/users/{username}", {"name": username, "password": tmp, "roleCodes": list(roles), "status": 1,
++                                                  "department": department})
++        self.admin.post(f"/users/{username}/unlock")
++        c = self.client(ip=self.ip())
++        st, b = c.login(username, tmp)
++        if st != 200:
++            raise RuntimeError(f"测试用户 {username} 登录失败：HTTP {st} {msg(b)}")
++        st, b = c.put(f"/users/{username}/password", {"oldPassword": tmp, "newPassword": pw})
++        if st != 200:
++            raise RuntimeError(f"测试用户 {username} 改密失败：HTTP {st} {msg(b)}")
++        c = self.client(ip=c.ip)
++        st, b = c.login(username, pw)
++        if st != 200:
++            raise RuntimeError(f"测试用户 {username} 重新登录失败：HTTP {st} {msg(b)}")
++        c.password = pw
++        self._users[key] = c
++        return c
++
++    # ───────── 业务数据 ─────────
++    def asset(self, client=None, **kw):
++        c = client or self.admin
++        body = {"name": f"{TEST_PREFIX}-asset", "sn": f"SN-{TEST_PREFIX}-{uuid.uuid4().hex[:10]}", "categoryCode": "SRV", **kw}
++        st, b = c.post("/assets", body)
++        if st != 200:
++            raise RuntimeError(f"创建资产失败：HTTP {st} {msg(b)}")
++        return data(b)["assetNo"]
++
++    def workorder(self, client=None, wo_type="巡检", **kw):
++        c = client or self.admin
++        st, b = c.post("/workorders", {"woType": wo_type, "title": f"{TEST_PREFIX} 自动化测试工单", **kw})
++        if st != 200:
++            raise RuntimeError(f"创建工单失败：HTTP {st} {msg(b)}")
++        return data(b)["woNo"]
++
++    # ───────── 数据库（可选） ─────────
++    def sql(self, query):
++        """返回行列表（每行为字符串列表）；无 psql 或未配置 PGHOST 时返回 None"""
++        if not os.environ.get("PGHOST") or not shutil.which("psql"):
++            return None
++        r = subprocess.run(["psql", "-At", "-F", "\t", "-c", query], capture_output=True, text=True, timeout=60)
++        if r.returncode != 0:
++            raise RuntimeError(r.stderr.strip())
++        return [line.split("\t") for line in r.stdout.splitlines() if line]
+diff --git a/tests/lib/framework.py b/tests/lib/framework.py
+new file mode 100644
+index 0000000..4cb11d0
+--- /dev/null
++++ b/tests/lib/framework.py
+@@ -0,0 +1,195 @@
++"""极简测试框架（v3.4）：用例注册、断言、跳过、计时与多格式报告。
++
++不依赖 pytest，只用标准库 + requests，便于在内网 / 离线环境直接运行。
++
++    from lib.framework import suite, case, check, skip
++
++    S = suite("permission", "权限矩阵", order=30)
++
++    @case(S, "P-DEL-01", "未授予删除的角色删除资产返回 403", risk="越权删除", level="P0")
++    def _(ctx):
++        st, body = ctx.client("fld1").delete("/assets/X")
++        check(st == 403, f"HTTP {st}")
++"""
++import json, os, time, traceback, html
++from dataclasses import dataclass, field
++from xml.sax.saxutils import escape
++
++
++class Skip(Exception):
++    pass
++
++
++class CheckFailed(AssertionError):
++    pass
++
++
++def skip(reason):
++    raise Skip(reason)
++
++
++def check(cond, message="", detail=None):
++    """断言；失败时抛出 CheckFailed，消息进入报告"""
++    if not cond:
++        raise CheckFailed(message + (f" | {detail}" if detail is not None else ""))
++
++
++def check_eq(actual, expected, message=""):
++    check(actual == expected, f"{message} 期望 {expected!r}，实际 {actual!r}")
++
++
++@dataclass(eq=False)
++class Case:
++    suite: "Suite"
++    id: str
++    title: str
++    risk: str
++    level: str
++    tags: tuple
++    fn: object
++
++
++@dataclass(eq=False)
++class Suite:
++    name: str
++    title: str
++    order: int
++    cases: list = field(default_factory=list)
++    setup: object = None
++
++
++_SUITES = {}
++
++
++def suite(name, title, order=50):
++    s = _SUITES.get(name) or Suite(name, title, order)
++    _SUITES[name] = s
++    return s
++
++
++def case(s, cid, title, risk="", level="P1", tags=()):
++    def deco(fn):
++        s.cases.append(Case(s, cid, title, risk, level, tuple(tags), fn))
++        return fn
++    return deco
++
++
++def setup(s):
++    """套件级前置：失败则整套跳过"""
++    def deco(fn):
++        s.setup = fn
++        return fn
++    return deco
++
++
++def all_suites():
++    return sorted(_SUITES.values(), key=lambda x: (x.order, x.name))
++
++
++@dataclass
++class Result:
++    case: Case
++    status: str  # PASS / FAIL / ERROR / SKIP
++    seconds: float
++    detail: str = ""
++
++
++def run(ctx, suites, select=None, out=print):
++    results = []
++    for s in suites:
++        cases = [c for c in s.cases if not select or select(c)]
++        if not cases:
++            continue
++        out(f"\n━━ {s.title}（{s.name}，{len(cases)} 项）")
++        if s.setup:
++            try:
++                s.setup(ctx)
++            except Skip as e:
++                for c in cases:
++                    results.append(Result(c, "SKIP", 0.0, f"套件跳过：{e}"))
++                out(f"  [跳过] 整套：{e}")
++                continue
++            except Exception as e:  # noqa
++                for c in cases:
++                    results.append(Result(c, "ERROR", 0.0, f"套件前置失败：{e}"))
++                out(f"  [错误] 套件前置失败：{e}")
++                continue
++        for c in cases:
++            t0 = time.perf_counter()
++            try:
++                note = c.fn(ctx)
++                r = Result(c, "PASS", time.perf_counter() - t0, note or "")
++            except Skip as e:
++                r = Result(c, "SKIP", time.perf_counter() - t0, str(e))
++            except CheckFailed as e:
++                r = Result(c, "FAIL", time.perf_counter() - t0, str(e))
++            except Exception as e:  # noqa
++                tb = traceback.format_exc(limit=3)
++                r = Result(c, "ERROR", time.perf_counter() - t0, f"{type(e).__name__}: {e}\n{tb}")
++            results.append(r)
++            mark = {"PASS": "通过", "FAIL": "失败", "ERROR": "错误", "SKIP": "跳过"}[r.status]
++            line = f"  [{mark}] {c.id} {c.title}"
++            if r.status != "PASS" or r.detail:
++                line += f" —— {r.detail.splitlines()[0] if r.detail else ''}"
++            out(line[:400])
++    return results
++
++
++def summarize(results):
++    counts = {k: 0 for k in ("PASS", "FAIL", "ERROR", "SKIP")}
++    for r in results:
++        counts[r.status] += 1
++    return counts
++
++
++def write_reports(results, out_dir, meta):
++    os.makedirs(out_dir, exist_ok=True)
++    counts = summarize(results)
++    # JSON
++    data = {
++        "meta": meta, "summary": counts,
++        "results": [{"suite": r.case.suite.name, "id": r.case.id, "title": r.case.title, "level": r.case.level,
++                     "risk": r.case.risk, "status": r.status, "seconds": round(r.seconds, 3), "detail": r.detail}
++                    for r in results],
++    }
++    with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
++        json.dump(data, f, ensure_ascii=False, indent=1)
++    # JUnit XML（CI 平台通用）
++    by_suite = {}
++    for r in results:
++        by_suite.setdefault(r.case.suite, []).append(r)
++    xml = ['<?xml version="1.0" encoding="UTF-8"?>', f'<testsuites name="dcim" tests="{len(results)}" failures="{counts["FAIL"]}" errors="{counts["ERROR"]}" skipped="{counts["SKIP"]}">']
++    for s, rs in by_suite.items():
++        f_ = sum(1 for r in rs if r.status == "FAIL")
++        e_ = sum(1 for r in rs if r.status == "ERROR")
++        k_ = sum(1 for r in rs if r.status == "SKIP")
++        xml.append(f'  <testsuite name="{escape(s.name)}" tests="{len(rs)}" failures="{f_}" errors="{e_}" skipped="{k_}" time="{sum(r.seconds for r in rs):.3f}">')
++        for r in rs:
++            xml.append(f'    <testcase classname="{escape(s.name)}" name="{escape(r.case.id + " " + r.case.title)}" time="{r.seconds:.3f}">')
++            if r.status == "FAIL":
++                xml.append(f'      <failure message="{escape(r.detail[:200], {chr(34): "&quot;"})}">{escape(r.detail)}</failure>')
++            elif r.status == "ERROR":
++                xml.append(f'      <error message="{escape(r.detail[:200], {chr(34): "&quot;"})}">{escape(r.detail)}</error>')
++            elif r.status == "SKIP":
++                xml.append(f'      <skipped message="{escape(r.detail[:200], {chr(34): "&quot;"})}"/>')
++            xml.append('    </testcase>')
++        xml.append('  </testsuite>')
++    xml.append('</testsuites>')
++    with open(os.path.join(out_dir, "junit.xml"), "w", encoding="utf-8") as f:
++        f.write("\n".join(xml))
++    # Markdown（人读）
++    md = [f"# 回归测试报告", "", f"- 时间：{meta.get('time')}", f"- 被测：{meta.get('base')}（后端 {meta.get('version')}）",
++          f"- 结果：通过 {counts['PASS']} · 失败 {counts['FAIL']} · 错误 {counts['ERROR']} · 跳过 {counts['SKIP']}", ""]
++    for s, rs in by_suite.items():
++        md.append(f"## {s.title}（{s.name}）")
++        md.append("")
++        md.append("| 编号 | 用例 | 级别 | 结果 | 说明 |")
++        md.append("|---|---|---|---|---|")
++        for r in rs:
++            mark = {"PASS": "✅ 通过", "FAIL": "❌ 失败", "ERROR": "⚠️ 错误", "SKIP": "⏭ 跳过"}[r.status]
++            detail = (r.detail.splitlines()[0] if r.detail else "").replace("|", "\\|")[:160]
++            md.append(f"| {r.case.id} | {r.case.title} | {r.case.level} | {mark} | {detail} |")
++        md.append("")
++    with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
++        f.write("\n".join(md))
++    return counts
+diff --git a/tests/perf_tests.py b/tests/perf_tests.py
+deleted file mode 100644
+index 48eccf1..0000000
+--- a/tests/perf_tests.py
++++ /dev/null
+@@ -1,50 +0,0 @@
+-"""Latency / throughput probes at 100k-asset scale."""
+-import sys, os, time, statistics, json
+-from concurrent.futures import ThreadPoolExecutor
+-sys.path.insert(0, os.path.dirname(__file__))
+-from api import Client, admin
+-import requests
+-
+-adm = admin()
+-MON = os.environ.get("MONITORING_TOKEN", "montoken0123456789abcdef")
+-cases = [
+-    ("资产列表 第1页", "GET", "/assets", {"page": 1, "size": 20}),
+-    ("资产列表 深分页 p=4000", "GET", "/assets", {"page": 4000, "size": 20}),
+-    ("资产关键字搜索 'H800'", "GET", "/assets", {"page": 1, "size": 20, "keyword": "H800"}),
+-    ("资产按机房筛选", "GET", "/assets", {"page": 1, "size": 20, "roomCode": "PR03"}),
+-    ("全局搜索 '10.1.2'", "GET", "/search", {"keyword": "10.1.2"}),
+-    ("全局搜索 'PT-0999'", "GET", "/search", {"keyword": "PT-0999"}),
+-    ("工单列表", "GET", "/workorders", {"page": 1, "size": 20}),
+-    ("工单关键字", "GET", "/workorders", {"page": 1, "size": 20, "keyword": "压测工单 1999"}),
+-    ("运营总览 dashboard", "GET", "/report/dashboard", {}),
+-    ("资产报表", "GET", "/report/assets", {}),
+-    ("容量-机房", "GET", "/capacity/rooms", {}),
+-    ("机柜列表", "GET", "/racks", {"page": 1, "size": 20}),
+-    ("监控总览", "GET", "/monitoring/overview", {}),
+-]
+-def timed(fn, n):
+-    ts = []
+-    for _ in range(n):
+-        s = time.perf_counter(); st = fn(); ts.append((time.perf_counter() - s) * 1000)
+-    return st, statistics.median(ts), max(ts)
+-out = []
+-for name, m, p, q in cases:
+-    st, med, mx = timed(lambda: adm.req(m, p, params=q)[0], 5)
+-    out.append((name, st, med, mx)); print(f"{name:28s} status={st} p50={med:8.1f}ms max={mx:8.1f}ms", flush=True)
+-# service discovery (Prometheus http_sd) with bearer token
+-for job in ["icmp", "node"]:
+-    def sd():
+-        r = requests.get(f"http://127.0.0.1:8081/api/monitoring/sd/{job}", headers={"Authorization": "Bearer " + MON}, timeout=120)
+-        sd.size = len(r.content); return r.status_code
+-    st, med, mx = timed(sd, 3)
+-    print(f"{'服务发现 sd/'+job:28s} status={st} p50={med:8.1f}ms max={mx:8.1f}ms bytes={getattr(sd,'size',0)}", flush=True)
+-# concurrency: 50 parallel asset list requests
+-def one(_):
+-    s = time.perf_counter(); st = adm.req("GET", "/assets", params={"page": 1, "size": 20})[0]; return st, (time.perf_counter()-s)*1000
+-for conc in (20, 50):
+-    t0 = time.perf_counter()
+-    with ThreadPoolExecutor(conc) as ex:
+-        rs = list(ex.map(one, range(conc * 4)))
+-    dur = time.perf_counter() - t0
+-    lat = sorted(r[1] for r in rs)
+-    print(f"并发{conc} 资产列表: {len(rs)/dur:6.1f} req/s p50={lat[len(lat)//2]:.0f}ms p95={lat[int(len(lat)*.95)]:.0f}ms errors={sum(1 for r in rs if r[0]!=200)}", flush=True)
+diff --git a/tests/run_all.py b/tests/run_all.py
+new file mode 100644
+index 0000000..7532afa
+--- /dev/null
++++ b/tests/run_all.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""一键回归（v3.4）：按层次运行全部测试套件，输出控制台结果与 report.md / report.json / junit.xml。
++
++用法：
++  ADMIN_PW='...' python3 tests/run_all.py                         # 全部套件（缺条件的自动跳过）
++  ADMIN_PW='...' python3 tests/run_all.py -s smoke,contract        # 指定套件
++  ADMIN_PW='...' python3 tests/run_all.py -k PF- --level P0        # 按用例编号前缀 / 级别筛选
++  python3 tests/run_all.py --list                                  # 只列出用例
++
++退出码：有失败或错误时为 1，便于接入 CI 作为发布门禁。
++环境变量见 tests/lib/context.py 顶部说明。
++"""
++import argparse, importlib, os, pkgutil, sys, time
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, HERE)
++
++from lib import framework  # noqa: E402
++from lib.context import Context  # noqa: E402
++
++
++def load_suites():
++    import suites
++    for m in pkgutil.iter_modules(suites.__path__):
++        importlib.import_module(f"suites.{m.name}")
++    return framework.all_suites()
++
++
++def main():
++    ap = argparse.ArgumentParser(description="智算资产管理平台回归测试")
++    ap.add_argument("-s", "--suites", default="", help="逗号分隔的套件名（smoke,contract,permission,security,concurrency,performance,e2e,cluster,deploy）")
++    ap.add_argument("-k", "--keyword", default="", help="只运行编号或标题包含该文本的用例")
++    ap.add_argument("--level", default="", help="只运行指定级别，如 P0 或 P0,P1")
++    ap.add_argument("-o", "--out", default=os.path.join(HERE, "out"), help="报告目录")
++    ap.add_argument("--list", action="store_true", help="只列出用例")
++    a = ap.parse_args()
++
++    suites = load_suites()
++    if a.suites:
++        want = {x.strip() for x in a.suites.split(",") if x.strip()}
++        suites = [s for s in suites if s.name in want]
++    levels = {x.strip() for x in a.level.split(",") if x.strip()}
++
++    def select(c):
++        if a.keyword and a.keyword not in c.id and a.keyword not in c.title:
++            return False
++        return not levels or c.level in levels
++
++    if a.list:
++        for s in suites:
++            print(f"\n{s.title}（{s.name}）")
++            for c in s.cases:
++                if select(c):
++                    print(f"  {c.id:<7} {c.level}  {c.title}" + (f"  〔风险：{c.risk}〕" if c.risk else ""))
++        return 0
++
++    ctx = Context()
++    meta = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "base": ctx.base}
++    try:
++        meta["version"] = ctx.version()
++    except Exception as e:  # noqa
++        meta["version"] = f"不可达：{e}"
++    print(f"被测：{ctx.base}  后端版本：{meta['version']}  批次：{ctx.run_id}")
++    t0 = time.time()
++    results = framework.run(ctx, suites, select)
++    counts = framework.write_reports(results, a.out, meta)
++    print(f"\n合计 {len(results)} 项：通过 {counts['PASS']} · 失败 {counts['FAIL']} · 错误 {counts['ERROR']} · 跳过 {counts['SKIP']}"
++          f"（{time.time() - t0:.0f} 秒）\n报告：{os.path.join(a.out, 'report.md')}")
++    return 1 if counts["FAIL"] or counts["ERROR"] else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/sec_tests.py b/tests/sec_tests.py
+deleted file mode 100644
+index 7cd44c7..0000000
+--- a/tests/sec_tests.py
++++ /dev/null
+@@ -1,114 +0,0 @@
+-"""v3.3 安全 / 并发回归测试（黑盒，针对运行中的后端）。
+-每项输出 OK（行为正确）或 VULN（问题复现）。仅在测试环境运行：会创建测试角色/用户/资产/工单。
+-环境变量：BASE、ADMIN_PW、ADMIN_PW_INIT、REDIS_PASSWORD。"""
+-import sys, time, uuid, threading, statistics
+-from concurrent.futures import ThreadPoolExecutor
+-sys.path.insert(0, __import__('os').path.dirname(__file__))
+-from api import Client, admin, ensure_user, ensure_role, pw_for
+-
+-import subprocess, os
+-REDIS_PW = os.environ.get("REDIS_PASSWORD", "redispass")
+-def flush_throttle():
+-    # 测试环境：清掉多轮测试累积的登录失败计数，避免 IP 限流（429）干扰（需本机 redis-cli，可选）
+-    subprocess.run(f"redis-cli -a '{REDIS_PW}' --no-auth-warning --scan --pattern 'dcim:login-throttle:*' | xargs -r redis-cli -a '{REDIS_PW}' --no-auth-warning del", shell=True, capture_output=True)
+-flush_throttle()
+-results = []
+-def report(name, ok, detail=""):
+-    results.append((name, ok))
+-    print(f"[{'OK  ' if ok else 'VULN'}] {name} {detail}")
+-
+-adm = admin()
+-# ---------- T1: vertical privilege escalation via system-write role ----------
+-ensure_role(adm, "R-HELPDESK", {"system": {"read": True, "write": True}})
+-hd = ensure_user(adm, "hd1", ["R-HELPDESK"])
+-st, b = hd.put("/users/hd1", {"name": "hd1", "roleCodes": ["ADMIN"]})
+-st2, me = hd.get("/auth/me")
+-hd2 = Client(); hd2.login("hd1", pw_for("hd1")); _, me2 = hd2.get("/auth/me")
+-escalated = bool(me2 and me2.get("data", {}).get("isAdmin"))
+-report("T1a 系统写权限用户给自己授予 ADMIN", not escalated, f"PUT status={st}, isAdmin after relogin={escalated}")
+-# restore
+-adm.put("/users/hd1", {"name": "hd1", "roleCodes": ["R-HELPDESK"]})
+-hd = Client(); hd.login("hd1", pw_for("hd1"))
+-st, b = hd.put("/users/admin", {"name": "系统管理员", "password": "Hacked#Pass-2026x"})
+-report("T1b 系统写权限用户重置 admin 密码", st != 200, f"status={st}")
+-if st == 200:  # undo: admin password now Hacked..., login and restore
+-    c = Client(); c.login("admin", "Hacked#Pass-2026x")
+-    c.put("/users/admin/password", {"oldPassword": "Hacked#Pass-2026x", "newPassword": "Adm1n#Strong-2026"})
+-    adm = admin()
+-st, b = hd.put("/users/admin", {"name": "系统管理员", "status": 0})
+-report("T1c 系统写权限用户停用 admin", st != 200, f"status={st}")
+-if st == 200:
+-    # admin is disabled -> re-enable directly in DB is needed; use psql
+-    import subprocess
+-    subprocess.run(["psql", "-h", "127.0.0.1", "-U", "dcim", "-d", "platform", "-c", "update users set status=1 where username='admin'"], capture_output=True)
+-    subprocess.run(["redis-cli", "-a", REDIS_PW, "--no-auth-warning", "del", "dcim:loginuser:admin"], capture_output=True)
+-    adm = admin()
+-
+-# ---------- T2: access token still valid after logout ----------
+-u = ensure_user(adm, "tok1", ["VIEWER"])
+-saved = u.s.cookies.get("access_token")
+-u.post("/auth/logout")
+-c = Client(); c.s.cookies.set("access_token", saved)
+-st, b = c.get("/auth/me")
+-report("T2 登出后旧 access_token 仍可用", st != 200, f"status={st}")
+-
+-# ---------- T3: access token valid after password change ----------
+-u = Client(); u.login("tok1", pw_for("tok1"))
+-saved = u.s.cookies.get("access_token")
+-st, _ = u.put("/users/tok1/password", {"oldPassword": pw_for("tok1"), "newPassword": pw_for("tok1","b")})
+-c = Client(); c.s.cookies.set("access_token", saved)
+-st2, b = c.get("/auth/me")
+-report("T3 改密后旧 access_token 仍可用", st2 != 200, f"pwdchange={st} me={st2}")
+-u = Client(); u.login("tok1", pw_for("tok1","b")); u.put("/users/tok1/password", {"oldPassword": pw_for("tok1","b"), "newPassword": pw_for("tok1")})
+-
+-# ---------- T4: refresh token replay race ----------
+-u = Client(); u.login("tok1", pw_for("tok1"))
+-rt = u.s.cookies.get("refresh_token")
+-import requests as _rq
+-from api import BASE
+-def refresh_once(_):
+-    r = _rq.post(BASE + "/auth/refresh", cookies={"refresh_token": rt}, timeout=30)
+-    # 真正“换发”= 响应里下发了新的 refresh_token Cookie（v3.3 并发宽限请求只回 200 不换发）
+-    return 1 if "refresh_token" in r.cookies and r.cookies.get("refresh_token") else 0
+-with ThreadPoolExecutor(16) as ex:
+-    issued = sum(ex.map(refresh_once, range(16)))
+-report("T4 同一 refresh_token 并发重放可多次换发", issued <= 1, f"换发次数={issued}/16")
+-time.sleep(1)
+-r = _rq.post(BASE + "/auth/refresh", cookies={"refresh_token": rt}, timeout=30)
+-
+-
+-# ---------- T5: concurrent duplicate -> HTTP 500 ----------
+-sn = "SN-DUP-" + uuid.uuid4().hex[:8].upper()
+-def mk(_):
+-    st, b = adm.post("/assets", {"name": "dup", "sn": sn, "categoryCode": "SRV"})
+-    return st
+-with ThreadPoolExecutor(8) as ex:
+-    codes = list(ex.map(mk, range(8)))
+-report("T5 并发重复 SN 返回 500 而非 409", 500 not in codes, f"codes={sorted(codes)}")
+-
+-# ---------- T6: workorder assetNos alias silently dropped ----------
+-st, b = adm.post("/assets", {"name": "wo-asset", "sn": "SN-WO-" + uuid.uuid4().hex[:8], "categoryCode": "SRV"})
+-asset_no = b["data"]["assetNo"] if b and b.get("data") else None
+-st, b = adm.post("/workorders", {"woType": "故障维修", "title": "assetNos test", "assetNos": [asset_no]})
+-wo = b["data"]["woNo"] if b and b.get("data") else None
+-st, d = adm.get(f"/workorders/{wo}")
+-items = (d or {}).get("data", {}).get("items") or []
+-report("T6 工单 assetNos 关联资产被静默丢弃", len(items) == 1, f"wo={wo} items={len(items)} related={(d or {}).get('data',{}).get('relatedAssets')}")
+-
+-# ---------- T7: data scope SELF not enforced ----------
+-ensure_role(adm, "R-SELF", {"workorders": {"read": True, "write": True}}, {"workorders": {"type": "SELF"}})
+-s1 = ensure_user(adm, "self1", ["R-SELF"])
+-st, b = s1.get("/workorders", params={"page": 1, "size": 50})
+-rows = (b or {}).get("data", {}).get("records", [])
+-others = [r for r in rows if r.get("applicantUsername") not in (None, "self1") and r.get("assignee") != "self1"]
+-report("T7 数据范围 SELF 未生效（能看到他人工单）", len(others) == 0, f"可见他人工单={len(others)}")
+-
+-# ---------- T8: login user enumeration via timing ----------
+-flush_throttle()
+-def t(user):
+-    c = Client(); s = time.perf_counter(); c.login(user, "Wrong#Password-123"); return time.perf_counter() - s
+-for _ in range(2): t("tok1"); t("nouser_x")
+-a = statistics.median([t("tok1") for _ in range(7)]); n = statistics.median([t("nouser_" + uuid.uuid4().hex[:6]) for _ in range(7)])
+-report("T8 登录响应时间可枚举用户名", abs(a - n) < 0.03, f"存在={a*1000:.0f}ms 不存在={n*1000:.0f}ms")
+-# reset login throttle side effects
+-print("\nSUMMARY:", sum(1 for _, ok in results if ok), "OK /", sum(1 for _, ok in results if not ok), "VULN")
+diff --git a/tests/suites/__init__.py b/tests/suites/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/suites/s10_smoke.py b/tests/suites/s10_smoke.py
+new file mode 100644
+index 0000000..db2e5f4
+--- /dev/null
++++ b/tests/suites/s10_smoke.py
+@@ -0,0 +1,64 @@
++"""冒烟：服务可用、版本可识别、全部无参 GET 接口不出现 5xx。"""
++from lib.framework import suite, case, check, skip
++from lib.context import data, msg
++
++S = suite("smoke", "冒烟", order=10)
++
++
++@case(S, "SM-01", "健康检查返回 up 且报告后端版本", risk="部署后跑的不是目标版本", level="P0")
++def _(ctx):
++    st, b = ctx.client().get("/healthz")
++    d = data(b) or {}
++    check(st == 200 and d.get("status") in ("up", "degraded"), f"HTTP {st} status={d.get('status')}")
++    check(bool(d.get("version")), "healthz 未返回 version（v3.3.0 及以前的后端）")
++    expect = __import__("os").environ.get("EXPECT_VERSION")
++    if expect:
++        check(d["version"] == expect, f"运行版本 {d['version']}，期望 {expect}")
++    return f"版本 {d['version']}"
++
++
++@case(S, "SM-02", "匿名访问健康检查不返回 JVM / 连接池明细", risk="信息泄露", level="P1")
++def _(ctx):
++    c = ctx.client(ip=ctx.ip())
++    st, b = c.get("/healthz")
++    d = data(b) or {}
++    check("jvmMemoryUsedMB" not in d or c.base.startswith("http://127.") or c.base.startswith("http://localhost"),
++          "非本机匿名请求拿到了 JVM 明细")
++
++
++@case(S, "SM-03", "管理员能登录并取得当前用户、模块、操作与字段权限", risk="登录链路", level="P0")
++def _(ctx):
++    st, b = ctx.admin.get("/auth/me")
++    d = data(b) or {}
++    check(st == 200 and d.get("isAdmin") is True, f"HTTP {st}")
++    for k in ("modules", "actions", "fields", "dataScopes"):
++        check(k in d, f"/auth/me 缺少 {k}")
++
++
++@case(S, "SM-04", "OpenAPI 中全部无路径参数的 GET 接口不返回 5xx", risk="接口崩溃", level="P0")
++def _(ctx):
++    st, doc = ctx.admin.get("/openapi.json")
++    check(st == 200 and isinstance(doc, dict), f"openapi.json HTTP {st}")
++    ctx.cache["openapi"] = doc
++    bad, degraded, n = [], [], 0
++    skip_paths = ("/api/openapi.json", "/api/auth/logout", "/api/healthz")
++    for path, ops in sorted(doc["paths"].items()):
++        if "get" not in ops or "{" in path or path in skip_paths or path.endswith("/export") or path.endswith("/template") \
++                or "download" in path or "/stream" in path or "/sse" in path:
++            continue
++        n += 1
++        st, b = ctx.admin.get(path[len("/api"):])
++        if st == 503:
++            degraded.append(f"{path}（{msg(b)[:30]}）")   # 依赖未配置（如未接 Prometheus）属预期的降级
++        elif st >= 500:
++            bad.append(f"{path} → {st} {msg(b)[:60]}")
++    check(not bad, f"{len(bad)}/{n} 个接口 5xx", "; ".join(bad[:8]))
++    return f"{n} 个接口" + (f"；依赖未配置而降级 {len(degraded)} 个：{'、'.join(degraded[:3])}" if degraded else "")
++
++
++@case(S, "SM-05", "未登录访问业务接口返回 401", risk="鉴权绕过", level="P0")
++def _(ctx):
++    c = ctx.client(ip=ctx.ip())
++    for p in ("/assets", "/workorders", "/users", "/openapi.json"):
++        st, _ = c.get(p)
++        check(st == 401, f"{p} 未登录返回 {st}")
+diff --git a/tests/suites/s20_contract.py b/tests/suites/s20_contract.py
+new file mode 100644
+index 0000000..029f732
+--- /dev/null
++++ b/tests/suites/s20_contract.py
+@@ -0,0 +1,143 @@
++"""接口契约：OpenAPI 完整性、统一响应结构、入参校验与字段别名（含 v3.3.1 assetNos 问题的回归）。"""
++from lib.framework import suite, case, check, skip
++from lib.context import data, msg
++
++S = suite("contract", "接口契约", order=20)
++
++PUBLIC_OK = {"/api/healthz", "/api/auth/login", "/api/auth/refresh", "/api/auth/logout", "/api/auth/me", "/api/openapi.json"}
++
++
++def _doc(ctx):
++    if "openapi" not in ctx.cache:
++        st, doc = ctx.admin.get("/openapi.json")
++        check(st == 200, f"openapi.json HTTP {st}")
++        ctx.cache["openapi"] = doc
++    return ctx.cache["openapi"]
++
++
++@case(S, "CT-01", "OpenAPI 文档结构有效、版本与后端一致、operationId 不重复", level="P1")
++def _(ctx):
++    doc = _doc(ctx)
++    check(doc.get("openapi", "").startswith("3."), "openapi 版本字段")
++    check(doc["info"]["version"] == ctx.version(), f"文档版本 {doc['info']['version']} 与后端 {ctx.version()} 不一致")
++    ids = [op.get("operationId") for ops in doc["paths"].values() for op in ops.values()]
++    dup = {i for i in ids if ids.count(i) > 1}
++    check(not dup, f"重复 operationId：{sorted(dup)[:5]}")
++    return f"{len(ids)} 个操作"
++
++
++@case(S, "CT-02", "写接口都声明了所需权限（x-permission），例外须在白名单", risk="漏加权限注解", level="P0")
++def _(ctx):
++    doc = _doc(ctx)
++    missing = []
++    for path, ops in doc["paths"].items():
++        for m, op in ops.items():
++            if m in ("post", "put", "delete", "patch") and "x-permission" not in op and path not in PUBLIC_OK:
++                missing.append(f"{m.upper()} {path}")
++    # 这些接口在实现里自行判断归属（本人令牌、本人通知、企业微信回调等），记录在案
++    allowed_prefix = ("/api/tokens", "/api/notifications", "/api/wecom", "/api/auth/", "/api/users/", "/api/catalog", "/api/collector",
++                      "/api/monitoring/ingest", "/api/me", "/api/alerts/",
++                      "/api/system/ldap",     # 方法内校验管理员
++                      "/api/kb/")             # 知识库「有用 / 没用」反馈：登录即可
++    unexplained = [x for x in missing if not x.split(" ", 1)[1].startswith(allowed_prefix)]
++    check(not unexplained, f"{len(unexplained)} 个写接口未声明权限", "; ".join(unexplained[:10]))
++    return f"白名单内 {len(missing) - len(unexplained)} 个"
++
++
++@case(S, "CT-03", "工单建单入参别名都在文档中声明（relatedAssets 的 x-aliases）", level="P1")
++def _(ctx):
++    doc = _doc(ctx)
++    schema = doc["components"]["schemas"].get("WorkorderController.CreateWoReq", {})
++    aliases = schema.get("properties", {}).get("relatedAssets", {}).get("x-aliases", [])
++    for a in ("assetNos", "assetNoList", "assetNo"):
++        check(a in aliases, f"缺少别名 {a}")
++
++
++@case(S, "CT-04", "统一响应结构 {code, msg, data}：成功 code=0，失败 code=HTTP 状态", level="P0")
++def _(ctx):
++    st, b = ctx.admin.get("/assets", params={"page": 1, "size": 1})
++    check(st == 200 and b.get("code") == 0 and "data" in b and "msg" in b, f"成功响应 {st} {b and list(b.keys())}")
++    st, b = ctx.admin.get("/assets/NOT-EXIST-ASSET-00000")
++    check(st == 404 and b.get("code") == 404 and msg(b), f"404 响应 {st} {b}")
++
++
++@case(S, "CT-05", "缺必填字段返回 400 且提示字段", level="P1")
++def _(ctx):
++    st, b = ctx.admin.post("/workorders", {"title": "缺类型"})
++    check(st == 400 and ("类型" in msg(b) or "woType" in msg(b)), f"HTTP {st} {msg(b)}")
++    st, b = ctx.admin.post("/assets", {"sn": "x"})
++    check(st == 400, f"资产缺名称 HTTP {st} {msg(b)}")
++
++
++WO_SHAPES = [
++    ("relatedAssets 数组", lambda a, b: {"relatedAssets": [a, b]}, 2),
++    ("assets 对象数组（网页端）", lambda a, b: {"assets": [{"assetNo": a}, {"assetNo": b}]}, 2),
++    ("assetNos 数组", lambda a, b: {"assetNos": [a, b]}, 2),
++    ("assetNoList 数组", lambda a, b: {"assetNoList": [a, b]}, 2),
++    ("assetNos 逗号分隔字符串", lambda a, b: {"assetNos": f"{a},{b}"}, 2),
++    ("assetNos 中文逗号", lambda a, b: {"assetNos": f"{a}，{b}"}, 2),
++    ("assetNos 单个字符串", lambda a, b: {"assetNos": a}, 1),
++    ("assetNos 对象数组", lambda a, b: {"assetNos": [{"assetNo": a}, {"assetNo": b}]}, 2),
++    ("assets 字符串数组", lambda a, b: {"assets": [a, b]}, 2),
++    ("assetNo 单数", lambda a, b: {"assetNo": a}, 1),
++    ("asset_nos 下划线", lambda a, b: {"asset_nos": [a, b]}, 2),
++]
++
++
++@case(S, "CT-06", "工单关联资产：11 种常见写法全部落库（assetNos 回归）", risk="关联资产静默丢弃（v3.2 P0）", level="P0")
++def _(ctx):
++    a, b = ctx.asset(), ctx.asset()
++    bad = []
++    for name, body, n in WO_SHAPES:
++        st, r = ctx.admin.post("/workorders", {"woType": "巡检", "title": f"契约 {name}", **body(a, b)})
++        if st != 200:
++            bad.append(f"{name}: HTTP {st} {msg(r)}")
++            continue
++        wo = data(r)["woNo"]
++        st, d = ctx.admin.get(f"/workorders/{wo}")
++        items = (data(d) or {}).get("items") or []
++        if len(items) != n:
++            bad.append(f"{name}: 行项目 {len(items)}≠{n}")
++    check(not bad, "; ".join(bad))
++
++
++@case(S, "CT-07", "认不出的资产字段返回 400，不静默丢弃", risk="静默丢弃", level="P0")
++def _(ctx):
++    a = ctx.asset()
++    st, r = ctx.admin.post("/workorders", {"woType": "巡检", "title": "未知字段", "assetIdList": [a]})
++    check(st == 400 and "assetIdList" in msg(r), f"HTTP {st} {msg(r)}")
++
++
++@case(S, "CT-08", "PUT 更新工单可整体替换关联资产；已关闭工单返回 409", level="P1")
++def _(ctx):
++    a, b = ctx.asset(), ctx.asset()
++    wo = ctx.workorder(relatedAssets=[a, b])
++    st, r = ctx.admin.put(f"/workorders/{wo}", {"title": "改关联", "assetNos": [b]})
++    check(st == 200, f"HTTP {st} {msg(r)}")
++    st, d = ctx.admin.get(f"/workorders/{wo}")
++    items = [i["assetNo"] for i in (data(d) or {}).get("items") or []]
++    check(items == [b], f"行项目 {items}")
++    check((data(d) or {}).get("relatedAssets") == b, f"relatedAssets={data(d).get('relatedAssets')}")
++    ctx.admin.post(f"/workorders/{wo}/transitions", {"action": "开始处理", "opinion": "t"})
++    ctx.admin.post(f"/workorders/{wo}/transitions", {"action": "关闭", "opinion": "t", "rootCause": "t"})
++    st, r = ctx.admin.put(f"/workorders/{wo}", {"title": "已关闭", "assetNos": [a]})
++    check(st == 409, f"已关闭工单 HTTP {st} {msg(r)}")
++
++
++@case(S, "CT-09", "删除工单最后一条资产行后 relatedAssets 清空", risk="详情显示已删除资产（v3.2 起）", level="P1")
++def _(ctx):
++    a = ctx.asset()
++    wo = ctx.workorder(relatedAssets=[a])
++    st, d = ctx.admin.get(f"/workorders/{wo}")
++    item = data(d)["items"][0]["itemNo"]
++    ctx.admin.delete(f"/workorders/{wo}/items/{item}")
++    st, d = ctx.admin.get(f"/workorders/{wo}")
++    check(not data(d).get("relatedAssets"), f"relatedAssets={data(d).get('relatedAssets')!r}")
++
++
++@case(S, "CT-10", "唯一键冲突返回 409 并指出字段", level="P1")
++def _(ctx):
++    sn = f"SN-DUP-{ctx.run_id}"
++    ctx.asset(sn=sn)
++    st, r = ctx.admin.post("/assets", {"name": "dup", "sn": sn, "categoryCode": "SRV"})
++    check(st == 409, f"HTTP {st} {msg(r)}")
+diff --git a/tests/suites/s30_permission.py b/tests/suites/s30_permission.py
+new file mode 100644
+index 0000000..0ba5f37
+--- /dev/null
++++ b/tests/suites/s30_permission.py
+@@ -0,0 +1,283 @@
++"""权限矩阵：模块读写 → 操作（删除 / 导出）→ 数据范围（行）→ 字段（列），以及授权天花板。"""
++import uuid
++from lib.framework import suite, case, setup, check, skip
++from lib.context import data, msg
++
++S = suite("permission", "权限矩阵", order=30)
++
++FLD_FIELDS = {
++    "assets": {"hidden": ["purchasePrice", "sn", "mgmtIp", "finance", "roomCode"], "readonly": ["department", "statusFin"]},
++    "workorders": {"hidden": ["costLabor", "costService", "costOther", "attachments"], "readonly": ["description", "relatedAssets"]},
++}
++
++
++@setup(S)
++def _setup(ctx):
++    r = {}
++    r["ro"] = ctx.role("R34-ARO", {"assets": "r"})
++    r["aw"] = ctx.role("R34-AW", {"assets": "rw", "workorders": "rw"})
++    r["awd"] = ctx.role("R34-AWD", {"assets": "rw"}, actions={"assets": {"delete": True}})
++    r["noexp"] = ctx.role("R34-NOEXP", {"assets": "rw", "workorders": "rw"}, actions={"assets": {"export": False}, "workorders": {"export": False}})
++    r["self"] = ctx.role("R34-SELF", {"assets": "rw", "workorders": "rw"}, scopes={"assets": "SELF", "workorders": "SELF"})
++    r["dept"] = ctx.role("R34-DEPT", {"assets": "rw", "workorders": "rw"}, scopes={"assets": "DEPT", "workorders": "DEPT"})
++    r["fld"] = ctx.role("R34-FLD", {"assets": "rw", "workorders": "rw"}, fields=FLD_FIELDS)
++    r["open"] = ctx.role("R34-OPEN", {"assets": "r"})
++    r["hd"] = ctx.role("R34-HD", {"system": "rw", "assets": "rw"}, scopes={"assets": "SELF"},
++                       fields={"assets": {"hidden": ["purchasePrice"], "readonly": []}})
++    ctx.cache["roles"] = r
++
++
++def U(ctx, name, roles, dept=None):
++    return ctx.user(f"t34-{name}", roles, department=dept)
++
++
++# ───────────── 模块 ─────────────
++
++@case(S, "PM-01", "只读角色：可查资产、不能新建资产", level="P0")
++def _(ctx):
++    c = U(ctx, "ro", ["R34-ARO"])
++    st, _ = c.get("/assets", params={"page": 1, "size": 1})
++    check(st == 200, f"读 HTTP {st}")
++    st, b = c.post("/assets", {"name": "x", "categoryCode": "SRV"})
++    check(st == 403, f"写 HTTP {st} {msg(b)}")
++
++
++@case(S, "PM-02", "未授予模块：访问工单返回 403", level="P0")
++def _(ctx):
++    c = U(ctx, "ro", ["R34-ARO"])
++    st, b = c.get("/workorders", params={"page": 1, "size": 1})
++    check(st == 403, f"HTTP {st}")
++
++
++# ───────────── 操作 ─────────────
++
++@case(S, "PA-01", "未授予删除：删除 / 批量删除资产返回 403 并说明原因", risk="v3.4 删除改为显式授予", level="P0")
++def _(ctx):
++    c = U(ctx, "aw", ["R34-AW"])
++    a = ctx.asset()
++    st, b = c.delete(f"/assets/{a}")
++    check(st == 403 and "删除" in msg(b), f"HTTP {st} {msg(b)}")
++    st, b = c.post("/assets/batch-delete", {"assetNos": [a]})
++    check(st == 403, f"批量 HTTP {st} {msg(b)}")
++
++
++@case(S, "PA-02", "显式授予删除：可删除待上架资产；/auth/me 的 actions 同步", level="P0")
++def _(ctx):
++    c = U(ctx, "awd", ["R34-AWD"])
++    st, me = c.get("/auth/me")
++    check(data(me)["actions"]["assets"]["delete"] is True, "me.actions.assets.delete 应为 true")
++    a = ctx.asset()
++    st, b = c.delete(f"/assets/{a}")
++    check(st == 200, f"HTTP {st} {msg(b)}")
++    c2 = U(ctx, "aw", ["R34-AW"])
++    st, me = c2.get("/auth/me")
++    check(data(me)["actions"]["assets"]["delete"] is False, "未授予时 me.actions.assets.delete 应为 false")
++
++
++@case(S, "PA-03", "导出被禁止：资产导出、工单导出都返回 403", risk="v3.3 工单导出不校验导出权限", level="P1")
++def _(ctx):
++    c = U(ctx, "noexp", ["R34-NOEXP"])
++    st, b = c.get("/assets/export")
++    check(st == 403, f"资产导出 HTTP {st}")
++    st, b = c.get("/workorders/export")
++    check(st == 403, f"工单导出 HTTP {st}")
++
++
++# ───────────── 数据范围 ─────────────
++
++@case(S, "PS-01", "工单 SELF：列表只含本人相关，他人工单详情 404", level="P0")
++def _(ctx):
++    other = U(ctx, "other", ["R34-AW"], dept="测试乙部")
++    me = U(ctx, "self", ["R34-SELF"], dept="测试甲部")
++    wo_other = ctx.workorder(client=other)
++    wo_mine = ctx.workorder(client=me)
++    st, b = me.get("/workorders", params={"page": 1, "size": 200})
++    recs = data(b)["records"]
++    leaked = [r["woNo"] for r in recs if r.get("applicantUsername") not in ("t34-self",) and r.get("handler") != "t34-self"]
++    check(not leaked, f"可见他人工单 {leaked[:5]}")
++    check(any(r["woNo"] == wo_mine for r in recs), "看不到自己的工单")
++    st, b = me.get(f"/workorders/{wo_other}")
++    check(st == 404, f"他人工单详情 HTTP {st}")
++
++
++@case(S, "PS-02", "工单 DEPT：可见同部门同事的工单，不可见其他部门", level="P1")
++def _(ctx):
++    mate = U(ctx, "mate", ["R34-AW"], dept="测试甲部")
++    other = U(ctx, "other", ["R34-AW"], dept="测试乙部")
++    d = U(ctx, "dept", ["R34-DEPT"], dept="测试甲部")
++    wo_mate = ctx.workorder(client=mate)
++    wo_other = ctx.workorder(client=other)
++    st, b = d.get(f"/workorders/{wo_mate}")
++    check(st == 200, f"同部门 HTTP {st}")
++    st, b = d.get(f"/workorders/{wo_other}")
++    check(st == 404, f"其他部门 HTTP {st}")
++
++
++@case(S, "PS-03", "资产 SELF：按编号导出也不能拿到他人资产（v3.3 绕过修复）", risk="数据范围绕过", level="P0")
++def _(ctx):
++    me = U(ctx, "self", ["R34-SELF"], dept="测试甲部")
++    mine = ctx.asset(owner="t34-self")
++    theirs = ctx.asset(owner="someone-else")
++    st, b = me.get(f"/assets/{theirs}")
++    check(st == 404, f"他人资产详情 HTTP {st}")
++    me.get("/assets/export", params={"assetNos": f"{mine},{theirs}"})
++    text = me.last.text
++    check(mine in text and theirs not in text, "导出结果包含他人资产或缺少本人资产")
++
++
++# ───────────── 字段 ─────────────
++
++def _fld(ctx):
++    return U(ctx, "fld", ["R34-FLD"])
++
++
++@case(S, "PF-01", "读：列表、详情、子资产、变更记录剔除隐藏字段，并声明 X-Field-Hidden", level="P0")
++def _(ctx):
++    c = _fld(ctx)
++    parent = ctx.asset(purchasePrice=9999, mgmtIp="10.9.9.9")
++    child = ctx.asset(parentAssetNo=parent, purchasePrice=1)
++    st, b = c.get(f"/assets/{parent}")
++    d = data(b)
++    for k in ("purchasePrice", "sn", "mgmtIp", "finance", "roomCode"):
++        check(k not in d, f"详情仍含隐藏字段 {k}")
++    check(all("sn" not in ch for ch in d.get("children", [])), "子资产仍含 sn")
++    hdr = c.last.headers.get("X-Field-Hidden", "")
++    check("purchasePrice" in hdr, f"X-Field-Hidden={hdr!r}")
++    st, b = c.get("/assets", params={"page": 1, "size": 5})
++    check(all("sn" not in r and "purchasePrice" not in r for r in data(b)["records"]), "列表仍含隐藏字段")
++
++
++@case(S, "PF-02", "写：原样回传只读字段可保存；改动只读或隐藏字段返回 403；新建带隐藏字段 403", level="P0")
++def _(ctx):
++    c = _fld(ctx)
++    a = ctx.asset(department="甲", purchasePrice=100)
++    st, b = ctx.admin.get(f"/assets/{a}")
++    cur = data(b)
++    base = {k: cur.get(k) for k in ("name", "categoryCode", "department", "ownerType", "version")}
++    st, b = c.put(f"/assets/{a}", {**base, "name": "改名"})
++    check(st == 200, f"原样回传只读字段 HTTP {st} {msg(b)}")
++    st, b = ctx.admin.get(f"/assets/{a}")
++    base["version"] = data(b)["version"]
++    st, b = c.put(f"/assets/{a}", {**base, "department": "乙"})
++    check(st == 403 and "使用部门" in msg(b), f"改只读 HTTP {st} {msg(b)}")
++    st, b = c.put(f"/assets/{a}", {**base, "purchasePrice": 1})
++    check(st == 403 and "采购价格" in msg(b), f"改隐藏 HTTP {st} {msg(b)}")
++    st, b = c.post("/assets", {"name": "x", "categoryCode": "SRV", "sn": "SN-HIDDEN-1"})
++    check(st == 403, f"新建带隐藏字段 HTTP {st} {msg(b)}")
++
++
++@case(S, "PF-03", "写：批量修改与状态流转里出现受限字段返回 403", level="P1")
++def _(ctx):
++    c = _fld(ctx)
++    a = ctx.asset()
++    st, b = c.post("/assets/batch-update", {"assetNos": [a], "department": "乙"})
++    check(st == 403, f"批量修改 HTTP {st} {msg(b)}")
++    st, b = c.post(f"/assets/{a}/transitions", {"targetFin": "已入账", "reason": "t"})
++    check(st == 403 and "财务状态" in msg(b), f"流转 HTTP {st} {msg(b)}")
++
++
++@case(S, "PF-04", "导出不含隐藏列", level="P0")
++def _(ctx):
++    c = _fld(ctx)
++    a = ctx.asset()
++    c.get("/assets/export", params={"assetNos": a})
++    header = c.last.text.lstrip("\ufeff").splitlines()[0].split(",")
++    for col in ("SN", "采购单价", "管理IP", "机房编码"):
++        check(col not in header, f"导出表头含隐藏列 {col}：{header}")
++    check("使用部门" in header, "只读列应保留")
++
++
++@case(S, "PF-05", "搜索：不能用隐藏的 SN / 管理 IP 反查资产；不能按隐藏字段筛选", risk="借搜索反推隐藏值", level="P0")
++def _(ctx):
++    c = _fld(ctx)
++    sn = f"SN-HID-{uuid.uuid4().hex[:8].upper()}"   # 后端保存时 SN 统一大写
++    ip = f"10.250.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}"
++    ctx.asset(sn=sn, mgmtIp=ip)
++    st, b = c.get("/assets", params={"keyword": sn})
++    check(data(b)["total"] == 0, f"关键字按隐藏 SN 命中 {data(b)['total']}")
++    st, b = c.get("/search", params={"keyword": ip})
++    check(not [x for x in (data(b) or []) if x.get("type") == "asset"], "全局搜索按隐藏 IP 命中资产")
++    st, b = ctx.admin.get("/assets", params={"keyword": sn})
++    check(data(b)["total"] == 1, "管理员应能搜到（对照）")
++    st, b = c.get("/assets", params={"roomCode": "R01"})
++    check(st == 403, f"按隐藏字段筛选 HTTP {st}")
++
++
++@case(S, "PF-06", "有字段限制的角色不能批量导入", level="P1")
++def _(ctx):
++    c = _fld(ctx)
++    st, b = c.req("POST", "/assets/import", files={"file": ("a.csv", b"x")})
++    check(st == 403, f"HTTP {st} {msg(b)}")
++
++
++@case(S, "PF-07", "工单：费用与附件隐藏；改只读的描述 / 关联资产返回 403", level="P0")
++def _(ctx):
++    c = _fld(ctx)
++    a = ctx.asset()
++    st, b = ctx.admin.post("/workorders", {"woType": "故障维修", "title": "字段", "description": "原描述", "relatedAssets": [a]})
++    wo = data(b)["woNo"]
++    st, b = c.get(f"/workorders/{wo}")
++    d = data(b)
++    check(st == 200 and "costLabor" not in d, f"详情含费用或 HTTP {st}")
++    st, b = c.get(f"/workorders/{wo}/attachments")
++    check(st == 403, f"附件列表 HTTP {st}")
++    st, b = c.post(f"/workorders/{wo}/items", {"assetNo": ctx.asset()})
++    check(st == 403 and "关联资产" in msg(b), f"增资产行 HTTP {st} {msg(b)}")
++    st, b = c.post("/workorders", {"woType": "巡检", "title": "x", "assetNos": [a]})
++    check(st == 403, f"新建带只读关联资产 HTTP {st} {msg(b)}")
++    st, b = c.put(f"/workorders/{wo}/repair-cost", {"costLabor": 1})
++    check(st == 403, f"登记费用 HTTP {st} {msg(b)}")
++
++
++@case(S, "PF-08", "多角色合并：另一个角色未隐藏 SN，则 SN 可见（取最宽）", level="P1")
++def _(ctx):
++    c = ctx.user("t34-merge", ["R34-FLD", "R34-OPEN"])
++    a = ctx.asset()
++    st, b = c.get(f"/assets/{a}")
++    check("sn" in data(b), "合并后 SN 应可见")
++    st, me = c.get("/auth/me")
++    check("sn" not in (data(me)["fields"].get("assets", {}).get("hidden") or []), "me.fields 仍隐藏 sn")
++
++
++@case(S, "PF-09", "管理员不受字段规则约束", level="P1")
++def _(ctx):
++    a = ctx.asset(purchasePrice=5)
++    st, b = ctx.admin.get(f"/assets/{a}")
++    check("purchasePrice" in data(b) and "sn" in data(b), "管理员详情缺字段")
++
++
++@case(S, "PF-10", "角色保存：未知字段 / 未支持模块返回 400", level="P2")
++def _(ctx):
++    st, b = ctx.admin.put("/roles/R34-OPEN", {"roleCode": "R34-OPEN", "name": "R34-OPEN", "modulePerms": {"assets": {"read": True}},
++                                              "dataScopes": {"assets": {"type": "ALL"}}, "actionPerms": {},
++                                              "fieldPerms": {"assets": {"hidden": ["noSuchField"]}}})
++    check(st == 400, f"未知字段 HTTP {st} {msg(b)}")
++    ctx.role("R34-OPEN", {"assets": "r"})
++
++
++# ───────────── 授权天花板 ─────────────
++
++@case(S, "PC-01", "非管理员不能把自己没有的删除权限授出去（新建角色 / 分配已有角色）", risk="纵向越权", level="P0")
++def _(ctx):
++    hd = U(ctx, "hd", ["R34-HD"])
++    st, b = hd.post("/roles", {"roleCode": f"R34-X{ctx.run_id[-4:]}", "name": "x", "modulePerms": {"assets": {"read": True, "write": True}},
++                               "dataScopes": {"assets": {"type": "SELF"}}, "actionPerms": {"assets": {"delete": True}},
++                               "fieldPerms": {"assets": {"hidden": ["purchasePrice"]}}})
++    check(st == 403 and ("删除" in msg(b) or "delete" in msg(b)), f"新建角色 HTTP {st} {msg(b)}")
++    st, b = hd.put("/users/t34-aw", {"name": "t34-aw", "roleCodes": ["R34-AWD"]})
++    check(st == 403, f"分配带删除的角色 HTTP {st} {msg(b)}")
++
++
++@case(S, "PC-02", "非管理员不能授出比自己宽的数据范围或更松的字段规则", risk="纵向越权", level="P0")
++def _(ctx):
++    hd = U(ctx, "hd", ["R34-HD"])
++    base = {"name": "x", "modulePerms": {"assets": {"read": True, "write": True}}, "actionPerms": {}}
++    code = f"R34-Y{ctx.run_id[-4:]}"
++    st, b = hd.post("/roles", {**base, "roleCode": code, "dataScopes": {"assets": {"type": "ALL"}},
++                               "fieldPerms": {"assets": {"hidden": ["purchasePrice"]}}})
++    check(st == 403 and "数据范围" in msg(b), f"更宽范围 HTTP {st} {msg(b)}")
++    st, b = hd.post("/roles", {**base, "roleCode": code, "dataScopes": {"assets": {"type": "SELF"}}, "fieldPerms": {}})
++    check(st == 403 and "字段" in msg(b), f"更松字段 HTTP {st} {msg(b)}")
++    st, b = hd.post("/roles", {**base, "roleCode": code, "dataScopes": {"assets": {"type": "SELF"}},
++                               "fieldPerms": {"assets": {"hidden": ["purchasePrice", "sn"]}}})
++    check(st == 200, f"不超出自身时应允许 HTTP {st} {msg(b)}")
+diff --git a/tests/suites/s40_security.py b/tests/suites/s40_security.py
+new file mode 100644
+index 0000000..3b99d93
+--- /dev/null
++++ b/tests/suites/s40_security.py
+@@ -0,0 +1,164 @@
++"""安全回归：v3.3 审查的越权 / 会话 / 枚举问题 + v3.4 的账号锁定、接口限流、审计完整性、Webhook SSRF。"""
++import statistics, time, uuid
++from concurrent.futures import ThreadPoolExecutor
++import requests
++from lib.framework import suite, case, setup, check, skip
++from lib.context import data, msg
++
++S = suite("security", "安全回归", order=40)
++
++
++@setup(S)
++def _setup(ctx):
++    ctx.role("R34-SYS", {"system": "rw"})
++    ctx.role("R34-VIEW", {"assets": "r", "workorders": "r"})
++    ctx.role("R34-EXP", {"assets": "rw"})
++
++
++@case(S, "SE-01", "系统管理写权限用户不能给自己授予管理员、不能重置 / 停用 admin", risk="纵向越权（v3.3 S2）", level="P0")
++def _(ctx):
++    hd = ctx.user("t34-sys", ["R34-SYS"])
++    st, b = hd.put("/users/t34-sys", {"name": "t34-sys", "roleCodes": ["ADMIN"]})
++    check(st == 403, f"自授 ADMIN HTTP {st}")
++    st, b = hd.put(f"/users/{ctx.admin_user}", {"name": "系统管理员", "password": "Hacked#Pass-2026x"})
++    check(st == 403, f"重置 admin 口令 HTTP {st}")
++    st, b = hd.put(f"/users/{ctx.admin_user}", {"name": "系统管理员", "status": 0})
++    check(st == 403, f"停用 admin HTTP {st}")
++
++
++def _fresh_login(ctx, username, pw):
++    c = ctx.client(ip=ctx.ip())
++    st, b = c.login(username, pw)
++    check(st == 200, f"登录 HTTP {st} {msg(b)}")
++    return c
++
++
++@case(S, "SE-02", "退出登录后旧 access token 立即失效", risk="会话无法吊销（v3.3 S4）", level="P0")
++def _(ctx):
++    u = ctx.user("t34-tok", ["R34-VIEW"])
++    c = _fresh_login(ctx, "t34-tok", u.password)
++    saved = c.s.cookies.get("access_token")
++    c.post("/auth/logout")
++    x = ctx.client()
++    x.s.cookies.set("access_token", saved)
++    st, _ = x.get("/auth/me")
++    check(st == 401, f"HTTP {st}")
++
++
++@case(S, "SE-03", "改密后该账号所有旧 access token 失效", level="P0")
++def _(ctx):
++    u = ctx.user("t34-tok2", ["R34-VIEW"], fresh=True)
++    c = _fresh_login(ctx, "t34-tok2", u.password)
++    saved = c.s.cookies.get("access_token")
++    st, b = c.put("/users/t34-tok2/password", {"oldPassword": u.password, "newPassword": u.password + "b"})
++    check(st == 200, f"改密 HTTP {st} {msg(b)}")
++    x = ctx.client()
++    x.s.cookies.set("access_token", saved)
++    st, _ = x.get("/auth/me")
++    check(st == 401, f"旧令牌 HTTP {st}")
++    ctx.user("t34-tok2", ["R34-VIEW"], fresh=True)  # 复原口令
++
++
++@case(S, "SE-04", "同一 refresh token 16 路并发只能换发一次", risk="令牌重放（v3.3 H1）", level="P0")
++def _(ctx):
++    u = ctx.user("t34-tok", ["R34-VIEW"])
++    c = _fresh_login(ctx, "t34-tok", u.password)
++    rt = c.s.cookies.get("refresh_token")
++
++    def once(_):
++        r = requests.post(ctx.base + "/auth/refresh", cookies={"refresh_token": rt}, headers={"X-Forwarded-For": ctx.ip()}, timeout=30)
++        return 1 if r.cookies.get("refresh_token") else 0
++    with ThreadPoolExecutor(16) as ex:
++        issued = sum(ex.map(once, range(16)))
++    check(issued <= 1, f"换发 {issued}/16 次")
++
++
++@case(S, "SE-05", "登录耗时不暴露用户名是否存在", risk="用户名枚举（v3.3 H8）", level="P1")
++def _(ctx):
++    ip = ctx.ip()
++
++    def t(user):
++        c = ctx.client(ip=ip)
++        s = time.perf_counter()
++        c.login(user, "Wrong#Password-123")
++        return time.perf_counter() - s
++    for _ in range(2):
++        t("t34-tok"), t("nouser_x")
++    a = statistics.median([t("t34-tok") for _ in range(5)])
++    ip = ctx.ip()
++    n = statistics.median([t("nouser_" + uuid.uuid4().hex[:6]) for _ in range(5)])
++    ctx.admin.post("/users/t34-tok/unlock")
++    check(abs(a - n) < 0.04, f"存在 {a * 1000:.0f} ms / 不存在 {n * 1000:.0f} ms")
++    return f"存在 {a * 1000:.0f} ms / 不存在 {n * 1000:.0f} ms"
++
++
++@case(S, "SE-06", "账号跨 IP 失败 30 次即锁定：新 IP 被拒、可信 IP 不受影响、管理员可解锁", risk="分布式撞库（v3.4）", level="P0")
++def _(ctx):
++    u = ctx.user("t34-lock", ["R34-VIEW"], fresh=True)   # 本账号的固定 IP 登录成功过 → 可信 IP
++    for i in range(30):
++        ctx.client(ip=ctx.ip()).login("t34-lock", "Wrong#Password-123")
++    st, b = ctx.client(ip=ctx.ip()).login("t34-lock", u.password)
++    check(st == 429, f"锁定后新 IP 正确口令应被拒，实际 HTTP {st} {msg(b)}")
++    st, b = ctx.client(ip=u.ip).login("t34-lock", u.password)
++    check(st == 200, f"可信 IP 应能登录，实际 HTTP {st} {msg(b)}")
++    st, b = ctx.admin.get("/users", params={"keyword": "t34-lock"})
++    row = [r for r in data(b)["records"] if r["username"] == "t34-lock"][0]
++    check(row.get("loginLocked") is True, f"用户列表 loginLocked={row.get('loginLocked')}")
++    st, b = ctx.admin.post("/users/t34-lock/unlock")
++    check(st == 200, f"解锁 HTTP {st}")
++    st, b = ctx.client(ip=ctx.ip()).login("t34-lock", u.password)
++    check(st == 200, f"解锁后新 IP 登录 HTTP {st} {msg(b)}")
++    st, b = ctx.admin.get("/audit-logs", params={"page": 1, "size": 20, "action": "ACCOUNT_LOCKED", "objId": "t34-lock"})
++    recs = (data(b) or {}).get("records") or []
++    check(any(r.get("objId") == "t34-lock" or r.get("actor") == "t34-lock" for r in recs), "审计日志里没有 ACCOUNT_LOCKED 记录")
++
++
++@case(S, "SE-07", "接口限流：同一用户瞬时请求超出突发上限返回 429 + Retry-After，稍后恢复", risk="接口被刷（v3.4）", level="P1")
++def _(ctx):
++    u = ctx.user("t34-rl", ["R34-VIEW"])
++
++    def hit(_):
++        r = u.s.get(ctx.base + "/auth/me", headers={"X-Forwarded-For": u.ip}, timeout=30)
++        return r.status_code, r.headers.get("Retry-After")
++    with ThreadPoolExecutor(20) as ex:
++        res = list(ex.map(hit, range(120)))
++    limited = [r for r in res if r[0] == 429]
++    check(limited, f"120 次并发请求未触发限流（{[r[0] for r in res][:10]}…）")
++    check(all(ra for _, ra in limited), "429 响应缺少 Retry-After")
++    time.sleep(2.5)
++    st, _ = u.get("/auth/me")
++    check(st == 200, f"等待后仍被限流 HTTP {st}")
++    return f"{len(limited)}/120 被限流"
++
++
++@case(S, "SE-08", "重操作限流：同一用户每分钟导出超过 10 次返回 429", level="P2")
++def _(ctx):
++    u = ctx.user("t34-heavy", ["R34-EXP"], fresh=True)
++    codes = []
++    for _ in range(12):
++        u.get("/assets/export", params={"assetNos": "NOT-EXIST"}, no_retry=True)
++        codes.append(u.last.status_code)
++    check(429 in codes, f"导出状态码 {codes}")
++    check(codes[:10].count(200) == 10, f"前 10 次应成功：{codes}")
++
++
++@case(S, "SE-09", "审计：新建类操作记录对象号，返回值能序列化", risk="审计缺对象号（v3.3）", level="P1")
++def _(ctx):
++    a = ctx.asset()
++    st, b = ctx.admin.get("/audit-logs", params={"page": 1, "size": 20, "objId": a})
++    recs = (data(b) or {}).get("records") or []
++    mine = [r for r in recs if r.get("action") == "CREATE"]
++    check(mine, f"审计里找不到 objId={a} 的 CREATE 记录")
++    detail = str(mine[0].get("detail"))
++    check("无法序列化" not in detail, f"审计 detail 含「无法序列化」：{detail[:120]}")
++
++
++@case(S, "SE-10", "Webhook 不能指向平台内部的监控栈", risk="SSRF（v3.3 S5）", level="P0")
++def _(ctx):
++    st, meta = ctx.admin.get("/webhooks/meta")
++    m = data(meta) or {}
++    events = m.get("eventTypes") or m.get("events") or []
++    ev = (events[0].get("code") or events[0].get("value") or events[0].get("key")) if events and isinstance(events[0], dict) else (events[0] if events else "workorder.created")
++    for url in ("http://prometheus:9090/-/quit", "http://alertmanager:9093/api/v2/silences", "http://127.0.0.1:8081/api/healthz"):
++        st, b = ctx.admin.post("/webhooks", {"name": "t34-ssrf", "url": url, "eventTypes": [ev], "enabled": False})
++        check(st == 400, f"{url} HTTP {st} {msg(b)}")
+diff --git a/tests/suites/s50_concurrency.py b/tests/suites/s50_concurrency.py
+new file mode 100644
+index 0000000..d64423a
+--- /dev/null
++++ b/tests/suites/s50_concurrency.py
+@@ -0,0 +1,79 @@
++"""并发：唯一键、乐观锁、状态流转、编号生成在并发下的正确性（不出现 500、不重复、不丢失）。"""
++import uuid
++from concurrent.futures import ThreadPoolExecutor
++from lib.framework import suite, case, check
++from lib.context import data, msg
++
++S = suite("concurrency", "并发正确性", order=50)
++
++
++def _par(n, fn):
++    with ThreadPoolExecutor(n) as ex:
++        return list(ex.map(fn, range(n)))
++
++
++@case(S, "CC-01", "8 路并发录入同一 SN：1 个成功，其余 409，无 500", risk="唯一键冲突返回 500（v3.3 H2）", level="P0")
++def _(ctx):
++    sn = "SN-CC-" + uuid.uuid4().hex[:10]
++    codes = _par(8, lambda _: ctx.admin.post("/assets", {"name": "cc", "sn": sn, "categoryCode": "SRV"})[0])
++    check(codes.count(200) == 1 and codes.count(409) == 7, f"状态码 {sorted(codes)}")
++
++
++@case(S, "CC-02", "同一版本号并发修改资产：只有 1 个成功，其余 409", risk="并发覆盖（丢失更新）", level="P0")
++def _(ctx):
++    a = ctx.asset()
++    st, b = ctx.admin.get(f"/assets/{a}")
++    cur = data(b)
++    base = {k: cur.get(k) for k in ("name", "categoryCode", "ownerType", "version")}
++    codes = _par(8, lambda i: ctx.admin.put(f"/assets/{a}", {**base, "name": f"cc-{i}"})[0])
++    check(codes.count(200) == 1 and 500 not in codes, f"状态码 {sorted(codes)}")
++
++
++@case(S, "CC-03", "8 路并发流转同一工单：只有 1 个成功，无 500", level="P1")
++def _(ctx):
++    wo = ctx.workorder()
++    codes = _par(8, lambda _: ctx.admin.post(f"/workorders/{wo}/transitions", {"action": "开始处理", "opinion": "cc"})[0])
++    check(codes.count(200) == 1 and 500 not in codes, f"状态码 {sorted(codes)}")
++    st, b = ctx.admin.get(f"/workorders/{wo}")
++    flows = [f for f in (data(b).get("flows") or []) if f.get("action") == "开始处理"]
++    check(len(flows) == 1, f"流转记录 {len(flows)} 条")
++
++
++@case(S, "CC-04", "8 路并发给同一工单添加同一资产：只建 1 行", level="P1")
++def _(ctx):
++    a = ctx.asset()
++    wo = ctx.workorder()
++    codes = _par(8, lambda _: ctx.admin.post(f"/workorders/{wo}/items", {"assetNo": a})[0])
++    st, b = ctx.admin.get(f"/workorders/{wo}")
++    items = data(b).get("items") or []
++    check(len(items) == 1 and 500 not in codes, f"行项目 {len(items)} 条，状态码 {sorted(codes)}")
++
++
++@case(S, "CC-05", "40 路并发建单（超过连接池默认 20）：全部成功且工单号不重复", risk="连接池饥饿（v3.4 测试发现：事件监听另借连接）", level="P0")
++def _(ctx):
++    res = _par(40, lambda _: ctx.admin.post("/workorders", {"woType": "巡检", "title": "cc 并发建单"}))
++    codes = [st for st, _ in res]
++    nos = [data(b)["woNo"] for st, b in res if st == 200]
++    check(codes.count(200) == 40, f"状态码 {sorted(codes)}", "；".join(sorted({msg(b)[:60] for st, b in res if st != 200}))[:300])
++    check(len(set(nos)) == 40, f"工单号重复：{len(nos) - len(set(nos))} 个")
++
++
++@case(S, "CC-06", "有 Webhook 订阅时 30 路并发建单：全部成功，每张工单恰好一条投递记录", risk="事务性发件箱：丢事件 / 重复投递 / 连接池饥饿", level="P0")
++def _(ctx):
++    st, b = ctx.admin.post("/webhooks", {"name": f"t34-outbox-{ctx.run_id}", "url": "http://203.0.113.10:9/hook",
++                                          "eventTypes": ["workorder.created"], "enabled": True})
++    check(st == 200, f"创建 Webhook HTTP {st} {msg(b)}")
++    hid = data(b)["id"]
++    try:
++        res = _par(30, lambda _: ctx.admin.post("/workorders", {"woType": "巡检", "title": "cc 发件箱"}))
++        codes = [st for st, _ in res]
++        check(codes.count(200) == 30, f"状态码 {sorted(codes)}")
++        nos = sorted(data(b)["woNo"] for st, b in res if st == 200)
++        st, d = ctx.admin.get(f"/webhooks/{hid}/deliveries", params={"page": 1, "size": 100})
++        rows = (data(d) or {}).get("records") or (data(d) or {}).get("list") or []
++        got = sorted((r.get("payload") or {}).get("objId") for r in rows if r.get("eventType") == "workorder.created")
++        check(got == nos, f"投递记录 {len(got)} 条，工单 {len(nos)} 张",
++              f"缺 {sorted(set(nos) - set(got))[:3]} 多 {sorted(set(got) - set(nos))[:3]}")
++        return f"{len(got)} 条投递记录与 {len(nos)} 张工单一一对应"
++    finally:
++        ctx.admin.delete(f"/webhooks/{hid}")
+diff --git a/tests/suites/s60_performance.py b/tests/suites/s60_performance.py
+new file mode 100644
+index 0000000..8d737f5
+--- /dev/null
++++ b/tests/suites/s60_performance.py
+@@ -0,0 +1,84 @@
++"""性能基线：10 万资产规模下的延迟预算与并发吞吐。数据量不足时跳过（避免在空库上得出误导性结论）。
++
++预算可整体放宽：PERF_FACTOR=2 表示所有预算 × 2（较慢的测试机）。
++"""
++import os, statistics, time
++from concurrent.futures import ThreadPoolExecutor
++from lib.framework import suite, case, setup, check, skip
++from lib.context import data
++
++S = suite("performance", "性能基线", order=60)
++F = float(os.environ.get("PERF_FACTOR", "1"))
++MIN_ASSETS = int(os.environ.get("PERF_MIN_ASSETS", "50000"))
++
++
++@setup(S)
++def _setup(ctx):
++    st, b = ctx.admin.get("/assets", params={"page": 1, "size": 1})
++    total = (data(b) or {}).get("total", 0)
++    if total < MIN_ASSETS:
++        raise __import__("lib.framework", fromlist=["Skip"]).Skip(f"资产 {total} 台，少于 {MIN_ASSETS}，性能结论无意义（可用 tests/seed_scale.sql 灌数）")
++    ctx.cache["perf_assets"] = total
++
++
++def _measure(ctx, path, params=None, n=10):
++    """测纯服务端延迟：遇到限流（429）先按 Retry-After 等待再重测该样本，不把等待时间计入延迟；
++    样本间隔 80 ms，使压测账号保持在「每秒 20 次」的限流以内。"""
++    c = ctx.admin
++    c.get(path, params=params)  # 预热
++    ts = []
++    while len(ts) < n:
++        time.sleep(0.08)
++        t = time.perf_counter()
++        st, _ = c.get(path, params=params, no_retry=True)
++        ms = (time.perf_counter() - t) * 1000
++        if st == 429:
++            time.sleep(min(5.0, float(c.last.headers.get("Retry-After") or 1)))
++            continue
++        check(st == 200, f"{path} HTTP {st}")
++        ts.append(ms)
++    ts.sort()
++    return statistics.median(ts), ts[int(len(ts) * 0.9) - 1]
++
++
++BUDGETS = [
++    ("PERF-01", "资产列表第 1 页", "/assets", {"page": 1, "size": 20}, 60),
++    ("PERF-02", "资产列表深分页（第 4000 页）", "/assets", {"page": 4000, "size": 20}, 100),
++    ("PERF-03", "资产关键字搜索", "/assets", {"page": 1, "size": 20, "keyword": "H800"}, 80),
++    ("PERF-04", "全局搜索（IP 片段）", "/search", {"keyword": "10.1.2"}, 120),
++    ("PERF-05", "工单列表", "/workorders", {"page": 1, "size": 20}, 60),
++    ("PERF-06", "运营总览（缓存）", "/report/dashboard", None, 60),
++    ("PERF-07", "容量-机房（缓存）", "/capacity/rooms", None, 60),
++    ("PERF-08", "监控总览", "/monitoring/overview", None, 120),
++]
++
++for cid, title, path, params, budget in BUDGETS:
++    def make(path=path, params=params, budget=budget):
++        def fn(ctx):
++            p50, p90 = _measure(ctx, path, params)
++            check(p50 <= budget * F, f"p50 {p50:.0f} ms 超出预算 {budget * F:.0f} ms")
++            return f"p50 {p50:.0f} ms / p90 {p90:.0f} ms（预算 {budget * F:.0f} ms）"
++        return fn
++    case(S, cid, f"{title} p50 ≤ {budget} ms", level="P1")(make())
++
++
++@case(S, "PERF-20", "资产列表 20 路并发（10 个用户）吞吐 ≥ 80 req/s、无错误", level="P1")
++def _(ctx):
++    """多用户并发：单用户受「每秒 20 次」限流，压测用 10 个账号模拟真实多人访问"""
++    ctx.role("R34-PERF", {"assets": "r"})
++    users = [ctx.user(f"t34-perf{i}", ["R34-PERF"]) for i in range(10)]
++    n = 300
++
++    def one(i):
++        st, _ = users[i % 10].get("/assets", params={"page": 1 + i % 50, "size": 20}, no_retry=True)
++        return st
++    with ThreadPoolExecutor(20) as ex:
++        list(ex.map(one, range(20)))  # 预热
++        t0 = time.perf_counter()
++        codes = list(ex.map(one, range(n)))
++    dt = time.perf_counter() - t0
++    rps = n / dt
++    errs = [c for c in codes if c != 200]
++    check(not errs, f"{len(errs)} 次失败：{sorted(set(errs))}")
++    check(rps >= 80 / F, f"吞吐 {rps:.0f} req/s")
++    return f"{rps:.0f} req/s"
+diff --git a/tests/suites/s70_e2e_ui.py b/tests/suites/s70_e2e_ui.py
+new file mode 100644
+index 0000000..18f3b16
+--- /dev/null
++++ b/tests/suites/s70_e2e_ui.py
+@@ -0,0 +1,175 @@
++"""浏览器端到端（Playwright，可选）：关键页面在真实浏览器里可用、前后端字段契约一致、权限在界面上生效。
++
++需要 `pip install playwright` 且有 Chromium；前端地址 UI_BASE（默认 http://127.0.0.1:4173）。缺任一条件整套跳过。
++"""
++import asyncio, glob, os, time, uuid
++from lib.framework import suite, case, setup, check, Skip
++from lib.context import data, msg
++
++S = suite("e2e", "浏览器端到端", order=70)
++
++
++def _exe():
++    c = sorted(glob.glob("/opt/pw-browsers/chromium-*/chrome-linux/chrome"))
++    return c[-1] if c else None
++
++
++@setup(S)
++def _setup(ctx):
++    try:
++        import playwright  # noqa
++    except ImportError:
++        raise Skip("未安装 playwright（pip install playwright && playwright install chromium）")
++    import requests
++    try:
++        requests.get(ctx.ui_base + "/", timeout=5)
++    except Exception:
++        raise Skip(f"前端 {ctx.ui_base} 不可达")
++
++
++def run_page(ctx, user, pw, fn):
++    """在独立浏览器上下文里登录后执行 fn(page, errors)"""
++    from playwright.async_api import async_playwright
++
++    async def main():
++        async with async_playwright() as p:
++            b = await p.chromium.launch(executable_path=_exe())
++            context = await b.new_context(viewport={"width": 1440, "height": 900}, locale="zh-CN",
++                                          extra_http_headers={"X-Forwarded-For": ctx.ip()})
++            page = await context.new_page()
++            errors = {"console": [], "api": []}
++            page.on("console", lambda m: errors["console"].append(m.text) if m.type == "error" else None)
++            page.on("response", lambda r: errors["api"].append(f"{r.status} {r.url}") if r.status >= 500 and "/api/" in r.url else None)
++            await page.goto(ctx.ui_base + "/login")
++            await page.fill("input[placeholder='用户名']", user)
++            await page.fill("input[placeholder='密码']", pw)
++            await page.keyboard.press("Enter")
++            await page.wait_for_url("**/dashboard", timeout=20000)
++            try:
++                return await fn(page, errors)
++            finally:
++                await b.close()
++    return asyncio.run(main())
++
++
++@case(S, "UI-01", "管理员登录后运营总览渲染，无 5xx、无脚本错误", level="P0")
++def _(ctx):
++    async def fn(page, errors):
++        await page.wait_for_timeout(3000)
++        cards = await page.locator(".dashboard .el-card, .dashboard .stat-card, .dashboard [class*=card]").count()
++        js = [e for e in errors["console"] if "Failed to load resource" not in e]
++        return cards, js, errors["api"]
++    cards, js, api = run_page(ctx, ctx.admin_user, ctx.admin_pw, fn)
++    check(cards > 0, "运营总览没有渲染出卡片")
++    check(not api, f"接口 5xx：{api[:3]}")
++    check(not js, f"脚本错误：{js[:3]}")
++
++
++@case(S, "UI-02", "通过界面创建带关联资产的工单，后端行项目正确落库", risk="前后端字段不一致（v3.2 assetNos 类问题）", level="P0")
++def _(ctx):
++    a = ctx.asset(name=f"t34-ui-{uuid.uuid4().hex[:6]}")
++    title = f"t34 界面建单 {uuid.uuid4().hex[:6]}"
++
++    async def fn(page, errors):
++        await page.goto(ctx.ui_base + "/workorders")
++        await page.wait_for_timeout(1500)
++        await page.locator("button:has-text('创建工单')").first.click()
++        dlg = page.locator(".el-dialog:has-text('创建工单')")
++        await dlg.locator("label:has-text('巡检')").first.click()
++        await dlg.locator("input[placeholder='必填']").first.fill(title)
++        # Element Plus 2.8 的远程搜索下拉：占位文字不是 input 的 placeholder 属性，按区块定位
++        block = dlg.locator(".detail-block:has-text('关联资产')")
++        if not await block.locator(".el-select").count():
++            await block.locator("button:has-text('添加行')").click()
++        await block.locator(".el-select").first.click()
++        await page.keyboard.type(a, delay=20)
++        await page.wait_for_timeout(1200)
++        await page.locator(f".el-select-dropdown__item:visible:has-text('{a}')").first.click()
++        await dlg.locator("button:has-text('创建')").click()
++        await page.wait_for_timeout(2500)
++        return errors["api"]
++    api = run_page(ctx, ctx.admin_user, ctx.admin_pw, fn)
++    check(not api, f"接口 5xx：{api[:3]}")
++    st, b = ctx.admin.get("/workorders", params={"page": 1, "size": 20, "keyword": title})
++    recs = data(b)["records"]
++    check(recs, "界面创建的工单没查到")
++    st, d = ctx.admin.get(f"/workorders/{recs[0]['woNo']}")
++    items = [i["assetNo"] for i in data(d).get("items") or []]
++    check(items == [a], f"行项目 {items}，期望 [{a}]")
++
++
++@case(S, "UI-03", "字段受限用户：资产列表不显示隐藏列，没有删除 / 导入按钮", level="P0")
++def _(ctx):
++    ctx.role("R34-FLD", {"assets": "rw", "workorders": "rw"},
++             fields={"assets": {"hidden": ["purchasePrice", "sn", "mgmtIp", "finance", "roomCode"], "readonly": ["department", "statusFin"]}})
++    u = ctx.user("t34-uifld", ["R34-FLD"])
++
++    async def fn(page, errors):
++        await page.goto(ctx.ui_base + "/assets/inventory")
++        await page.wait_for_timeout(3000)
++        heads = [h.strip() for h in await page.locator(".el-table__header th").all_inner_texts() if h.strip()]
++        dels = await page.locator(".el-table__body button:has-text('删除')").count()
++        imp = await page.locator("button:has-text('导入')").count()
++        return heads, dels, imp
++    heads, dels, imp = run_page(ctx, "t34-uifld", u.password, fn)
++    check("SN" not in heads, f"仍显示 SN 列：{heads}")
++    check("使用部门" in heads, f"只读字段应仍显示：{heads}")
++    check(dels == 0 and imp == 0, f"删除按钮 {dels} 个，导入按钮 {imp} 个")
++
++
++@case(S, "UI-04", "角色编辑页可配置字段权限并保存", level="P1")
++def _(ctx):
++    code = "R34-UIROLE"
++    ctx.role(code, {"assets": "rw"})   # 每次先复位为「无字段规则」
++
++    async def fn(page, errors):
++        await page.goto(ctx.ui_base + "/system/roles")
++        await page.wait_for_timeout(1500)
++        search = page.locator("input[placeholder='搜索角色编码 / 名称']")
++        await search.fill(code.lower())        # 顺带验证搜索不区分大小写
++        await search.press("Enter")
++        await page.wait_for_timeout(1200)
++        await page.locator(f".el-table__body tr:has-text('{code}') button:has-text('编辑')").first.click()
++        dlg = page.locator(".el-dialog:has-text('编辑角色')")
++        row = dlg.locator(".field-rule-row:has-text('资产')")
++        await row.locator(".el-select").first.click()
++        await page.locator(".el-select-dropdown__item:visible:has-text('采购价格')").first.click()
++        await page.keyboard.press("Escape")
++        await dlg.locator("button:has-text('保存')").click()
++        await page.wait_for_timeout(1500)
++        return errors["api"]
++    api = run_page(ctx, ctx.admin_user, ctx.admin_pw, fn)
++    check(not api, f"接口 5xx：{api[:3]}")
++    st, b = ctx.admin.get("/roles", params={"page": 1, "size": 200})
++    role = [r for r in data(b)["records"] if r["roleCode"] == code][0]
++    hidden = (role.get("fieldPerms") or {}).get("assets", {}).get("hidden") or []
++    check("purchasePrice" in hidden, f"保存后的字段权限 {role.get('fieldPerms')}")
++
++
++@case(S, "UI-05", "接口文档页可浏览，关于对话框显示前后端版本一致", level="P2")
++def _(ctx):
++    async def fn(page, errors):
++        await page.goto(ctx.ui_base + "/developer/api-docs")
++        await page.wait_for_timeout(2500)
++        rows = await page.locator(".api-row").count()
++        await page.locator(".layout-user").click()
++        await page.locator("text=关于本系统").click()
++        await page.wait_for_timeout(1500)
++        about = await page.locator(".el-dialog:has-text('关于本系统')").inner_text()
++        return rows, about
++    rows, about = run_page(ctx, ctx.admin_user, ctx.admin_pw, fn)
++    check(rows > 100, f"接口文档只有 {rows} 行")
++    check("前后端版本不一致" not in about, about.replace("\n", " ")[:120])
++
++
++@case(S, "UI-06", "暗色模式刷新后保持", level="P2")
++def _(ctx):
++    async def fn(page, errors):
++        await page.evaluate("localStorage.setItem('dcim-theme','dark')")
++        await page.reload()
++        await page.wait_for_timeout(2000)
++        cls = await page.evaluate("document.documentElement.className")
++        await page.evaluate("localStorage.setItem('dcim-theme','light')")
++        return cls
++    cls = run_page(ctx, ctx.admin_user, ctx.admin_pw, fn)
++    check("dark" in cls, f"html class={cls!r}")
+diff --git a/tests/suites/s80_cluster.py b/tests/suites/s80_cluster.py
+new file mode 100644
+index 0000000..4c115be
+--- /dev/null
++++ b/tests/suites/s80_cluster.py
+@@ -0,0 +1,105 @@
++"""多实例（ADR-11）：两个后端实例共用同一数据库与 Redis 时，会话吊销、登录计数、限流、定时任务互斥是否在实例间一致。
++
++需要 BASE2 指向第二个实例（与 BASE 同库同 Redis）。CL-06 需要 SLOW=1 且能直连数据库（PGHOST 等）。
++"""
++import time
++from concurrent.futures import ThreadPoolExecutor
++from lib.framework import suite, case, setup, check, Skip
++from lib.context import data, msg
++
++S = suite("cluster", "多实例一致性", order=80)
++
++
++@setup(S)
++def _setup(ctx):
++    if not ctx.base2:
++        raise Skip("未设置 BASE2（第二个后端实例）")
++    st, _ = ctx.client(base=ctx.base2).get("/healthz")
++    if st != 200:
++        raise Skip(f"第二个实例不可用：HTTP {st}")
++    ctx.role("R34-VIEW", {"assets": "r", "workorders": "r"})
++
++
++def _b(ctx, ip=None):
++    return ctx.client(base=ctx.base2, ip=ip or ctx.ip())
++
++
++@case(S, "CL-01", "两个实例运行同一版本", level="P0")
++def _(ctx):
++    v1 = ctx.version()
++    st, b = _b(ctx).get("/healthz")
++    v2 = (data(b) or {}).get("version")
++    check(v1 == v2, f"实例 A {v1} / 实例 B {v2}")
++
++
++@case(S, "CL-02", "在实例 A 退出登录，实例 B 立即拒绝旧令牌", risk="会话吊销只在本机生效", level="P0")
++def _(ctx):
++    u = ctx.user("t34-cl", ["R34-VIEW"])
++    a = ctx.client(ip=u.ip)
++    a.login("t34-cl", u.password)
++    tok = a.s.cookies.get("access_token")
++    b = _b(ctx, u.ip)
++    b.s.cookies.set("access_token", tok)
++    st, _ = b.get("/auth/me")
++    check(st == 200, f"退出前实例 B 应接受令牌，HTTP {st}")
++    a.post("/auth/logout")
++    st, _ = b.get("/auth/me")
++    check(st == 401, f"退出后实例 B HTTP {st}")
++
++
++@case(S, "CL-03", "管理员在实例 A 停用账号，该账号在实例 B 的会话立即失效", level="P0")
++def _(ctx):
++    u = ctx.user("t34-cl2", ["R34-VIEW"], fresh=True)
++    b = _b(ctx, u.ip)
++    b.login("t34-cl2", u.password)
++    ctx.admin.put("/users/t34-cl2", {"name": "t34-cl2", "status": 0})
++    st, _ = b.get("/auth/me")
++    ctx.admin.put("/users/t34-cl2", {"name": "t34-cl2", "status": 1})
++    check(st == 401, f"停用后实例 B HTTP {st}")
++
++
++@case(S, "CL-04", "登录失败计数跨实例累计：A、B 各失败 15 次后账号锁定", risk="多实例各算各的额度", level="P0")
++def _(ctx):
++    u = ctx.user("t34-cl3", ["R34-VIEW"], fresh=True)
++    for i in range(15):
++        ctx.client(ip=ctx.ip()).login("t34-cl3", "Wrong#Password-123")
++        _b(ctx).login("t34-cl3", "Wrong#Password-123")
++    st, b = _b(ctx).login("t34-cl3", u.password)
++    ctx.admin.post("/users/t34-cl3/unlock")
++    check(st == 429, f"跨实例累计 30 次后新 IP 登录 HTTP {st} {msg(b)}")
++
++
++@case(S, "CL-05", "同一用户的限流额度跨实例共享", level="P1")
++def _(ctx):
++    u = ctx.user("t34-cl4", ["R34-VIEW"])
++    b = _b(ctx, u.ip)
++    b.s.cookies.update(u.s.cookies)
++
++    def hit(i):
++        c = u if i % 2 == 0 else b
++        st, _ = c.get("/auth/me", no_retry=True)
++        return st
++    t0 = time.perf_counter()
++    with ThreadPoolExecutor(20) as ex:
++        codes = list(ex.map(hit, range(120)))
++    dt = time.perf_counter() - t0
++    ok = codes.count(200)
++    budget = 40 + 20 * dt + 10   # 突发 40 + 每秒 20 次补充 + 余量；不共享时两个实例合计约翻倍
++    check(ok <= budget, f"两实例合计放行 {ok} 次（{dt:.1f} 秒内），超出共享额度 {budget:.0f}")
++    return f"放行 {ok}/120，用时 {dt:.1f} 秒"
++
++
++@case(S, "CL-06", "定时任务每周期只在一个实例上执行（job_lock.run_count）", risk="多实例重复派单 / 重复升级", level="P0")
++def _(ctx):
++    if not ctx.slow:
++        raise Skip("耗时约 3 分钟，设置 SLOW=1 运行")
++    rows = ctx.sql("SELECT name, run_count FROM job_lock WHERE name IN ('SlaEscalationService.scheduledRun','InspectionScheduler.tick')")
++    if rows is None:
++        raise Skip("未配置数据库直连（PGHOST 等）")
++    before = {r[0]: int(r[1]) for r in rows}
++    time.sleep(185)
++    after = {r[0]: int(r[1]) for r in ctx.sql("SELECT name, run_count FROM job_lock WHERE name IN ('SlaEscalationService.scheduledRun','InspectionScheduler.tick')")}
++    deltas = {k: after.get(k, 0) - before.get(k, 0) for k in after}
++    # 两个任务的周期都是 60 秒：185 秒内单实例最多 4 次；两个实例若各跑一次会到 6~7 次
++    check(all(0 < d <= 4 for d in deltas.values()), f"执行次数 {deltas}")
++    return f"185 秒内执行次数 {deltas}"
+diff --git a/tests/suites/s90_deploy.py b/tests/suites/s90_deploy.py
+new file mode 100644
+index 0000000..b1a8726
+--- /dev/null
++++ b/tests/suites/s90_deploy.py
+@@ -0,0 +1,120 @@
++"""安装包检查（静态）：脚本语法、编排文件、敏感文件、权限、版本一致性、已发布迁移未被改动、启动脚本选包逻辑。
++
++需要 PKG_DIR 指向解压后的安装包根目录（含 install.sh）。
++"""
++import glob, hashlib, json, os, re, shutil, stat, subprocess, tempfile
++from lib.framework import suite, case, setup, check, Skip
++
++S = suite("deploy", "安装包检查", order=90)
++HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++
++@setup(S)
++def _setup(ctx):
++    if not ctx.pkg_dir or not os.path.isfile(os.path.join(ctx.pkg_dir, "install.sh")):
++        raise Skip("未设置 PKG_DIR（安装包根目录）")
++
++
++def P(ctx, *parts):
++    return os.path.join(ctx.pkg_dir, *parts)
++
++
++@case(S, "DP-01", "全部 shell 脚本语法正确", level="P0")
++def _(ctx):
++    bad = []
++    files = [f for f in glob.glob(P(ctx, "**", "*.sh"), recursive=True) if "/source/" not in f] + [P(ctx, "install.sh"), P(ctx, "dcimctl")]
++    for f in files:
++        r = subprocess.run(["bash", "-n", f], capture_output=True, text=True)
++        if r.returncode != 0:
++            bad.append(f"{os.path.relpath(f, ctx.pkg_dir)}: {r.stderr.strip()[:80]}")
++    check(not bad, "; ".join(bad))
++    return f"{len(files)} 个脚本"
++
++
++@case(S, "DP-02", "docker-compose.yml 在两种 seccomp 设置下都能通过校验", level="P0")
++def _(ctx):
++    if not shutil.which("docker"):
++        raise Skip("没有 docker 命令")
++    with tempfile.TemporaryDirectory() as d:
++        env = os.path.join(d, ".env")
++        tpl = open(P(ctx, "deploy", ".env.example"), encoding="utf-8").read()
++        for opt in ("seccomp:unconfined", "no-new-privileges:true"):
++            open(env, "w", encoding="utf-8").write(re.sub(r"^SECCOMP_OPT=.*$", f"SECCOMP_OPT={opt}", tpl, flags=re.M))
++            r = subprocess.run(["docker", "compose", "--env-file", env, "-f", P(ctx, "deploy", "docker-compose.yml"), "config", "-q"],
++                               capture_output=True, text=True)
++            check(r.returncode == 0, f"SECCOMP_OPT={opt}：{r.stderr.strip()[:200]}")
++
++
++@case(S, "DP-03", "安装包里没有 .env、私钥、数据目录", risk="v3.2.0 安装包外泄", level="P0")
++def _(ctx):
++    bad = []
++    for root, dirs, files in os.walk(ctx.pkg_dir):
++        rel = os.path.relpath(root, ctx.pkg_dir)
++        if rel.split(os.sep)[0] in ("data",) or "pgdata" in rel:
++            bad.append(rel)
++        for f in files:
++            if f == ".env" or f.endswith((".key", ".p12", ".jks")) or f.startswith("id_rsa"):
++                bad.append(os.path.join(rel, f))
++    check(not bad, f"{bad[:8]}")
++
++
++@case(S, "DP-04", "没有全局可写文件，脚本可执行", level="P1")
++def _(ctx):
++    ww, noexec = [], []
++    for root, dirs, files in os.walk(ctx.pkg_dir):
++        for f in files:
++            p = os.path.join(root, f)
++            m = os.stat(p).st_mode
++            if m & stat.S_IWOTH:
++                ww.append(os.path.relpath(p, ctx.pkg_dir))
++            if (f.endswith(".sh") or f in ("install.sh", "dcimctl")) and not m & stat.S_IXUSR and "/source/" not in p:
++                noexec.append(os.path.relpath(p, ctx.pkg_dir))
++    check(not ww, f"全局可写：{ww[:5]}")
++    check(not noexec, f"不可执行：{noexec[:5]}")
++
++
++@case(S, "DP-05", "版本号一致：VERSION、后端包名、.env.example、compose 默认值", level="P0")
++def _(ctx):
++    v = open(P(ctx, "VERSION")).read().strip()
++    jars = [os.path.basename(j) for j in glob.glob(P(ctx, "artifacts", "backend", "dcim-platform-*.jar"))]
++    check(jars == [f"dcim-platform-{v}.jar"], f"后端包 {jars}，VERSION={v}")
++    env = open(P(ctx, "deploy", ".env.example"), encoding="utf-8").read()
++    check(f"DCIM_VERSION={v}" in env, ".env.example 的 DCIM_VERSION 不一致")
++    compose = open(P(ctx, "deploy", "docker-compose.yml"), encoding="utf-8").read()
++    check(f"${{DCIM_VERSION:-{v}}}" in compose, "docker-compose.yml 默认镜像标签不一致")
++    return f"v{v}"
++
++
++@case(S, "DP-06", "已发布的数据库迁移未被改动（与登记的校验和一致）", risk="Flyway 校验失败导致无法启动", level="P0")
++def _(ctx):
++    reg = json.load(open(os.path.join(HERE, "data", "migration-checksums.json"), encoding="utf-8"))
++    mig = glob.glob(P(ctx, "source", "backend", "resources", "db", "migration", "V*.sql"))
++    check(mig, "安装包内找不到迁移脚本（source/backend/resources/db/migration）")
++    cur = {os.path.basename(m): hashlib.sha256(open(m, "rb").read()).hexdigest() for m in mig}
++    changed = [n for n, h in reg.items() if n in cur and cur[n] != h]
++    missing = [n for n in reg if n not in cur]
++    check(not changed and not missing, f"被改动 {changed}，缺失 {missing}")
++    return f"已登记 {len(reg)} 个，当前 {len(cur)} 个"
++
++
++@case(S, "DP-07", "启动脚本在新旧 jar 并存时选版本最高的", risk="覆盖解压后跑旧包（v3.3.1 根因）", level="P0")
++def _(ctx):
++    src = open(P(ctx, "deploy", "native", "run-backend.sh"), encoding="utf-8").read()
++    with tempfile.TemporaryDirectory() as d:
++        os.makedirs(os.path.join(d, "artifacts", "backend"))
++        os.makedirs(os.path.join(d, "deploy", "native"))
++        for v in ("3.2.0", "3.3.0", "3.10.1", "3.4.0"):
++            open(os.path.join(d, "artifacts", "backend", f"dcim-platform-{v}.jar"), "w").close()
++        test = re.sub(r"^\s*exec java .*$", '  echo "PICK=$JAR"; exit 0', src, flags=re.M)
++        sp = os.path.join(d, "deploy", "native", "t.sh")
++        open(sp, "w").write(test)
++        r = subprocess.run(["sh", sp], capture_output=True, text=True)
++        check("dcim-platform-3.10.1.jar" in r.stdout, f"选中：{r.stdout.strip()} {r.stderr.strip()[:120]}")
++
++
++@case(S, "DP-08", "Prometheus 未开启远程生命周期接口，热加载用 SIGHUP", risk="可被远程关停监控", level="P1")
++def _(ctx):
++    compose = open(P(ctx, "deploy", "docker-compose.yml"), encoding="utf-8").read()
++    check(not re.search(r"^\s*-\s*--web\.enable-lifecycle", compose, re.M), "仍开启 --web.enable-lifecycle")
++    ctl = open(P(ctx, "dcimctl"), encoding="utf-8").read()
++    check("kill -s HUP dcim-prometheus" in ctl, "dcimctl 未改用 SIGHUP 热加载")
+diff --git a/tests/tools/register_migrations.py b/tests/tools/register_migrations.py
+new file mode 100755
+index 0000000..bae473a
+--- /dev/null
++++ b/tests/tools/register_migrations.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++"""把已发布的数据库迁移登记进 tests/data/migration-checksums.json（发布新版本时运行一次）。
++
++    python3 tests/tools/register_migrations.py [迁移目录]
++
++默认目录依次尝试 backend-resources/db/migration、source/backend/resources/db/migration。
++只追加新文件；已登记的文件如果内容变了，直接报错退出 —— 已发布的迁移不允许改动，应新增 V{n+1}。
++"""
++import hashlib, json, os, sys
++
++HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++REG = os.path.join(HERE, "data", "migration-checksums.json")
++ROOT = os.path.dirname(HERE)
++
++
++def version(name):
++    head = name[1:].split("__", 1)[0]
++    return tuple(int(x) for x in head.replace("_", ".").split(".") if x.isdigit())
++
++
++def main():
++    cands = sys.argv[1:] or [os.path.join(ROOT, "backend-resources", "db", "migration"),
++                             os.path.join(ROOT, "source", "backend", "resources", "db", "migration")]
++    d = next((c for c in cands if os.path.isdir(c)), None)
++    if not d:
++        sys.exit(f"找不到迁移目录：{cands}")
++    reg = json.load(open(REG, encoding="utf-8")) if os.path.exists(REG) else {}
++    cur = {f: hashlib.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
++           for f in os.listdir(d) if f.startswith("V") and f.endswith(".sql")}
++    changed = [f for f in reg if f in cur and cur[f] != reg[f]]
++    if changed:
++        sys.exit(f"已发布的迁移被改动：{changed}（请撤销改动，改为新增迁移）")
++    added = sorted(set(cur) - set(reg), key=version)
++    reg.update({f: cur[f] for f in added})
++    os.makedirs(os.path.dirname(REG), exist_ok=True)
++    with open(REG, "w", encoding="utf-8") as f:
++        json.dump(dict(sorted(reg.items(), key=lambda kv: version(kv[0]))), f, indent=1)
++    print(f"已登记 {len(reg)} 个迁移，本次新增 {added or '无'}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/ui_check.py b/tests/ui_check.py
+deleted file mode 100644
+index 3b87a3c..0000000
+--- a/tests/ui_check.py
++++ /dev/null
+@@ -1,42 +0,0 @@
+-import asyncio, os, sys
+-from playwright.async_api import async_playwright
+-BASE = "http://127.0.0.1:4173"
+-OUT = "/home/claude/work/build/shots"
+-async def main():
+-    async with async_playwright() as p:
+-        b = await p.chromium.launch(executable_path="/opt/pw-browsers/chromium-1194/chrome-linux/chrome" if os.path.exists("/opt/pw-browsers/chromium-1194/chrome-linux/chrome") else None)
+-        ctx = await b.new_context(viewport={"width": 1440, "height": 900}, locale="zh-CN")
+-        page = await ctx.new_page()
+-        errors = []
+-        page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+-        failed = []
+-        page.on("response", lambda r: failed.append(f"{r.status} {r.url}") if r.status >= 400 and "/api/" in r.url else None)
+-        await page.goto(BASE + "/login")
+-        await page.fill("input[placeholder='用户名']", "admin")
+-        await page.fill("input[placeholder='密码']", "Adm1n#Strong-2026")
+-        await page.keyboard.press("Enter")
+-        await page.wait_for_url("**/dashboard", timeout=20000)
+-        await page.wait_for_timeout(4000)
+-        await page.screenshot(path=f"{OUT}/dashboard-light.png", full_page=False)
+-        await page.evaluate("localStorage.setItem('dcim-theme','dark')")
+-        await page.reload(); await page.wait_for_timeout(4000)
+-        await page.screenshot(path=f"{OUT}/dashboard-dark.png", full_page=False)
+-        html_class = await page.evaluate("document.documentElement.className")
+-        await page.goto(BASE + "/workorders"); await page.wait_for_timeout(2500)
+-        await page.screenshot(path=f"{OUT}/workorders-dark.png")
+-        await page.evaluate("localStorage.setItem('dcim-theme','light')")
+-        await page.goto(BASE + "/workorders/WO-20261006-0001"); await page.wait_for_timeout(3000)
+-        await page.screenshot(path=f"{OUT}/wo-detail.png", full_page=True)
+-        has_problem = await page.locator("text=升级为问题单").count()
+-        await page.goto(BASE + "/system/roles"); await page.wait_for_timeout(2000)
+-        btns = page.locator("button:has-text('编辑')")
+-        if await btns.count() > 0:
+-            await btns.nth(1).click(); await page.wait_for_timeout(1500)
+-            await page.screenshot(path=f"{OUT}/role-scope.png")
+-        has_scope = await page.locator("text=数据范围").count()
+-        print("html.class(dark run) =", html_class)
+-        print("escalate button:", has_problem, " data-scope column:", has_scope)
+-        print("console errors:", len(errors)); [print("  ", e[:200]) for e in errors[:10]]
+-        print("api failures:", len(failed)); [print("  ", f) for f in sorted(set(failed))[:20]]
+-        await b.close()
+-asyncio.run(main())

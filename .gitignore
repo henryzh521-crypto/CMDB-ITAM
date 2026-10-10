@@ -1,0 +1,47 @@
+﻿# 运行时数据，不要提交
+V3.4.0/data/
+*.sock
+*.log
+*.pid
+
+# 密钥/环境变量
+.env
+.env.*
+*.key
+*.pem
+*.root_password
+*.root_user
+
+# 依赖
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# 系统/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 构建产物
+**/build/
+**/dist/
+**/artifacts/
+**/target/
+*.class
+*.jar
+
+# 发布包/压缩包
+*.tar.gz
+*.zip
+*.tgz
+
+# 测试输出
+**/tests/out/
+
+# 工具生成
+.arts/
+.merkle-snapshot.json

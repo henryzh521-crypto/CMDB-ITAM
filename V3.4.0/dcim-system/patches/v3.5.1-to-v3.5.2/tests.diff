@@ -1,0 +1,146 @@
+diff --git a/a/tests/README.md b/b/tests/README.md
+index ab050bc..3eeb755 100644
+--- a/a/tests/README.md
++++ b/b/tests/README.md
+@@ -1,6 +1,6 @@
+ # 回归测试套件（v3.5）
+ 
+-一条命令跑完 9 层、93 个用例，输出控制台结果和三种报告（`report.md` 给人看，`junit.xml` 给 CI，`report.json` 给脚本）。
++一条命令跑完 9 层、95 个用例，输出控制台结果和三种报告（`report.md` 给人看，`junit.xml` 给 CI，`report.json` 给脚本）。
+ 只依赖 Python 3.9+ 和 `requests`；浏览器用例另需 `playwright`，数据库相关用例另需 `psql`。条件不满足的套件或用例会**跳过**，不会报错。
+ 
+ ```bash
+@@ -36,13 +36,13 @@ python3 tests/run_all.py --list          # 只列出用例
+ | 套件 | 编号 | 内容 | 前置条件 |
+ |---|---|---|---|
+ | smoke 冒烟 | SM | 健康检查、版本、登录、全部无参 GET 不出 5xx、未登录 401 | 后端 |
+-| contract 接口契约 | CT | OpenAPI 完整性、写接口权限声明、统一响应结构、11 种关联资产写法（assetNos 回归）；v3.5：新事件目录、盘点差异工单、低库存联动、SLA 升级投递、SSE 帧契约 | 后端 |
++| contract 接口契约 | CT | OpenAPI 完整性、写接口权限声明、统一响应结构、11 种关联资产写法（assetNos 回归）；v3.5：新事件目录、盘点差异工单、低库存联动、SLA 升级投递、SSE 帧契约；v3.5.2：bmc_ip 唯一约束并发兜底 | 后端 |
+ | permission 权限矩阵 | PM/PA/PS/PF/PC | 模块读写、删除显式授予、导出、数据范围、字段级权限、授权上限 | 后端 |
+ | security 安全回归 | SE | 越权、会话吊销、令牌重放、用户名枚举、账号锁定、限流、审计、SSRF | 后端 |
+ | concurrency 并发正确性 | CC | 唯一键、乐观锁、状态流转、编号生成、连接池、事务性发件箱；v3.5：SSE 并发建连/心跳/广播/回收 | 后端 |
+ | performance 性能基线 | PERF | 8 个关键接口的延迟预算 + 多用户吞吐；v3.5：SSE 20 连接常开下的列表延迟 | ≥5 万资产 |
+ | e2e 浏览器端到端 | UI | 登录、界面建单落库、字段受限界面、角色字段权限编辑、接口文档、暗色模式；v3.5：通知中心、看板拖拽回弹、网络拓扑 | 前端 + playwright |
+-| cluster 多实例一致性 | CL | 跨实例会话吊销、账号停用、登录计数、限流共享、定时任务互斥；v3.5：SSE 跨实例送达、补货单跨实例幂等 | `BASE2`（CL-07 另需 Redis，CL-08 另需 ticket 模式） |
++| cluster 多实例一致性 | CL | 跨实例会话吊销、账号停用、登录计数、限流共享、定时任务互斥；v3.5：SSE 跨实例送达、补货单跨实例幂等；v3.5.2：PAT 吊销跨实例即时生效 | `BASE2`（CL-07/09 另需 Redis，CL-08 另需 ticket 模式） |
+ | deploy 安装包检查 | DP | 脚本语法、编排校验、敏感文件、权限、版本一致、迁移未改动、选包逻辑、监控热加载 | `PKG_DIR` |
+ 
+ ## 测试数据
+diff --git a/a/tests/data/migration-checksums.json b/b/tests/data/migration-checksums.json
+index 2b79b0e..b631c62 100644
+--- a/a/tests/data/migration-checksums.json
++++ b/b/tests/data/migration-checksums.json
+@@ -44,5 +44,6 @@
+  "V43__v33_security_perf.sql": "23b0adffbb3f2b77426c539529000766c511483184c3c21f1022ea87f8a98461",
+  "V44__report_settings.sql": "3875d468be4509a4de1a5999330d827d4f829317da0f8cca319acae417c8edbd",
+  "V45__v34_permissions_perf.sql": "be8812e4482c241e6d1162fdf269698a27e6e3ca500bbd97ba0ed34bcc0b6346",
+- "V46__v35_linkage_sse.sql": "deb7254806df993069e597f7a2319fd68b9c6cfedcda1b635a2dd8d76b333651"
++ "V46__v35_linkage_sse.sql": "deb7254806df993069e597f7a2319fd68b9c6cfedcda1b635a2dd8d76b333651",
++ "V47__v352_hardening.sql": "63dc999e97c898edfa1c5f351bacd647fa2dc04f01c6c6943281d0bd29200542"
+ }
+\ No newline at end of file
+diff --git a/a/tests/suites/s20_contract.py b/b/tests/suites/s20_contract.py
+index 3a8dceb..268816a 100644
+--- a/a/tests/suites/s20_contract.py
++++ b/b/tests/suites/s20_contract.py
+@@ -5,6 +5,7 @@ v3.5 增补：CT-11~15 覆盖新事件目录（workorder.sla_escalated / invento
+ """
+ import time
+ import uuid
++from concurrent.futures import ThreadPoolExecutor
+ 
+ import requests as rq
+ 
+@@ -386,3 +387,46 @@ def _(ctx):
+     st, b = ctx.admin.delete(f"/assets/{a2}")
+     check(st == 200, f"未入账资产删除应 200，实际 {st} {msg(b)}")
+     return "财务删除守卫生效：转固计提 409 / batch 错误行 / 未入账放行"
++
++
++@case(S, "CT-17", "带外端点 bmc_ip 唯一约束：顺序重复 409；并发 8 路同一 bmcIp 恰好 1 次 200、其余 409（无 500）", risk="check-then-act 竞态穿透唯一约束返回 500（P3-2）", level="P1")
++def _(ctx):
++    tok = ctx.admin.s.cookies.get("access_token")
++    check(bool(tok), "管理员会话缺少 access_token cookie")
++
++    def uniq_ip():
++        n = uuid.uuid4().int
++        return f"10.{n % 250 + 1}.{(n >> 8) % 250 + 1}.{(n >> 16) % 250 + 1}"
++
++    # 顺序重复：应用层 selectCount 查重 → 409（v3.4 已有行为，回归保护）
++    ip = uniq_ip()
++    st, b = ctx.admin.post("/oob/endpoints", {"bmcIp": ip})
++    check(st == 200, f"首次创建 HTTP {st} {msg(b)}")
++    st, b = ctx.admin.post("/oob/endpoints", {"bmcIp": ip})
++    check(st == 409, f"顺序重复创建应 409，实际 {st} {msg(b)}")
++    check("已存在" in msg(b), f"提示应说明端点已存在：{msg(b)}")
++
++    # 并发竞态：8 路同时创建另一 bmcIp——selectCount 查重同时放行、由数据库唯一约束兜底，
++    # DuplicateKeyException 须映射为 409（v3.5.2 前：竞态方收到 500）
++    ip2 = uniq_ip()
++
++    def race(_):
++        c = ctx.client()
++        c.s.cookies.set("access_token", tok)
++        return c.post("/oob/endpoints", {"bmcIp": ip2})[0]
++
++    with ThreadPoolExecutor(8) as ex:
++        codes = list(ex.map(race, range(8)))
++    check(codes.count(200) == 1, f"并发 8 路应恰好 1 次 200，实际 {codes}")
++    check(all(c in (200, 409) for c in codes), f"竞态穿透应映射为 409，实际状态码：{codes}")
++
++    # 清理本用例创建的端点（无凭据、无关联资产，留着只会让采集器反复外呼失败）
++    for kw in (ip, ip2):
++        try:
++            st, b = ctx.admin.get("/oob/endpoints", params={"page": 1, "size": 50, "keyword": kw})
++            for r in (data(b) or {}).get("records") or []:
++                if r.get("bmcIp") == kw:
++                    ctx.admin.delete(f"/oob/endpoints/{r['id']}")
++        except Exception:  # noqa
++            pass
++    return f"顺序 409 + 并发 {codes.count(200)}×200/{codes.count(409)}×409，唯一约束兜底生效"
+diff --git a/a/tests/suites/s80_cluster.py b/b/tests/suites/s80_cluster.py
+index 20b37b6..df00c65 100644
+--- a/a/tests/suites/s80_cluster.py
++++ b/b/tests/suites/s80_cluster.py
+@@ -2,6 +2,7 @@
+ 
+ 需要 BASE2 指向第二个实例（与 BASE 同库同 Redis）。CL-06 需要 SLOW=1 且能直连数据库（PGHOST 等）。
+ v3.5 增补：CL-07（SSE 跨实例，需 Redis）、CL-08（低库存补货单跨实例幂等，需 ticket 模式）。
++v3.5.2 增补：CL-09（PAT 吊销跨实例即时生效，需 Redis）。
+ """
+ import time
+ import uuid
+@@ -189,3 +190,33 @@ def _(ctx):
+     rows = open_tickets()
+     check(len(rows) == 1, f"双实例并发触发后应只有 1 张未完结补货单，实际 {len(rows)}：{[r['woNo'] for r in rows]}")
+     return f"补货单 {rows[0]['woNo']}，跨实例幂等成立"
++
++
++@case(S, "CL-09", "PAT 吊销跨实例生效：实例 A 吊销后，已进实例 B 校验缓存的令牌 3 秒内被拒（Redis pub/sub）", risk="v3.5.2 前多实例吊销窗口最长 60s（P3-7）", level="P0")
++def _(ctx):
++    st, b = ctx.client().get("/healthz")
++    if (data(b) or {}).get("redis") == "disabled":
++        raise Skip("Redis 未接入（PAT 吊销广播依赖 Redis pub/sub）")
++    st, b = ctx.admin.post("/tokens", {"name": f"CL-09 跨实例吊销 {ctx.run_id}", "readOnly": False, "expireDays": 1})
++    check(st == 200, f"创建 PAT HTTP {st} {msg(b)}")
++    tok = (data(b) or {}).get("token")
++    tid = (data(b) or {}).get("id")
++    check(bool(tok) and str(tok).startswith("dcim_pat_"), f"返回的令牌异常：{tok}")
++    h = {"Authorization": f"Bearer {tok}"}
++    b2 = _b(ctx)
++    # 先在实例 B 用一次：把令牌写进其 60s 校验缓存（否则测不出广播失效的价值）
++    st, _ = b2.get("/assets", params={"page": 1, "size": 1}, headers=h)
++    check(st == 200, f"吊销前实例 B 应接受 PAT，HTTP {st}")
++    # 实例 A 吊销 → 广播清各实例缓存；无广播时实例 B 的缓存要等 60s 才自然过期
++    st, b = ctx.admin.delete(f"/tokens/{tid}")
++    check(st == 200, f"实例 A 吊销 HTTP {st} {msg(b)}")
++    rejected, elapsed = False, None
++    t0 = time.time()
++    while time.time() - t0 < 3.0:
++        st, _ = b2.get("/assets", params={"page": 1, "size": 1}, headers=h)
++        if st == 401:
++            rejected, elapsed = True, time.time() - t0
++            break
++        time.sleep(0.2)
++    check(rejected, "3s 内实例 B 仍在接受已吊销的 PAT（吊销广播未生效）")
++    return f"吊销后实例 B {elapsed:.1f}s 内拒绝"

@@ -1,0 +1,1872 @@
+diff --git a/platform-web/components.d.ts b/platform-web/components.d.ts
+index 8c4437c..ee37a66 100644
+--- a/platform-web/components.d.ts
++++ b/platform-web/components.d.ts
+@@ -52,6 +52,7 @@ declare module 'vue' {
+     ElRadio: typeof import('element-plus/es')['ElRadio']
+     ElRadioButton: typeof import('element-plus/es')['ElRadioButton']
+     ElRadioGroup: typeof import('element-plus/es')['ElRadioGroup']
++    ElResult: typeof import('element-plus/es')['ElResult']
+     ElRow: typeof import('element-plus/es')['ElRow']
+     ElSelect: typeof import('element-plus/es')['ElSelect']
+     ElSubMenu: typeof import('element-plus/es')['ElSubMenu']
+diff --git a/platform-web/package.json b/platform-web/package.json
+index 5486544..6cd4e01 100644
+--- a/platform-web/package.json
++++ b/platform-web/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "platform-web",
+   "private": true,
+-  "version": "3.2.0",
++  "version": "3.4.0",
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+diff --git a/platform-web/src/api/client.ts b/platform-web/src/api/client.ts
+index c700c71..e1dce92 100644
+--- a/platform-web/src/api/client.ts
++++ b/platform-web/src/api/client.ts
+@@ -16,10 +16,12 @@ function isSilent(cfg: unknown): boolean {
+ 
+ export const USER_KEY = 'platform.user'
+ export const MODULES_KEY = 'platform.modules'
++export const PERMS_KEY = 'platform.perms'
+ 
+ export function clearLocalAuth(): void {
+   localStorage.removeItem(USER_KEY)
+   localStorage.removeItem(MODULES_KEY)
++  localStorage.removeItem(PERMS_KEY)
+ }
+ 
+ function redirectToLogin(): void {
+diff --git a/platform-web/src/api/types.ts b/platform-web/src/api/types.ts
+index a6467e5..241bd50 100644
+--- a/platform-web/src/api/types.ts
++++ b/platform-web/src/api/types.ts
+@@ -20,9 +20,22 @@ export interface LoginResult {
+   user: UserInfo
+ }
+ 
++/** v3.4：每个模块的操作权限（后端已按角色合并；删除需显式授予） */
++export type ActionMap = Record<string, Partial<Record<'delete' | 'create' | 'update' | 'import' | 'export' | 'approve', boolean>>>
++
++/** v3.4：字段级权限（隐藏 = 不可见不可写；只读 = 可见不可写） */
++export interface FieldRule {
++  hidden?: string[]
++  readonly?: string[]
++}
++export type FieldMap = Record<string, FieldRule>
++
+ export interface MeResult extends UserInfo {
+   roles: string[]
+   modules: ModuleMap
++  actions?: ActionMap
++  fields?: FieldMap
++  dataScopes?: Record<string, string>
+ }
+ 
+ /** 通用分页返回 */
+@@ -70,6 +83,9 @@ export interface UserItem {
+   mustChangePwd?: boolean
+   roles?: string[]
+   createdAt?: string
++  /** v3.4：账号级登录锁定 */
++  loginLocked?: boolean
++  loginLockedSeconds?: number
+ }
+ 
+ export interface RoleItem {
+diff --git a/platform-web/src/layout/MainLayout.vue b/platform-web/src/layout/MainLayout.vue
+index 87f7682..0e66c5e 100644
+--- a/platform-web/src/layout/MainLayout.vue
++++ b/platform-web/src/layout/MainLayout.vue
+@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
+ import { ElMessage } from 'element-plus'
+ import { Search, Monitor, Sunny, Moon, User, ArrowDown, Bell } from '@element-plus/icons-vue'
+ import { useAuthStore } from '@/stores/auth'
++import http from '@/api/client'
+ import { useThemeStore } from '@/stores/theme'
+ import {
+   fetchMyNotifications,
+@@ -155,6 +156,7 @@ const menuGroups: MenuGroup[] = [
+       { path: '/webhooks', title: '消息推送 / Webhook', module: 'system' },
+       { path: '/system/ldap', title: '目录集成（LDAP）', module: 'system', adminOnly: true },
+       { path: '/account/tokens', title: '个人访问令牌', module: 'dashboard' },
++      { path: '/developer/api-docs', title: '接口文档', module: 'dashboard' },
+     ],
+   },
+ ]
+@@ -259,6 +261,8 @@ async function onUserCommand(command: string) {
+     router.push('/change-password')
+   } else if (command === 'tokens') {
+     router.push('/account/tokens')
++  } else if (command === 'about') {
++    void openAbout()
+   } else if (command === 'logout') {
+     await auth.logout()
+     ElMessage.success('已退出登录')
+@@ -266,6 +270,22 @@ async function onUserCommand(command: string) {
+   }
+ }
+ 
++/* ---------------- v3.4：关于（前后端版本对照） ---------------- */
++const aboutVisible = ref(false)
++const backendVersion = ref('')
++const frontendVersion = __APP_VERSION__
++
++async function openAbout() {
++  aboutVisible.value = true
++  backendVersion.value = '查询中…'
++  try {
++    const h = await http.get<any, { version?: string }>('/healthz', { silent: true } as Record<string, unknown>)
++    backendVersion.value = h?.version || '未知（v3.3.0 及以前的后端不报告版本）'
++  } catch {
++    backendVersion.value = '无法获取'
++  }
++}
++
+ /* ---------------- 通知铃铛 ---------------- */
+ const unreadCount = ref(0)
+ const notiLoading = ref(false)
+@@ -442,6 +462,7 @@ onUnmounted(() => {
+               <el-dropdown-menu>
+                 <el-dropdown-item command="password">修改密码</el-dropdown-item>
+                 <el-dropdown-item command="tokens">个人访问令牌</el-dropdown-item>
++                <el-dropdown-item command="about">关于本系统</el-dropdown-item>
+                 <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
+               </el-dropdown-menu>
+             </template>
+@@ -485,6 +506,19 @@ onUnmounted(() => {
+       </el-main>
+     </el-container>
+   </el-container>
++  <el-dialog v-model="aboutVisible" title="关于本系统" width="420px">
++    <el-descriptions :column="1" border size="small">
++      <el-descriptions-item label="前端版本">{{ frontendVersion }}</el-descriptions-item>
++      <el-descriptions-item label="后端版本">{{ backendVersion }}</el-descriptions-item>
++    </el-descriptions>
++    <p v-if="backendVersion && frontendVersion && backendVersion !== frontendVersion && /^\d/.test(backendVersion)" class="about-warn">
++      前后端版本不一致：通常是升级时没有重建全部镜像，或安装目录里残留了旧的后端包。
++    </p>
++    <template #footer>
++      <el-button @click="router.push('/developer/api-docs'); aboutVisible = false">接口文档</el-button>
++      <el-button type="primary" @click="aboutVisible = false">关闭</el-button>
++    </template>
++  </el-dialog>
+ </template>
+ 
+ <style scoped>
+@@ -682,4 +716,9 @@ onUnmounted(() => {
+   background: var(--el-fill-color-light);
+   padding: 16px;
+ }
++.about-warn {
++  margin: 12px 0 0;
++  color: var(--el-color-warning);
++  font-size: 13px;
++}
+ </style>
+diff --git a/platform-web/src/router/index.ts b/platform-web/src/router/index.ts
+index 1f7db89..9aa3ff5 100644
+--- a/platform-web/src/router/index.ts
++++ b/platform-web/src/router/index.ts
+@@ -245,6 +245,13 @@ const routes: RouteRecordRaw[] = [
+         meta: { title: '数据字典', module: 'system' },
+       },
+ 
++      // v3.4：接口文档（登录即可访问；后端 /api/openapi.json）
++      {
++        path: 'developer/api-docs',
++        name: 'developer-api-docs',
++        component: () => import('@/views/developer/ApiDocsView.vue'),
++        meta: { title: '接口文档', module: 'dashboard' },
++      },
+       // 系统管理 system（用户/角色为真实页面）
+       {
+         path: 'system/users',
+diff --git a/platform-web/src/stores/auth.ts b/platform-web/src/stores/auth.ts
+index ed0cfe7..cb4958b 100644
+--- a/platform-web/src/stores/auth.ts
++++ b/platform-web/src/stores/auth.ts
+@@ -1,8 +1,8 @@
+ import { defineStore } from 'pinia'
+-import { USER_KEY, MODULES_KEY, clearLocalAuth } from '@/api/client'
++import { USER_KEY, MODULES_KEY, PERMS_KEY, clearLocalAuth } from '@/api/client'
+ import * as authApi from '@/api/auth'
+ import { wecomDevLogin, wecomLogin } from '@/api/wecom'
+-import type { LoginResult, ModuleMap, UserInfo } from '@/api/types'
++import type { ActionMap, FieldMap, LoginResult, ModuleMap, UserInfo } from '@/api/types'
+ 
+ function readJson<T>(key: string, fallback: T): T {
+   try {
+@@ -13,15 +13,28 @@ function readJson<T>(key: string, fallback: T): T {
+   }
+ }
+ 
++interface PermExt {
++  actions: ActionMap
++  fields: FieldMap
++  dataScopes: Record<string, string>
++}
++
+ interface AuthState {
+   user: UserInfo | null
+   modules: ModuleMap
++  perms: PermExt | null
++}
++
++function has(list: string[] | undefined, field: string): boolean {
++  const f = field.toLowerCase()
++  return !!list?.some((x) => x.toLowerCase() === f)
+ }
+ 
+ export const useAuthStore = defineStore('auth', {
+   state: (): AuthState => ({
+     user: readJson<UserInfo | null>(USER_KEY, null),
+     modules: readJson<ModuleMap>(MODULES_KEY, {}),
++    perms: readJson<PermExt | null>(PERMS_KEY, null),
+   }),
+ 
+   getters: {
+@@ -29,6 +42,27 @@ export const useAuthStore = defineStore('auth', {
+     canRead: (state) => (moduleCode: string) =>
+       moduleCode === 'dashboard' || !!state.modules[moduleCode]?.read,
+     canWrite: (state) => (moduleCode: string) => !!state.modules[moduleCode]?.write,
++    /** v3.4：删除需显式授予（管理员恒可删除） */
++    canDelete: (state) => (moduleCode: string) =>
++      !!state.user?.isAdmin || !!state.perms?.actions?.[moduleCode]?.delete,
++    /** 操作权限：除删除外默认允许，角色显式禁止时为 false */
++    canAction: (state) => (moduleCode: string, action: 'create' | 'update' | 'import' | 'export' | 'approve') =>
++      !!state.user?.isAdmin || state.perms?.actions?.[moduleCode]?.[action] !== false,
++    /** 字段对当前用户可见 */
++    fieldVisible: (state) => (moduleCode: string, field: string) =>
++      !!state.user?.isAdmin || !has(state.perms?.fields?.[moduleCode]?.hidden, field),
++    /** 字段对当前用户可编辑（模块可写、字段未隐藏且非只读） */
++    fieldEditable: (state) => (moduleCode: string, field: string) =>
++      !!state.user?.isAdmin ||
++      (!!state.modules[moduleCode]?.write &&
++        !has(state.perms?.fields?.[moduleCode]?.hidden, field) &&
++        !has(state.perms?.fields?.[moduleCode]?.readonly, field)),
++    /** 当前用户在该模块上是否有任何字段限制（有则不能批量导入） */
++    fieldRestricted: (state) => (moduleCode: string) => {
++      if (state.user?.isAdmin) return false
++      const r = state.perms?.fields?.[moduleCode]
++      return !!(r && ((r.hidden?.length ?? 0) > 0 || (r.readonly?.length ?? 0) > 0))
++    },
+   },
+ 
+   actions: {
+@@ -36,6 +70,8 @@ export const useAuthStore = defineStore('auth', {
+       if (this.user) localStorage.setItem(USER_KEY, JSON.stringify(this.user))
+       else localStorage.removeItem(USER_KEY)
+       localStorage.setItem(MODULES_KEY, JSON.stringify(this.modules))
++      if (this.perms) localStorage.setItem(PERMS_KEY, JSON.stringify(this.perms))
++      else localStorage.removeItem(PERMS_KEY)
+     },
+ 
+     async login(username: string, password: string) {
+@@ -77,11 +113,12 @@ export const useAuthStore = defineStore('auth', {
+         roles: me.roles,
+       }
+       this.modules = me.modules || {}
++      this.perms = { actions: me.actions || {}, fields: me.fields || {}, dataScopes: me.dataScopes || {} }
+       this.persist()
+     },
+ 
+     async ensureLoaded() {
+-      if (!this.modules || Object.keys(this.modules).length === 0) {
++      if (!this.modules || Object.keys(this.modules).length === 0 || !this.perms) {
+         await this.fetchMe()
+       }
+     },
+@@ -97,6 +134,7 @@ export const useAuthStore = defineStore('auth', {
+     reset() {
+       this.user = null
+       this.modules = {}
++      this.perms = null
+       clearLocalAuth()
+     },
+   },
+diff --git a/platform-web/src/views/asset/AssetListView.vue b/platform-web/src/views/asset/AssetListView.vue
+index f0c50d8..4cc01fa 100644
+--- a/platform-web/src/views/asset/AssetListView.vue
++++ b/platform-web/src/views/asset/AssetListView.vue
+@@ -43,6 +43,9 @@ import { downloadQrcode, openPrintPage, renderToCanvas } from '@/utils/qrcode'
+ import { assetEventLabel } from '@/utils/assetEvents'
+ 
+ const auth = useAuthStore()
++/** v3.4：字段级权限——隐藏字段不显示，只读字段不可编辑（后端同样校验） */
++const fv = (f: string) => auth.fieldVisible('assets', f)
++const fe = (f: string) => auth.fieldEditable('assets', f)
+ 
+ type TagType = 'primary' | 'success' | 'warning' | 'info' | 'danger'
+ 
+@@ -1228,7 +1231,7 @@ onMounted(() => {
+           批量编辑
+         </el-button>
+         <el-button
+-          v-if="auth.user?.isAdmin"
++          v-if="auth.canDelete('assets')"
+           type="danger"
+           plain
+           @click="batchDelete"
+@@ -1238,7 +1241,7 @@ onMounted(() => {
+         <el-button :loading="exporting" plain @click="exportSelected">导出选中</el-button>
+       </template>
+       <el-button type="primary" @click="openCreate">新增资产</el-button>
+-      <el-button @click="openImport">导入</el-button>
++      <el-button v-if="auth.canWrite('assets') && !auth.fieldRestricted('assets')" @click="openImport">导入</el-button>
+       <el-button :loading="exporting" @click="doExport">导出</el-button>
+       <el-button
+         type="success"
+@@ -1263,7 +1266,7 @@ onMounted(() => {
+     >
+       <el-table-column type="selection" width="42" fixed="left" />
+       <el-table-column prop="assetNo" label="资产编号" min-width="130" fixed="left" />
+-      <el-table-column label="父资产" min-width="130" show-overflow-tooltip>
++      <el-table-column v-if="fv('parentAssetNo')" label="父资产" min-width="130" show-overflow-tooltip>
+         <template #default="{ row }">
+           <template v-if="row.parentAssetNo">
+             <el-button link type="primary" @click="openParentFromChild(row)">{{ row.parentAssetNo }}</el-button>
+@@ -1271,39 +1274,39 @@ onMounted(() => {
+           <span v-else class="root-badge">整机</span>
+         </template>
+       </el-table-column>
+-      <el-table-column prop="sn" label="SN" min-width="120" show-overflow-tooltip />
++      <el-table-column v-if="fv('sn')" prop="sn" label="SN" min-width="120" show-overflow-tooltip />
+       <el-table-column prop="name" label="名称" min-width="140" show-overflow-tooltip />
+-      <el-table-column label="分类" min-width="110" show-overflow-tooltip>
++      <el-table-column v-if="fv('categoryCode')" label="分类" min-width="110" show-overflow-tooltip>
+         <template #default="{ row }">
+           {{ categoryNameMap.get(row.categoryCode) || row.categoryCode || '-' }}
+         </template>
+       </el-table-column>
+-      <el-table-column label="业务状态" width="100">
++      <el-table-column v-if="fv('statusBiz')" label="业务状态" width="100">
+         <template #default="{ row }">
+           <el-tag :type="stateTagType(row.statusBiz)" size="small">{{ row.statusBiz || '-' }}</el-tag>
+         </template>
+       </el-table-column>
+-      <el-table-column label="财务状态" width="100">
++      <el-table-column v-if="fv('statusFin')" label="财务状态" width="100">
+         <template #default="{ row }">
+           <el-tag :type="stateTagType(row.statusFin)" size="small">{{ row.statusFin || '-' }}</el-tag>
+         </template>
+       </el-table-column>
+-      <el-table-column label="区域" width="90">
++      <el-table-column v-if="fv('regionCode')" label="区域" width="90">
+         <template #default="{ row }">{{ regionLabel(row.regionCode) }}</template>
+       </el-table-column>
+-      <el-table-column prop="rackCode" label="机柜" min-width="100" show-overflow-tooltip>
++      <el-table-column v-if="fv('rackCode')" prop="rackCode" label="机柜" min-width="100" show-overflow-tooltip>
+         <template #default="{ row }">{{ row.rackCode || '-' }}</template>
+       </el-table-column>
+-      <el-table-column label="U位" width="70">
++      <el-table-column v-if="fv('unitNo')" label="U位" width="70">
+         <template #default="{ row }">{{ row.unitNo || '-' }}</template>
+       </el-table-column>
+-      <el-table-column prop="department" label="使用部门" min-width="110" show-overflow-tooltip>
++      <el-table-column v-if="fv('department')" prop="department" label="使用部门" min-width="110" show-overflow-tooltip>
+         <template #default="{ row }">{{ row.department || '-' }}</template>
+       </el-table-column>
+-      <el-table-column prop="owner" label="责任人" min-width="90">
++      <el-table-column v-if="fv('owner')" prop="owner" label="责任人" min-width="90">
+         <template #default="{ row }">{{ row.owner || '-' }}</template>
+       </el-table-column>
+-      <el-table-column prop="purchaseDate" label="采购日期" width="105">
++      <el-table-column v-if="fv('purchaseDate')" prop="purchaseDate" label="采购日期" width="105">
+         <template #default="{ row }">{{ row.purchaseDate || '-' }}</template>
+       </el-table-column>
+       <el-table-column label="操作" width="240" fixed="right">
+@@ -1312,7 +1315,7 @@ onMounted(() => {
+           <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+           <el-button link type="warning" @click="openTransition(row)">流转</el-button>
+           <el-button link type="info" @click="filterChildren(row)">子资产</el-button>
+-          <el-button v-if="auth.user?.isAdmin" link type="danger" @click="remove(row)">删除</el-button>
++          <el-button v-if="auth.canDelete('assets')" link type="danger" @click="remove(row)">删除</el-button>
+         </template>
+       </el-table-column>
+     </el-table>
+@@ -1336,25 +1339,25 @@ onMounted(() => {
+           <el-tag v-else type="info" size="small">部件</el-tag>
+         </template>
+       </el-table-column>
+-      <el-table-column label="分类" min-width="110" show-overflow-tooltip>
++      <el-table-column v-if="fv('categoryCode')" label="分类" min-width="110" show-overflow-tooltip>
+         <template #default="{ row }">
+           {{ categoryNameMap.get(row.categoryCode) || row.categoryCode || '-' }}
+         </template>
+       </el-table-column>
+-      <el-table-column label="业务状态" width="100">
++      <el-table-column v-if="fv('statusBiz')" label="业务状态" width="100">
+         <template #default="{ row }">
+           <el-tag :type="stateTagType(row.statusBiz)" size="small">{{ row.statusBiz || '-' }}</el-tag>
+         </template>
+       </el-table-column>
+-      <el-table-column label="财务状态" width="100">
++      <el-table-column v-if="fv('statusFin')" label="财务状态" width="100">
+         <template #default="{ row }">
+           <el-tag :type="stateTagType(row.statusFin)" size="small">{{ row.statusFin || '-' }}</el-tag>
+         </template>
+       </el-table-column>
+-      <el-table-column label="机柜 / U" min-width="100">
++      <el-table-column v-if="fv('rackCode')" label="机柜 / U" min-width="100">
+         <template #default="{ row }">{{ row.rackCode || '-' }}{{ row.unitNo ? ' / U' + row.unitNo : '' }}</template>
+       </el-table-column>
+-      <el-table-column prop="owner" label="责任人" min-width="90">
++      <el-table-column v-if="fv('owner')" prop="owner" label="责任人" min-width="90">
+         <template #default="{ row }">{{ row.owner || '-' }}</template>
+       </el-table-column>
+       <el-table-column label="操作" width="200" fixed="right">
+@@ -1362,7 +1365,7 @@ onMounted(() => {
+           <el-button link type="primary" @click="openDetail(row)">详情</el-button>
+           <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+           <el-button link type="warning" @click="openTransition(row)">流转</el-button>
+-          <el-button v-if="auth.user?.isAdmin" link type="danger" @click="remove(row)">删除</el-button>
++          <el-button v-if="auth.canDelete('assets')" link type="danger" @click="remove(row)">删除</el-button>
+         </template>
+       </el-table-column>
+     </el-table>
+@@ -1404,15 +1407,15 @@ onMounted(() => {
+                   <el-input ref="nameInputRef" v-model="form.name" placeholder="必填" />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('sn')" :span="12">
+                 <el-form-item label="SN">
+-                  <el-input v-model="form.sn" />
++                  <el-input :disabled="!fe('sn')" v-model="form.sn" />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('categoryCode')" :span="12">
+                 <el-form-item label="分类">
+                   <el-tree-select
+-                    v-model="form.categoryCode"
++                    :disabled="!fe('categoryCode')" v-model="form.categoryCode"
+                     :data="categoryTree"
+                     :props="{ label: 'name', children: 'children' }"
+                     node-key="categoryCode"
+@@ -1426,10 +1429,10 @@ onMounted(() => {
+                   />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('modelCode')" :span="12">
+                 <el-form-item label="型号">
+                   <el-select
+-                    v-model="form.modelCode"
++                    :disabled="!fe('modelCode')" v-model="form.modelCode"
+                     clearable
+                     filterable
+                     allow-create
+@@ -1442,9 +1445,9 @@ onMounted(() => {
+                   </el-select>
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('regionCode')" :span="12">
+                 <el-form-item label="区域">
+-                  <el-select v-model="form.regionCode" clearable placeholder="选择区域" style="width: 100%">
++                  <el-select :disabled="!fe('regionCode')" v-model="form.regionCode" clearable placeholder="选择区域" style="width: 100%">
+                     <el-option v-for="r in meta?.regions || []" :key="r.key" :label="r.label" :value="r.key" />
+                   </el-select>
+                 </el-form-item>
+@@ -1459,10 +1462,10 @@ onMounted(() => {
+           <!-- ② 位置与上架：区域→机房→机柜→U位 级联 -->
+           <el-collapse-item name="position" title="位置与上架">
+             <el-row :gutter="12">
+-              <el-col :span="12">
++              <el-col v-if="fv('roomCode')" :span="12">
+                 <el-form-item label="机房">
+                   <el-select
+-                    v-model="form.roomCode"
++                    :disabled="!fe('roomCode')" v-model="form.roomCode"
+                     clearable
+                     filterable
+                     allow-create
+@@ -1484,10 +1487,10 @@ onMounted(() => {
+                   </el-select>
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('rackCode')" :span="12">
+                 <el-form-item label="机柜">
+                   <el-select
+-                    v-model="form.rackCode"
++                    :disabled="!fe('rackCode')" v-model="form.rackCode"
+                     clearable
+                     filterable
+                     remote
+@@ -1508,10 +1511,10 @@ onMounted(() => {
+                   <div class="form-hint">选中机柜会自动回填所属机房</div>
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="8">
++              <el-col v-if="fv('uHeight')" :span="8">
+                 <el-form-item label="U高">
+                   <el-input-number
+-                    v-model="form.uHeight"
++                    :disabled="!fe('uHeight')" v-model="form.uHeight"
+                     :min="1"
+                     :max="48"
+                     controls-position="right"
+@@ -1519,12 +1522,12 @@ onMounted(() => {
+                   />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="8">
++              <el-col v-if="fv('unitNo')" :span="8">
+                 <el-form-item label="U位">
+                   <el-select
+                     v-model="form.unitNo"
+                     clearable
+-                    :disabled="!form.rackCode"
++                    :disabled="(!form.rackCode) || !fe('unitNo')"
+                     :loading="unitOptionsLoading"
+                     :placeholder="form.rackCode ? '选择起始U位' : '先选择机柜'"
+                     style="width: 100%"
+@@ -1534,10 +1537,10 @@ onMounted(() => {
+                   <div class="form-hint">{{ unitHint }}</div>
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="16">
++              <el-col v-if="fv('rackDate')" :span="16">
+                 <el-form-item label="上架日期">
+                   <el-date-picker
+-                    v-model="form.rackDate"
++                    :disabled="!fe('rackDate')" v-model="form.rackDate"
+                     type="date"
+                     value-format="YYYY-MM-DD"
+                     placeholder="选择日期"
+@@ -1551,10 +1554,10 @@ onMounted(() => {
+           <!-- ③ 采购与责任 -->
+           <el-collapse-item name="purchase" title="采购与责任">
+             <el-row :gutter="12">
+-              <el-col :span="12">
++              <el-col v-if="fv('purchaseDate')" :span="12">
+                 <el-form-item label="采购日期">
+                   <el-date-picker
+-                    v-model="form.purchaseDate"
++                    :disabled="!fe('purchaseDate')" v-model="form.purchaseDate"
+                     type="date"
+                     value-format="YYYY-MM-DD"
+                     placeholder="选择日期"
+@@ -1562,10 +1565,10 @@ onMounted(() => {
+                   />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('purchasePrice')" :span="12">
+                 <el-form-item label="采购单价">
+                   <el-input-number
+-                    v-model="form.purchasePrice"
++                    :disabled="!fe('purchasePrice')" v-model="form.purchasePrice"
+                     :min="0"
+                     :precision="2"
+                     controls-position="right"
+@@ -1573,10 +1576,10 @@ onMounted(() => {
+                   />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('warrantyEnd')" :span="12">
+                 <el-form-item label="保修到期">
+                   <el-date-picker
+-                    v-model="form.warrantyEnd"
++                    :disabled="!fe('warrantyEnd')" v-model="form.warrantyEnd"
+                     type="date"
+                     value-format="YYYY-MM-DD"
+                     placeholder="选择日期"
+@@ -1584,15 +1587,15 @@ onMounted(() => {
+                   />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('contractNo')" :span="12">
+                 <el-form-item label="合同号">
+-                  <el-input v-model="form.contractNo" />
++                  <el-input :disabled="!fe('contractNo')" v-model="form.contractNo" />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('ratedPowerW')" :span="12">
+                 <el-form-item label="额定功率">
+                   <el-input-number
+-                    v-model="form.ratedPowerW"
++                    :disabled="!fe('ratedPowerW')" v-model="form.ratedPowerW"
+                     :min="0"
+                     :max="200000"
+                     :controls="false"
+@@ -1601,14 +1604,14 @@ onMounted(() => {
+                   />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('department')" :span="12">
+                 <el-form-item label="使用部门">
+-                  <el-input v-model="form.department" />
++                  <el-input :disabled="!fe('department')" v-model="form.department" />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('owner')" :span="12">
+                 <el-form-item label="责任人">
+-                  <el-input v-model="form.owner" />
++                  <el-input :disabled="!fe('owner')" v-model="form.owner" />
+                 </el-form-item>
+               </el-col>
+             </el-row>
+@@ -1617,9 +1620,9 @@ onMounted(() => {
+           <!-- ④ 扩展信息 -->
+           <el-collapse-item name="extra" title="扩展信息">
+             <el-row :gutter="12">
+-              <el-col :span="12">
++              <el-col v-if="fv('ownerType')" :span="12">
+                 <el-form-item label="权属">
+-                  <el-select v-model="form.ownerType" clearable placeholder="自持 / 租赁" style="width: 100%">
++                  <el-select :disabled="!fe('ownerType')" v-model="form.ownerType" clearable placeholder="自持 / 租赁" style="width: 100%">
+                     <el-option
+                       v-for="t in meta?.ownerTypes || []"
+                       :key="t"
+@@ -1629,20 +1632,20 @@ onMounted(() => {
+                   </el-select>
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('mgmtIp')" :span="12">
+                 <el-form-item label="管理IP">
+-                  <el-input v-model="form.mgmtIp" />
++                  <el-input :disabled="!fe('mgmtIp')" v-model="form.mgmtIp" />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('bizIp')" :span="12">
+                 <el-form-item label="业务IP">
+-                  <el-input v-model="form.bizIp" />
++                  <el-input :disabled="!fe('bizIp')" v-model="form.bizIp" />
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="12">
++              <el-col v-if="fv('parentAssetNo')" :span="12">
+                 <el-form-item label="父资产">
+                   <el-select
+-                    v-model="form.parentAssetNo"
++                    :disabled="!fe('parentAssetNo')" v-model="form.parentAssetNo"
+                     clearable
+                     filterable
+                     remote
+@@ -1662,9 +1665,9 @@ onMounted(() => {
+                   <div class="form-hint">部件（GPU卡/内存/硬盘等）挂到整机下；清空=根资产</div>
+                 </el-form-item>
+               </el-col>
+-              <el-col :span="24">
++              <el-col v-if="fv('attrs')" :span="24">
+                 <el-form-item label="备注">
+-                  <el-input v-model="form.attrsRemark" type="textarea" :rows="2" placeholder="存储于 attrs.remark" />
++                  <el-input :disabled="!fe('attrs')" v-model="form.attrsRemark" type="textarea" :rows="2" placeholder="存储于 attrs.remark" />
+                 </el-form-item>
+               </el-col>
+             </el-row>
+@@ -1934,7 +1937,7 @@ onMounted(() => {
+         style="margin-bottom: 12px"
+       />
+       <el-form label-width="92px">
+-        <el-form-item label="分类">
++        <el-form-item v-if="fe('categoryCode')" label="分类">
+           <el-select
+             v-model="batchEditForm.categoryCode"
+             clearable
+@@ -1946,7 +1949,7 @@ onMounted(() => {
+             <el-option v-for="c in categoryFlat" :key="c.categoryCode" :label="c.label" :value="c.categoryCode" />
+           </el-select>
+         </el-form-item>
+-        <el-form-item label="型号">
++        <el-form-item v-if="fe('modelCode')" label="型号">
+           <el-select
+             v-model="batchEditForm.modelCode"
+             clearable
+@@ -1959,7 +1962,7 @@ onMounted(() => {
+             <el-option v-for="m in modelOptions" :key="m" :label="m" :value="m" />
+           </el-select>
+         </el-form-item>
+-        <el-form-item label="区域">
++        <el-form-item v-if="fe('regionCode')" label="区域">
+           <el-select
+             v-model="batchEditForm.regionCode"
+             clearable
+@@ -1975,19 +1978,19 @@ onMounted(() => {
+             />
+           </el-select>
+         </el-form-item>
+-        <el-form-item label="权属">
++        <el-form-item v-if="fe('ownerType')" label="权属">
+           <el-select v-model="batchEditForm.ownerType" clearable placeholder="不修改请留空" style="width: 100%">
+             <el-option label="自持 SELF" value="SELF" />
+             <el-option label="租赁 LEASE" value="LEASE" />
+           </el-select>
+         </el-form-item>
+-        <el-form-item label="使用部门">
++        <el-form-item v-if="fe('department')" label="使用部门">
+           <el-input v-model="batchEditForm.department" clearable placeholder="不修改请留空" />
+         </el-form-item>
+-        <el-form-item label="责任人">
++        <el-form-item v-if="fe('owner')" label="责任人">
+           <el-input v-model="batchEditForm.owner" clearable placeholder="不修改请留空" />
+         </el-form-item>
+-        <el-form-item label="合同号">
++        <el-form-item v-if="fe('contractNo')" label="合同号">
+           <el-input v-model="batchEditForm.contractNo" clearable placeholder="不修改请留空" />
+         </el-form-item>
+       </el-form>
+diff --git a/platform-web/src/views/capacity/CapacityView.vue b/platform-web/src/views/capacity/CapacityView.vue
+index 58bd004..eb6f1db 100644
+--- a/platform-web/src/views/capacity/CapacityView.vue
++++ b/platform-web/src/views/capacity/CapacityView.vue
+@@ -21,6 +21,8 @@ import {
+ import type { PowerProfile, RackCapacity, Recommendation, RoomCapacity } from '@/api/capacity'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('racks'))
+ const canWrite = computed(() => auth.canWrite('racks'))
+ const isAdmin = computed(() => !!auth.user?.isAdmin)
+ const tab = ref('racks')
+@@ -431,7 +433,7 @@ onMounted(() => {
+               <el-table-column v-if="canWrite" label="操作" width="120">
+                 <template #default="{ row }">
+                   <el-button link type="primary" @click="openProfile(row)">编辑</el-button>
+-                  <el-button link type="danger" @click="removeProfile(row)">删除</el-button>
++                  <el-button v-if="canDelete" link type="danger" @click="removeProfile(row)">删除</el-button>
+                 </template>
+               </el-table-column>
+             </el-table>
+diff --git a/platform-web/src/views/change/ChangeListView.vue b/platform-web/src/views/change/ChangeListView.vue
+index d5870fd..4c83852 100644
+--- a/platform-web/src/views/change/ChangeListView.vue
++++ b/platform-web/src/views/change/ChangeListView.vue
+@@ -184,7 +184,7 @@ const can = computed(() => {
+     start: d.status === 'APPROVED',
+     finish: d.status === 'IN_PROGRESS',
+     cancel: ownerOrAdmin && ['DRAFT', 'PENDING_CAB', 'APPROVED', 'REJECTED'].includes(d.status),
+-    remove: isAdmin.value && (d.status === 'DRAFT' || d.status === 'CANCELLED'),
++    remove: auth.canDelete('changes') && (d.status === 'DRAFT' || d.status === 'CANCELLED'),
+   }
+ })
+ 
+diff --git a/platform-web/src/views/developer/ApiDocsView.vue b/platform-web/src/views/developer/ApiDocsView.vue
+new file mode 100644
+index 0000000..adb382d
+--- /dev/null
++++ b/platform-web/src/views/developer/ApiDocsView.vue
+@@ -0,0 +1,420 @@
++<script setup lang="ts">
++/**
++ * v3.4：接口文档。数据来自后端运行时生成的 /api/openapi.json（OpenAPI 3.0），
++ * 每个接口带权限要求（x-permission）与字段级权限标记（x-field-policy）。
++ */
++import { computed, onMounted, ref } from 'vue'
++import { ElMessage } from 'element-plus'
++import http from '@/api/client'
++
++interface SchemaObj {
++  type?: string
++  format?: string
++  $ref?: string
++  items?: SchemaObj
++  properties?: Record<string, SchemaObj>
++  required?: string[]
++  description?: string
++  default?: unknown
++  'x-aliases'?: string[]
++}
++interface ParamObj {
++  name: string
++  in: string
++  required: boolean
++  schema: SchemaObj
++}
++interface Operation {
++  tags?: string[]
++  operationId?: string
++  summary?: string
++  parameters?: ParamObj[]
++  requestBody?: { required?: boolean; content?: Record<string, { schema: SchemaObj }> }
++  responses?: Record<string, { description?: string; content?: Record<string, { schema: SchemaObj }> }>
++  'x-permission'?: { module: string; moduleName?: string; access: string; action?: string }
++  'x-field-policy'?: { module: string; mode: string }
++}
++interface OpenApiDoc {
++  info: { title: string; version: string; description?: string }
++  tags: { name: string; description?: string }[]
++  paths: Record<string, Record<string, Operation>>
++  components: { schemas: Record<string, SchemaObj> }
++}
++interface OpRow {
++  key: string
++  method: string
++  path: string
++  tag: string
++  op: Operation
++}
++
++const loading = ref(false)
++const doc = ref<OpenApiDoc | null>(null)
++const keyword = ref('')
++const activeTag = ref('')
++const selectedKey = ref('')
++
++async function load() {
++  loading.value = true
++  try {
++    const res = await http.get<any, { data: OpenApiDoc }>('/openapi.json')
++    doc.value = (res as unknown as { data: OpenApiDoc }).data ?? (res as unknown as OpenApiDoc)
++  } catch {
++    // 拦截器已提示
++  } finally {
++    loading.value = false
++  }
++}
++
++const rows = computed<OpRow[]>(() => {
++  const d = doc.value
++  if (!d) return []
++  const out: OpRow[] = []
++  for (const [path, ops] of Object.entries(d.paths)) {
++    for (const [method, op] of Object.entries(ops)) {
++      out.push({ key: `${method} ${path}`, method: method.toUpperCase(), path, tag: op.tags?.[0] ?? '', op })
++    }
++  }
++  return out
++})
++
++const tagNames = computed<Record<string, string>>(() => {
++  const m: Record<string, string> = {}
++  for (const t of doc.value?.tags ?? []) m[t.name] = t.description || t.name
++  return m
++})
++
++const filtered = computed(() => {
++  const kw = keyword.value.trim().toLowerCase()
++  return rows.value.filter((r) => {
++    if (activeTag.value && r.tag !== activeTag.value) return false
++    if (!kw) return true
++    return (
++      r.path.toLowerCase().includes(kw) ||
++      r.method.toLowerCase() === kw ||
++      (tagNames.value[r.tag] || '').toLowerCase().includes(kw) ||
++      (r.op.operationId || '').toLowerCase().includes(kw)
++    )
++  })
++})
++
++const tagOptions = computed(() => {
++  const counts: Record<string, number> = {}
++  for (const r of rows.value) counts[r.tag] = (counts[r.tag] ?? 0) + 1
++  return Object.keys(counts)
++    .sort((a, b) => (tagNames.value[a] || a).localeCompare(tagNames.value[b] || b, 'zh-CN'))
++    .map((t) => ({ value: t, label: `${tagNames.value[t] || t}（${counts[t]}）` }))
++})
++
++const selected = computed(() => rows.value.find((r) => r.key === selectedKey.value) ?? filtered.value[0] ?? null)
++
++function resolve(s?: SchemaObj): SchemaObj | undefined {
++  if (!s) return s
++  if (s.$ref) {
++    const name = s.$ref.replace('#/components/schemas/', '')
++    return doc.value?.components.schemas[name]
++  }
++  return s
++}
++
++function typeText(s?: SchemaObj): string {
++  if (!s) return '-'
++  if (s.$ref) return s.$ref.replace('#/components/schemas/', '')
++  if (s.type === 'array') return `${typeText(s.items)}[]`
++  return s.format ? `${s.type}(${s.format})` : s.type || 'object'
++}
++
++interface FieldRow {
++  name: string
++  type: string
++  required: boolean
++  aliases: string
++  note: string
++}
++
++function fieldsOf(s?: SchemaObj): FieldRow[] {
++  const r = resolve(s)
++  if (!r?.properties) return []
++  return Object.entries(r.properties).map(([name, p]) => ({
++    name,
++    type: typeText(p),
++    required: !!r.required?.includes(name),
++    aliases: (p['x-aliases'] ?? []).join('、'),
++    note: p.description ?? '',
++  }))
++}
++
++const bodySchema = computed(() => {
++  const c = selected.value?.op.requestBody?.content
++  if (!c) return undefined
++  return (c['application/json'] ?? Object.values(c)[0])?.schema
++})
++const bodyIsMultipart = computed(() => !!selected.value?.op.requestBody?.content?.['multipart/form-data'])
++const dataSchema = computed(() => {
++  const s = selected.value?.op.responses?.['200']?.content?.['application/json']?.schema
++  return s?.properties?.data ?? s
++})
++
++function sample(s?: SchemaObj, depth = 0): unknown {
++  const r = resolve(s)
++  if (!r || depth > 3) return null
++  if (r.type === 'array') return [sample(r.items, depth + 1)]
++  if (r.type === 'integer' || r.type === 'number') return 0
++  if (r.type === 'boolean') return false
++  if (r.type === 'string') return r.format === 'date' ? '2026-01-01' : r.format === 'date-time' ? '2026-01-01T00:00:00' : ''
++  if (r.properties) {
++    const o: Record<string, unknown> = {}
++    for (const [k, v] of Object.entries(r.properties)) {
++      if (r.required?.includes(k) || depth === 0) o[k] = sample(v, depth + 1)
++    }
++    return o
++  }
++  return {}
++}
++
++const curl = computed(() => {
++  const s = selected.value
++  if (!s) return ''
++  const origin = window.location.origin
++  const query = (s.op.parameters ?? []).filter((p) => p.in === 'query' && p.required).map((p) => `${p.name}=`)
++  const url = `${origin}${s.path}${query.length ? '?' + query.join('&') : ''}`
++  const lines = [`curl -X ${s.method} '${url}' \\`, `  -H 'Authorization: Bearer <个人访问令牌>'`]
++  if (bodySchema.value && !bodyIsMultipart.value) {
++    lines[lines.length - 1] += ' \\'
++    lines.push(`  -H 'Content-Type: application/json' \\`)
++    lines.push(`  -d '${JSON.stringify(sample(bodySchema.value))}'`)
++  } else if (bodyIsMultipart.value) {
++    lines[lines.length - 1] += ' \\'
++    lines.push(`  -F 'file=@data.csv'`)
++  }
++  return lines.join('\n')
++})
++
++async function copyCurl() {
++  try {
++    await navigator.clipboard.writeText(curl.value)
++    ElMessage.success('已复制')
++  } catch {
++    ElMessage.warning('浏览器不允许访问剪贴板，请手动复制')
++  }
++}
++
++function methodType(m: string): 'success' | 'primary' | 'warning' | 'danger' | 'info' {
++  return m === 'GET' ? 'success' : m === 'POST' ? 'primary' : m === 'PUT' || m === 'PATCH' ? 'warning' : m === 'DELETE' ? 'danger' : 'info'
++}
++
++const ACCESS_TEXT: Record<string, string> = { read: '读', write: '写' }
++const ACTION_TEXT: Record<string, string> = {
++  create: '新建',
++  update: '编辑',
++  delete: '删除（需显式授予）',
++  import: '导入',
++  export: '导出',
++  approve: '审批',
++}
++const FIELD_MODE_TEXT: Record<string, string> = {
++  MASK: '响应按字段权限剔除隐藏字段',
++  CREATE: '受限字段有值即拒绝（403）',
++  UPDATE: '改动受限字段即拒绝（403），原样回传不算改动',
++  PRESENCE: '请求中出现受限字段即拒绝（403）',
++  REQUIRE: '整个接口依赖某字段的权限',
++}
++
++onMounted(load)
++</script>
++
++<template>
++  <div class="page-card api-docs" v-loading="loading">
++    <div class="page-toolbar">
++      <div class="api-docs-title">
++        <span>{{ doc?.info.title || '接口文档' }}</span>
++        <el-tag v-if="doc" size="small" type="info" effect="plain">v{{ doc.info.version }}</el-tag>
++        <span v-if="doc" class="muted">共 {{ rows.length }} 个接口</span>
++      </div>
++      <el-select v-model="activeTag" clearable filterable placeholder="全部模块" style="width: 220px">
++        <el-option v-for="t in tagOptions" :key="t.value" :value="t.value" :label="t.label" />
++      </el-select>
++      <el-input v-model="keyword" clearable placeholder="搜索路径、方法或模块" style="width: 260px" />
++      <el-button tag="a" href="/api/openapi.json" target="_blank">下载 openapi.json</el-button>
++    </div>
++    <p v-if="doc?.info.description" class="muted api-docs-desc">{{ doc.info.description }}</p>
++
++    <div class="api-docs-body">
++      <div class="api-docs-list">
++        <div
++          v-for="r in filtered"
++          :key="r.key"
++          class="api-row"
++          :class="{ active: selected?.key === r.key }"
++          @click="selectedKey = r.key"
++        >
++          <el-tag :type="methodType(r.method)" size="small" effect="dark" class="api-method">{{ r.method }}</el-tag>
++          <span class="api-path">{{ r.path }}</span>
++        </div>
++        <el-empty v-if="!loading && !filtered.length" description="没有匹配的接口" :image-size="60" />
++      </div>
++
++      <div v-if="selected" class="api-docs-detail">
++        <div class="api-detail-head">
++          <el-tag :type="methodType(selected.method)" effect="dark">{{ selected.method }}</el-tag>
++          <code class="api-detail-path">{{ selected.path }}</code>
++        </div>
++        <el-descriptions :column="1" border size="small">
++          <el-descriptions-item label="模块">{{ tagNames[selected.tag] || selected.tag }}</el-descriptions-item>
++          <el-descriptions-item label="所需权限">
++            <template v-if="selected.op['x-permission']">
++              {{ selected.op['x-permission'].moduleName }}（{{ selected.op['x-permission'].module }}）·
++              {{ ACCESS_TEXT[selected.op['x-permission'].access] }}
++              <template v-if="selected.op['x-permission'].action">
++                · {{ ACTION_TEXT[selected.op['x-permission'].action] || selected.op['x-permission'].action }}
++              </template>
++            </template>
++            <span v-else>登录即可</span>
++          </el-descriptions-item>
++          <el-descriptions-item v-if="selected.op['x-field-policy']" label="字段级权限">
++            {{ FIELD_MODE_TEXT[selected.op['x-field-policy'].mode] || selected.op['x-field-policy'].mode }}
++          </el-descriptions-item>
++          <el-descriptions-item label="实现">{{ selected.op.operationId }}</el-descriptions-item>
++        </el-descriptions>
++
++        <template v-if="selected.op.parameters?.length">
++          <div class="api-section-title">参数</div>
++          <el-table :data="selected.op.parameters" size="small" border>
++            <el-table-column prop="name" label="名称" min-width="140" />
++            <el-table-column label="位置" width="80">
++              <template #default="{ row }">{{ row.in === 'path' ? '路径' : '查询' }}</template>
++            </el-table-column>
++            <el-table-column label="类型" width="130">
++              <template #default="{ row }">{{ typeText(row.schema) }}</template>
++            </el-table-column>
++            <el-table-column label="必填" width="70">
++              <template #default="{ row }">{{ row.required ? '是' : '' }}</template>
++            </el-table-column>
++            <el-table-column label="默认值" min-width="90">
++              <template #default="{ row }">{{ row.schema?.default ?? '' }}</template>
++            </el-table-column>
++          </el-table>
++        </template>
++
++        <template v-if="bodySchema">
++          <div class="api-section-title">
++            请求体 <span class="muted">{{ bodyIsMultipart ? 'multipart/form-data' : typeText(bodySchema) }}</span>
++          </div>
++          <el-table v-if="fieldsOf(bodySchema).length" :data="fieldsOf(bodySchema)" size="small" border>
++            <el-table-column prop="name" label="字段" min-width="150" />
++            <el-table-column prop="type" label="类型" min-width="140" />
++            <el-table-column label="必填" width="70">
++              <template #default="{ row }">{{ row.required ? '是' : '' }}</template>
++            </el-table-column>
++            <el-table-column prop="aliases" label="兼容别名" min-width="160" show-overflow-tooltip />
++            <el-table-column prop="note" label="说明" min-width="140" show-overflow-tooltip />
++          </el-table>
++        </template>
++
++        <div class="api-section-title">
++          响应 <span class="muted">{code, msg, data}，data：{{ typeText(dataSchema) }}</span>
++        </div>
++        <el-table v-if="fieldsOf(dataSchema).length" :data="fieldsOf(dataSchema)" size="small" border>
++          <el-table-column prop="name" label="字段" min-width="150" />
++          <el-table-column prop="type" label="类型" min-width="140" />
++        </el-table>
++
++        <div class="api-section-title">
++          调用示例
++          <el-button link type="primary" size="small" @click="copyCurl">复制</el-button>
++        </div>
++        <pre class="api-curl">{{ curl }}</pre>
++      </div>
++    </div>
++  </div>
++</template>
++
++<style scoped>
++.api-docs-title {
++  flex: 1;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  font-weight: 600;
++}
++.muted {
++  color: var(--el-text-color-secondary);
++  font-weight: 400;
++  font-size: 12px;
++}
++.api-docs-desc {
++  margin: 0 0 12px;
++}
++.api-docs-body {
++  display: flex;
++  gap: 16px;
++  min-height: 560px;
++}
++.api-docs-list {
++  width: 380px;
++  flex-shrink: 0;
++  max-height: calc(100vh - 240px);
++  overflow: auto;
++  border: 1px solid var(--el-border-color-lighter);
++  border-radius: 6px;
++}
++.api-row {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  padding: 6px 10px;
++  cursor: pointer;
++  border-bottom: 1px solid var(--el-border-color-extra-light);
++}
++.api-row:hover {
++  background: var(--el-fill-color-light);
++}
++.api-row.active {
++  background: var(--el-color-primary-light-9);
++}
++.api-method {
++  width: 58px;
++  justify-content: center;
++}
++.api-path {
++  font-family: var(--el-font-family-monospace, monospace);
++  font-size: 12px;
++  word-break: break-all;
++}
++.api-docs-detail {
++  flex: 1;
++  min-width: 0;
++}
++.api-detail-head {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  margin-bottom: 12px;
++}
++.api-detail-path {
++  font-size: 15px;
++  word-break: break-all;
++}
++.api-section-title {
++  margin: 16px 0 8px;
++  font-weight: 600;
++}
++.api-curl {
++  margin: 0;
++  padding: 12px;
++  border-radius: 6px;
++  background: var(--el-fill-color-light);
++  font-size: 12px;
++  white-space: pre-wrap;
++  word-break: break-all;
++}
++@media (max-width: 900px) {
++  .api-docs-body {
++    flex-direction: column;
++  }
++  .api-docs-list {
++    width: 100%;
++    max-height: 320px;
++  }
++}
++</style>
+diff --git a/platform-web/src/views/knowledge/KbView.vue b/platform-web/src/views/knowledge/KbView.vue
+index 59ae248..4ffb829 100644
+--- a/platform-web/src/views/knowledge/KbView.vue
++++ b/platform-web/src/views/knowledge/KbView.vue
+@@ -21,6 +21,8 @@ import {
+ import type { KbArticle, KbPayload } from '@/api/itsm'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('knowledge'))
+ const route = useRoute()
+ const router = useRouter()
+ const canWrite = computed(() => auth.canWrite('knowledge'))
+@@ -233,7 +235,7 @@ onMounted(() => {
+           <div style="flex: 1"></div>
+           <template v-if="canWrite">
+             <el-button size="small" type="primary" plain @click="openEditor(article)">编辑</el-button>
+-            <el-button size="small" type="danger" plain @click="remove(article)">删除</el-button>
++            <el-button v-if="canDelete" size="small" type="danger" plain @click="remove(article)">删除</el-button>
+           </template>
+         </div>
+       </template>
+diff --git a/platform-web/src/views/monitoring/MaintenanceView.vue b/platform-web/src/views/monitoring/MaintenanceView.vue
+index 103c0d1..60ca2aa 100644
+--- a/platform-web/src/views/monitoring/MaintenanceView.vue
++++ b/platform-web/src/views/monitoring/MaintenanceView.vue
+@@ -19,6 +19,8 @@ import {
+ import type { MaintenanceWindowItem, WindowPayload } from '@/api/monitoring'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('monitoring'))
+ const router = useRouter()
+ const canWrite = computed(() => auth.canWrite('monitoring'))
+ 
+@@ -229,7 +231,7 @@ onMounted(load)
+         <template #default="{ row }">
+           <el-button v-if="row.state !== 'ENDED'" link type="primary" @click="openEdit(row)">编辑</el-button>
+           <el-button v-if="row.state !== 'ENDED'" link type="warning" @click="doEnd(row)">提前结束</el-button>
+-          <el-button link type="danger" @click="doDelete(row)">删除</el-button>
++          <el-button v-if="canDelete" link type="danger" @click="doDelete(row)">删除</el-button>
+         </template>
+       </el-table-column>
+     </el-table>
+diff --git a/platform-web/src/views/network/CableView.vue b/platform-web/src/views/network/CableView.vue
+index 4ca0623..51b6fbf 100644
+--- a/platform-web/src/views/network/CableView.vue
++++ b/platform-web/src/views/network/CableView.vue
+@@ -12,6 +12,8 @@ import { CABLE_STATUS_LABEL, createCable, deleteCable, fetchCableMeta, fetchCabl
+ import type { Cable, CablePayload } from '@/api/network'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('network'))
+ const route = useRoute()
+ const canWrite = computed(() => auth.canWrite('network'))
+ const types = ref<Record<string, string>>({})
+@@ -187,7 +189,7 @@ onMounted(async () => {
+         <template #default="{ row }">
+           <el-button link type="primary" @click="open(row)">编辑</el-button>
+           <el-button v-if="row.status !== 'REMOVED'" link type="warning" @click="doRemove(row)">拆除</el-button>
+-          <el-button link type="danger" @click="doDelete(row)">删除</el-button>
++          <el-button v-if="canDelete" link type="danger" @click="doDelete(row)">删除</el-button>
+         </template>
+       </el-table-column>
+     </el-table>
+diff --git a/platform-web/src/views/network/IpamView.vue b/platform-web/src/views/network/IpamView.vue
+index 382d5fc..80c41cd 100644
+--- a/platform-web/src/views/network/IpamView.vue
++++ b/platform-web/src/views/network/IpamView.vue
+@@ -29,6 +29,8 @@ import {
+ import type { IpAddress, Prefix, Vlan } from '@/api/network'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('network'))
+ const canWrite = computed(() => auth.canWrite('network'))
+ const tab = ref('prefixes')
+ 
+@@ -380,7 +382,7 @@ onMounted(() => {
+           <el-table-column v-if="canWrite" label="操作" width="120">
+             <template #default="{ row }">
+               <el-button link type="primary" @click="openVlan(row)">编辑</el-button>
+-              <el-button link type="danger" @click="removeVlan(row)">删除</el-button>
++              <el-button v-if="canDelete" link type="danger" @click="removeVlan(row)">删除</el-button>
+             </template>
+           </el-table-column>
+         </el-table>
+diff --git a/platform-web/src/views/report/DashboardView.vue b/platform-web/src/views/report/DashboardView.vue
+index 75dd933..3bc19c9 100644
+--- a/platform-web/src/views/report/DashboardView.vue
++++ b/platform-web/src/views/report/DashboardView.vue
+@@ -1,11 +1,15 @@
+ <script setup lang="ts">
+ import { ASSET_EVENT_LABEL } from '@/utils/assetEvents'
+ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
++import { useAuthStore } from '@/stores/auth'
+ import echarts, { CHART_COLORS, axisColor, surfaceColor, type EChartsType } from '@/utils/echarts'
+ import { fetchDashboard, fetchWorkorderSla, fetchRepairCost, fetchRepairDuration, fetchAssetFinanceSummary, fetchOpexStructure, fetchSupplierPerformance, fetchCapacityPlanning, fetchAssetTco } from '@/api/report'
+ import type { CategoryStatusItem, DashboardData, GroupCountItem, RoomUsageItem, AssetFinanceSummary, OpexStructureData, AssetRoiData, SupplierPerformanceData, CapacityPlanningData, AssetTcoData } from '@/api/report'
+ 
+ /* ---------------- 数据加载 ---------------- */
++const auth = useAuthStore()
++/** v3.4：运营总览依赖「报表」读权限；没有时不发请求（以前会连弹多条「没有执行该操作的权限」） */
++const canSeeReport = computed(() => auth.canRead('report'))
+ const loading = ref(false)
+ const data = ref<DashboardData | null>(null)
+ const slaData = ref<any>(null)
+@@ -1140,7 +1144,7 @@ function handleThemeChange() {
+ 
+ onMounted(() => {
+   updateLayout()
+-  void load()
++  if (canSeeReport.value) void load()
+   window.addEventListener('resize', handleResize)
+   window.addEventListener('dcim-theme-change', handleThemeChange)
+ })
+@@ -1155,7 +1159,13 @@ onBeforeUnmount(() => {
+ </script>
+ 
+ <template>
+-  <div v-loading="loading" class="dashboard">
++  <el-result
++    v-if="!canSeeReport"
++    icon="info"
++    title="运营总览需要「数据报表」读权限"
++    sub-title="请从左侧菜单进入有权限的模块，或联系管理员为当前角色开通报表权限"
++  />
++  <div v-else v-loading="loading" class="dashboard">
+     <!-- 顶部统计卡 -->
+     <el-row :gutter="16">
+       <el-col :span="colSpan === 24 ? 24 : 6">
+diff --git a/platform-web/src/views/supplier/ContractListView.vue b/platform-web/src/views/supplier/ContractListView.vue
+index 38a5bbb..e70e4cb 100644
+--- a/platform-web/src/views/supplier/ContractListView.vue
++++ b/platform-web/src/views/supplier/ContractListView.vue
+@@ -13,6 +13,8 @@ import type { PageResult } from '@/api/types'
+ import { useAuthStore } from '@/stores/auth'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('contracts'))
+ const canWrite = computed(() => auth.canWrite('contracts'))
+ 
+ const TYPE_OPTIONS = ['采购', '销售', '融资租赁']
+@@ -308,7 +310,7 @@ onMounted(() => {
+       <el-table-column v-if="canWrite" label="操作" width="130" fixed="right">
+         <template #default="{ row }">
+           <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+-          <el-button link type="danger" @click="remove(row)">删除</el-button>
++          <el-button v-if="canDelete" link type="danger" @click="remove(row)">删除</el-button>
+         </template>
+       </el-table-column>
+     </el-table>
+diff --git a/platform-web/src/views/supplier/SupplierListView.vue b/platform-web/src/views/supplier/SupplierListView.vue
+index f030ad0..45fca28 100644
+--- a/platform-web/src/views/supplier/SupplierListView.vue
++++ b/platform-web/src/views/supplier/SupplierListView.vue
+@@ -13,6 +13,8 @@ import type { PageResult } from '@/api/types'
+ import { useAuthStore } from '@/stores/auth'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('suppliers'))
+ const canWrite = computed(() => auth.canWrite('suppliers'))
+ 
+ const STATUS_LABELS: Record<string, string> = {
+@@ -266,7 +268,7 @@ onMounted(() => {
+       <el-table-column v-if="canWrite" label="操作" width="130" fixed="right">
+         <template #default="{ row }">
+           <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+-          <el-button link type="danger" @click="remove(row)">删除</el-button>
++          <el-button v-if="canDelete" link type="danger" @click="remove(row)">删除</el-button>
+         </template>
+       </el-table-column>
+     </el-table>
+diff --git a/platform-web/src/views/system/RolesView.vue b/platform-web/src/views/system/RolesView.vue
+index 60a9001..3b00178 100644
+--- a/platform-web/src/views/system/RolesView.vue
++++ b/platform-web/src/views/system/RolesView.vue
+@@ -6,7 +6,7 @@ import http from '@/api/client'
+ import type { ModuleInfo, PageResult, RoleItem } from '@/api/types'
+ 
+ /* ---------------- 角色列表 ---------------- */
+-const query = reactive({ page: 1, size: 20 })
++const query = reactive({ page: 1, size: 20, keyword: '' })
+ const total = ref(0)
+ const records = ref<RoleItem[]>([])
+ const listLoading = ref(false)
+@@ -15,7 +15,7 @@ async function load() {
+   listLoading.value = true
+   try {
+     const res = await http.get<any, PageResult<RoleItem>>('/roles', {
+-      params: { page: query.page, size: query.size },
++      params: { page: query.page, size: query.size, keyword: query.keyword.trim() || undefined },
+     })
+     total.value = res.total ?? 0
+     records.value = res.records ?? []
+@@ -37,6 +37,35 @@ async function loadModules() {
+   }
+ }
+ 
++/* ---------------- v3.4：字段级权限（目前支持资产、工单） ---------------- */
++interface FieldDef {
++  field: string
++  label: string
++}
++const fieldCatalog = ref<Record<string, FieldDef[]>>({})
++const FIELD_MODULE_NAMES: Record<string, string> = { assets: '资产', workorders: '工单' }
++/** 每个模块：隐藏字段（不可见、不可写）与只读字段（可见、不可写） */
++const fieldRules = reactive<Record<string, { hidden: string[]; readonly: string[] }>>({})
++
++async function loadFieldCatalog() {
++  try {
++    fieldCatalog.value = await http.get<any, Record<string, FieldDef[]>>('/roles/field-catalog')
++  } catch {
++    // 拦截器已提示
++  }
++}
++
++function buildFieldRules(role?: RoleItem) {
++  for (const m of Object.keys(fieldCatalog.value)) {
++    const cfg = (role?.fieldPerms as Record<string, { hidden?: string[]; readonly?: string[] }> | undefined)?.[m]
++    fieldRules[m] = { hidden: [...(cfg?.hidden ?? [])], readonly: [...(cfg?.readonly ?? [])] }
++  }
++}
++
++function moduleReadable(code: string): boolean {
++  return !!matrixRows.value.find((r) => r.code === code)?.read
++}
++
+ /* ---------------- 新增 / 编辑（权限矩阵） ---------------- */
+ interface MatrixRow {
+   code: string
+@@ -96,6 +125,7 @@ function openCreate() {
+   editingCode.value = ''
+   Object.assign(form, { roleCode: '', name: '', description: '' })
+   buildRows()
++  buildFieldRules()
+   dialogVisible.value = true
+ }
+ 
+@@ -107,6 +137,7 @@ function openEdit(row: RoleItem) {
+     description: row.description || '',
+   })
+   buildRows(row)
++  buildFieldRules(row)
+   dialogVisible.value = true
+ }
+ 
+@@ -127,13 +158,21 @@ async function save() {
+         dataScopes[r.code] = { type: SCOPED_MODULES.has(r.code) ? r.scope : 'ALL' }
+       }
+     }
++    // 字段权限：同一字段既隐藏又只读时按隐藏处理；没有访问权的模块不提交
++    const fieldPerms: Record<string, { hidden: string[]; readonly: string[] }> = {}
++    for (const [m, r] of Object.entries(fieldRules)) {
++      if (!moduleReadable(m)) continue
++      const hidden = [...new Set(r.hidden)]
++      const readonly = [...new Set(r.readonly)].filter((f) => !hidden.includes(f))
++      if (hidden.length || readonly.length) fieldPerms[m] = { hidden, readonly }
++    }
+     const payload = {
+       roleCode: form.roleCode.trim(),
+       name: form.name.trim(),
+       description: form.description,
+       modulePerms,
+       dataScopes,
+-      fieldPerms: {},
++      fieldPerms,
+       actionPerms,
+     }
+     if (editingCode.value) {
+@@ -175,12 +214,21 @@ async function remove(row: RoleItem) {
+ onMounted(() => {
+   void load()
+   void loadModules()
++  void loadFieldCatalog()
+ })
+ </script>
+ 
+ <template>
+   <div class="page-card">
+     <div class="page-toolbar">
++      <el-input
++        v-model="query.keyword"
++        placeholder="搜索角色编码 / 名称"
++        clearable
++        style="width: 240px"
++        @keyup.enter="() => { query.page = 1; load() }"
++        @clear="() => { query.page = 1; load() }"
++      />
+       <div style="flex: 1"></div>
+       <el-button type="primary" @click="openCreate">新增角色</el-button>
+     </div>
+@@ -257,7 +305,12 @@ onMounted(() => {
+                 <el-checkbox v-model="row.write" />
+               </template>
+             </el-table-column>
+-            <el-table-column label="删除" width="70" align="center">
++            <el-table-column width="70" align="center">
++              <template #header>
++                <el-tooltip content="删除需显式授予：有写权限且勾选删除才可删除（v3.4 起生效）" placement="top">
++                  <span>删除</span>
++                </el-tooltip>
++              </template>
+               <template #default="{ row }">
+                 <el-checkbox v-model="row.del" />
+               </template>
+@@ -279,6 +332,51 @@ onMounted(() => {
+             </el-table-column>
+           </el-table>
+         </el-form-item>
++        <el-form-item label="字段权限">
++          <div class="field-rules">
++            <div v-for="(defs, m) in fieldCatalog" :key="m" class="field-rule-row">
++              <div class="field-rule-name">
++                {{ FIELD_MODULE_NAMES[m] || m }}
++                <span v-if="!moduleReadable(String(m))" class="module-code">（未授予读权限）</span>
++              </div>
++              <template v-if="fieldRules[m]">
++                <el-select
++                  v-model="fieldRules[m].hidden"
++                  multiple
++                  collapse-tags
++                  collapse-tags-tooltip
++                  clearable
++                  :disabled="!moduleReadable(String(m))"
++                  placeholder="隐藏字段（不可见、不可改）"
++                  style="width: 300px"
++                >
++                  <el-option v-for="d in defs" :key="d.field" :label="d.label" :value="d.field" />
++                </el-select>
++                <el-select
++                  v-model="fieldRules[m].readonly"
++                  multiple
++                  collapse-tags
++                  collapse-tags-tooltip
++                  clearable
++                  :disabled="!moduleReadable(String(m))"
++                  placeholder="只读字段（可见、不可改）"
++                  style="width: 300px"
++                >
++                  <el-option
++                    v-for="d in defs"
++                    :key="d.field"
++                    :label="d.label"
++                    :value="d.field"
++                    :disabled="fieldRules[m].hidden.includes(d.field)"
++                  />
++                </el-select>
++              </template>
++            </div>
++            <div class="module-code">
++              多个角色叠加时，字段在任一角色可见即可见、任一可写角色未限制即可改；管理员不受字段规则约束。
++            </div>
++          </div>
++        </el-form-item>
+       </el-form>
+       <template #footer>
+         <el-button @click="dialogVisible = false">取消</el-button>
+@@ -289,6 +387,22 @@ onMounted(() => {
+ </template>
+ 
+ <style scoped>
++.field-rules {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  width: 100%;
++}
++.field-rule-row {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  flex-wrap: wrap;
++}
++.field-rule-name {
++  width: 120px;
++  color: var(--el-text-color-regular);
++}
+ .module-code {
+   font-size: 12px;
+   color: var(--el-text-color-placeholder);
+diff --git a/platform-web/src/views/system/UsersView.vue b/platform-web/src/views/system/UsersView.vue
+index 204d10c..8ea0c9c 100644
+--- a/platform-web/src/views/system/UsersView.vue
++++ b/platform-web/src/views/system/UsersView.vue
+@@ -167,6 +167,17 @@ async function save() {
+   }
+ }
+ 
++/** v3.4：解除账号级登录锁定（跨 IP 多次失败触发） */
++async function unlock(row: UserItem) {
++  try {
++    await http.post(`/users/${encodeURIComponent(row.username)}/unlock`)
++    ElMessage.success(`已解锁 ${row.username}`)
++    void load()
++  } catch {
++    // 拦截器已提示
++  }
++}
++
+ async function remove(row: UserItem) {
+   try {
+     await ElMessageBox.confirm(
+@@ -343,6 +354,13 @@ async function doExport() {
+       <el-table-column label="状态" width="90">
+         <template #default="{ row }">
+           <el-tag :type="statusTagType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
++          <el-tooltip
++            v-if="row.loginLocked"
++            :content="`多次登录失败已临时锁定，约 ${Math.ceil((row.loginLockedSeconds || 0) / 60)} 分钟后自动解除；本人常用的终端不受影响`"
++            placement="top"
++          >
++            <el-tag type="danger" size="small" style="margin-left: 4px">锁定</el-tag>
++          </el-tooltip>
+         </template>
+       </el-table-column>
+       <el-table-column label="角色" min-width="140">
+@@ -359,9 +377,10 @@ async function doExport() {
+         </template>
+       </el-table-column>
+       <el-table-column prop="createdAt" label="创建时间" min-width="160" />
+-      <el-table-column label="操作" width="140" fixed="right">
++      <el-table-column label="操作" width="180" fixed="right">
+         <template #default="{ row }">
+           <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
++          <el-button v-if="row.loginLocked" link type="warning" @click="unlock(row)">解锁</el-button>
+           <el-button link type="danger" @click="remove(row)">删除</el-button>
+         </template>
+       </el-table-column>
+diff --git a/platform-web/src/views/warehouse/WarehouseListView.vue b/platform-web/src/views/warehouse/WarehouseListView.vue
+index 5cf547b..cdb2845 100644
+--- a/platform-web/src/views/warehouse/WarehouseListView.vue
++++ b/platform-web/src/views/warehouse/WarehouseListView.vue
+@@ -30,6 +30,8 @@ import type { RoomItem } from '@/api/room'
+ import { useAuthStore } from '@/stores/auth'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('warehouses'))
+ const canWrite = computed(() => !!auth.modules['warehouses']?.write)
+ 
+ /* ---------------- 元数据 ---------------- */
+@@ -511,7 +513,7 @@ onMounted(() => {
+           <el-button link type="primary" @click="openStock(row)">库存</el-button>
+           <template v-if="canWrite">
+             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+-            <el-button link type="danger" @click="remove(row)">删除</el-button>
++            <el-button v-if="canDelete" link type="danger" @click="remove(row)">删除</el-button>
+           </template>
+         </template>
+       </el-table-column>
+@@ -639,7 +641,7 @@ onMounted(() => {
+                   <template #default="{ row: l }">
+                     <template v-if="canWrite">
+                       <el-button link type="primary" @click="openLayerEdit(l)">编辑</el-button>
+-                      <el-button link type="danger" @click="removeLayer(l)">删除</el-button>
++                      <el-button v-if="canDelete" link type="danger" @click="removeLayer(l)">删除</el-button>
+                     </template>
+                     <span v-else>-</span>
+                   </template>
+@@ -665,7 +667,7 @@ onMounted(() => {
+             <template v-if="canWrite">
+               <el-button link type="primary" @click="openShelfEdit(row)">编辑</el-button>
+               <el-button link type="primary" @click="addLayer(row)">加层</el-button>
+-              <el-button link type="danger" @click="removeShelf(row)">删除</el-button>
++              <el-button v-if="canDelete" link type="danger" @click="removeShelf(row)">删除</el-button>
+             </template>
+             <span v-else>-</span>
+           </template>
+diff --git a/platform-web/src/views/workorder/InspectionPlanView.vue b/platform-web/src/views/workorder/InspectionPlanView.vue
+index d14e917..5bb67b4 100644
+--- a/platform-web/src/views/workorder/InspectionPlanView.vue
++++ b/platform-web/src/views/workorder/InspectionPlanView.vue
+@@ -20,6 +20,8 @@ import {
+ import type { InspectionPlan, InspectionPlanPayload, InspectionRun } from '@/api/upgrade'
+ 
+ const auth = useAuthStore()
++/** v3.4：删除需角色显式授予（后端同样校验） */
++const canDelete = computed(() => auth.canDelete('workorders'))
+ const router = useRouter()
+ const canWrite = computed(() => auth.canWrite('workorders'))
+ 
+@@ -272,7 +274,7 @@ onMounted(() => void load())
+           <template v-if="canWrite">
+             <el-button link type="primary" @click="runNow(row)">立即执行</el-button>
+             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+-            <el-button link type="danger" @click="remove(row)">删除</el-button>
++            <el-button v-if="canDelete" link type="danger" @click="remove(row)">删除</el-button>
+           </template>
+         </template>
+       </el-table-column>
+diff --git a/platform-web/src/views/workorder/WorkorderCreateDialog.vue b/platform-web/src/views/workorder/WorkorderCreateDialog.vue
+index 7752d12..c92e6f7 100644
+--- a/platform-web/src/views/workorder/WorkorderCreateDialog.vue
++++ b/platform-web/src/views/workorder/WorkorderCreateDialog.vue
+@@ -27,6 +27,7 @@ import type {
+   WorkflowConfigItem,
+ } from '@/api/workorder'
+ import ReplacementEditor from './ReplacementEditor.vue'
++import { useAuthStore } from '@/stores/auth'
+ import type { ReplacementRow } from './replacement'
+ import {
+   deriveReplacedAsset,
+@@ -43,6 +44,8 @@ interface WoCreatePrefill {
+   assetNos?: string[]
+ }
+ 
++/** v3.4：字段级权限，受限字段不在新建表单出现（后端同样校验） */
++const auth = useAuthStore()
+ const emit = defineEmits<{ (e: 'created', woNo: string): void }>()
+ 
+ const dialogVisible = ref(false)
+@@ -134,7 +137,9 @@ onMounted(() => {
+ })
+ 
+ /** 按类型显隐：关联资产（耗材申领除外） */
+-const showRelatedAssets = computed(() => form.woType !== '耗材申领')
++const showRelatedAssets = computed(
++  () => form.woType !== '耗材申领' && auth.fieldEditable('workorders', 'relatedAssets'),
++)
+ /** 按类型显隐：用料明细（耗材申领必填扣料；故障维修/部件更换完工扣料） */
+ const showDetails = computed(
+   () =>
+@@ -734,7 +739,7 @@ async function save() {
+             </el-form-item>
+           </el-col>
+           <el-col :span="12">
+-            <el-form-item label="期望完成">
++            <el-form-item v-if="auth.fieldEditable('workorders', 'expectFinish')" label="期望完成">
+               <el-date-picker
+                 v-model="form.expectFinish"
+                 type="date"
+@@ -899,7 +904,7 @@ async function save() {
+             </el-col>
+           </template>
+           <el-col :span="24">
+-            <el-form-item label="描述">
++            <el-form-item v-if="auth.fieldEditable('workorders', 'description')" label="描述">
+               <el-input v-model="form.description" type="textarea" :rows="3" placeholder="工单描述（选填）" />
+             </el-form-item>
+           </el-col>
+diff --git a/platform-web/src/views/workorder/WorkorderDetailView.vue b/platform-web/src/views/workorder/WorkorderDetailView.vue
+index c9f7f7d..8e4660e 100644
+--- a/platform-web/src/views/workorder/WorkorderDetailView.vue
++++ b/platform-web/src/views/workorder/WorkorderDetailView.vue
+@@ -49,6 +49,9 @@ import WorkorderCreateDialog from './WorkorderCreateDialog.vue'
+ import { createProblem, fetchProblemsByRef } from '@/api/itsm'
+ 
+ const auth = useAuthStore()
++/** v3.4：字段级权限（后端同样校验） */
++const wfv = (f: string) => auth.fieldVisible('workorders', f)
++const wfe = (f: string) => auth.fieldEditable('workorders', f)
+ const route = useRoute()
+ const router = useRouter()
+ 
+@@ -79,7 +82,7 @@ const detailItems = computed(() => detail.value?.items ?? [])
+ 
+ /** 行项目可维护：有写权限且工单未终态 */
+ const canEditItems = computed(() => {
+-  if (!canWrite.value || !detail.value) return false
++  if (!canWrite.value || !detail.value || !wfe('relatedAssets')) return false
+   return detail.value.status !== '已完成' && detail.value.status !== '已关闭'
+ })
+ 
+@@ -290,7 +293,7 @@ const attUploading = ref(false)
+  * 与控制器 @RequirePerm(write=true, action="update") 同源 —— 有写权限的人才下发 true，
+  * 只读角色不下发，从根上消灭「按钮点了才 403」。评论 perm.comment 仍是关联方口径，两者分开。
+  */
+-const canUploadAtt = computed(() => !!detail.value?.perm?.uploadAtt)
++const canUploadAtt = computed(() => !!detail.value?.perm?.uploadAtt && wfe('attachments'))
+ 
+ /** 时间展示：去掉 ISO 的 T 与秒后小数（后端 LocalDateTime 原样下发） */
+ function fmtTime(v?: string | null): string {
+@@ -309,6 +312,10 @@ function fmtSize(bytes: number): string {
+ let attSeq = 0
+ 
+ async function loadAttachments() {
++  if (!wfv('attachments')) {
++    attachments.value = []
++    return
++  }
+   const woNo = currentWoNo.value
+   if (!woNo) return
+   const seq = ++attSeq
+@@ -620,8 +627,12 @@ const costTotal = computed(() => {
+   return (d.costLabor ?? 0) + (d.costService ?? 0) + (d.costOther ?? 0)
+ })
+ 
+-const costVisible = computed(() => isRepairWo.value)
+-const canEditCost = computed(() => canWrite.value && isRepairWo.value)
++const costVisible = computed(
++  () => isRepairWo.value && ['costLabor', 'costService', 'costOther'].every((f) => wfv(f)),
++)
++const canEditCost = computed(
++  () => canWrite.value && isRepairWo.value && ['costLabor', 'costService', 'costOther'].every((f) => wfe(f)),
++)
+ 
+ const costDialogVisible = ref(false)
+ const costSaving = ref(false)
+@@ -747,14 +758,14 @@ onMounted(() => {
+           <el-descriptions :column="2" border size="small">
+             <el-descriptions-item label="工单编号">{{ detail.woNo }}</el-descriptions-item>
+             <el-descriptions-item label="类型">{{ detail.woType || '-' }}</el-descriptions-item>
+-            <el-descriptions-item label="申请人">{{ detail.applicant || '-' }}</el-descriptions-item>
+-            <el-descriptions-item label="处理人">{{ detail.handler || '-' }}</el-descriptions-item>
+-            <el-descriptions-item label="期望完成">{{ detail.expectFinish || '-' }}</el-descriptions-item>
++            <el-descriptions-item v-if="wfv('applicant')" label="申请人">{{ detail.applicant || '-' }}</el-descriptions-item>
++            <el-descriptions-item v-if="wfv('handler')" label="处理人">{{ detail.handler || '-' }}</el-descriptions-item>
++            <el-descriptions-item v-if="wfv('expectFinish')" label="期望完成">{{ detail.expectFinish || '-' }}</el-descriptions-item>
+             <el-descriptions-item label="申请时间">{{ fmtTime(detail.createdAt) }}</el-descriptions-item>
+-            <el-descriptions-item label="描述" :span="2">
++            <el-descriptions-item v-if="wfv('description')" label="描述" :span="2">
+               <div style="white-space: pre-wrap">{{ detail.description || '-' }}</div>
+             </el-descriptions-item>
+-            <el-descriptions-item label="关联资产" :span="2">
++            <el-descriptions-item v-if="wfv('relatedAssets')" label="关联资产" :span="2">
+               <template v-if="detailItems.length || splitList(detail.relatedAssets).length">
+                 <el-tag
+                   v-for="a in detailItems.length
+@@ -769,7 +780,7 @@ onMounted(() => {
+               </template>
+               <template v-else>-</template>
+             </el-descriptions-item>
+-            <el-descriptions-item label="关联物料" :span="2">
++            <el-descriptions-item v-if="wfv('relatedMaterials')" label="关联物料" :span="2">
+               <template v-if="splitList(detail.relatedMaterials).length">
+                 <el-tag
+                   v-for="m in splitList(detail.relatedMaterials)"
+@@ -892,7 +903,7 @@ onMounted(() => {
+           </el-descriptions>
+ 
+           <!-- 附件（可见即可传：模块写权限 + 未关闭，不限关联方；后端白名单 + 50MB） -->
+-          <div class="att-head">
++          <div v-if="wfv('attachments')" class="att-head">
+             <span class="drawer-subtitle" style="margin: 0">附件</span>
+             <el-upload
+               v-if="canUploadAtt"
+@@ -940,7 +951,7 @@ onMounted(() => {
+                 </el-button>
+               </div>
+             </div>
+-            <div v-else-if="!attLoading" class="detail-hint" style="margin-left: 0">暂无附件</div>
++            <div v-else-if="!attLoading && wfv('attachments')" class="detail-hint" style="margin-left: 0">暂无附件</div>
+           </div>
+ 
+           <!-- 用料明细（耗材申领 / 故障维修·部件更换展示） -->
+@@ -1382,8 +1393,9 @@ onMounted(() => {
+         <el-form-item label="标题" required>
+           <el-input v-model="editForm.title" maxlength="200" show-word-limit />
+         </el-form-item>
+-        <el-form-item label="描述">
++        <el-form-item v-if="wfv('description')" label="描述">
+           <el-input
++            :disabled="!wfe('description')"
+             v-model="editForm.description"
+             type="textarea"
+             :rows="4"
+diff --git a/platform-web/src/vite-env.d.ts b/platform-web/src/vite-env.d.ts
+index 11f02fe..1509f21 100644
+--- a/platform-web/src/vite-env.d.ts
++++ b/platform-web/src/vite-env.d.ts
+@@ -1 +1,4 @@
+ /// <reference types="vite/client" />
++
++/** vite.config.ts define：前端版本号 */
++declare const __APP_VERSION__: string
+diff --git a/platform-web/vite.config.ts b/platform-web/vite.config.ts
+index 9b9e739..e160986 100644
+--- a/platform-web/vite.config.ts
++++ b/platform-web/vite.config.ts
+@@ -4,8 +4,15 @@ import vue from '@vitejs/plugin-vue'
+ import AutoImport from 'unplugin-auto-import/vite'
+ import Components from 'unplugin-vue-components/vite'
+ import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
++import { readFileSync } from 'node:fs'
++
++const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8')) as { version: string }
+ 
+ export default defineConfig({
++  // v3.4：前端版本号（关于对话框里与后端版本对照，排查「前后端不是同一版本」）
++  define: {
++    __APP_VERSION__: JSON.stringify(pkg.version),
++  },
+   plugins: [
+     vue(),
+     AutoImport({
