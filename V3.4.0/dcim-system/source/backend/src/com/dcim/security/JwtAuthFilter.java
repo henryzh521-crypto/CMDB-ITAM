@@ -1,6 +1,7 @@
 package com.dcim.security;
 
 import com.dcim.apitoken.ApiTokenService;
+import com.fasterxml.jackson.core.JsonStringEncoder;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
 import jakarta.servlet.FilterChain;
@@ -24,7 +25,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 @Component
 public class JwtAuthFilter extends OncePerRequestFilter {
-    
+
     private static final Logger log = LoggerFactory.getLogger(JwtAuthFilter.class);
     private static final String ACCESS_TOKEN_COOKIE = "access_token";
     private static final Set<String> MUST_CHANGE_PWD_ALLOW_PREFIX = Set.of("/api/auth/", "/api/healthz", "/api/collector/");
@@ -124,7 +125,8 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         response.setStatus(403);
         response.setContentType("application/json");
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
-        response.getWriter().write("{\"code\":403,\"msg\":\"" + msg + "\"}");
+        String escaped = JsonStringEncoder.getInstance().quoteAsString(msg == null ? "" : msg);
+        response.getWriter().write("{\"code\":403,\"msg\":" + escaped + "}");
     }
 
     private String resolveToken(HttpServletRequest request) {
