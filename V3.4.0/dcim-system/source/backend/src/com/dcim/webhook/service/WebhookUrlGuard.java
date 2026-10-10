@@ -107,6 +107,9 @@ public class WebhookUrlGuard {
                         if (h.endsWith(".")) {
                             h = h.substring(0, h.length() - 1);
                         }
+                        if (isMalformedHost(h)) {
+                            throw BusinessException.badRequest("Webhook 目标主机名不合法：" + host);
+                        }
 
                         // 修复：test-allow-loopback 开关此前用 OR 绑定整个黑名单检查，误配为 true 时
                         // prometheus / alertmanager / minio 等全部内网主机被放行。现在该开关只对回环目标生效
@@ -145,6 +148,23 @@ public class WebhookUrlGuard {
         } else {
             throw BusinessException.badRequest("Webhook 地址不能为空");
         }
+    }
+
+    private static boolean isMalformedHost(String h) {
+        if (h == null || h.isBlank() || h.startsWith(".") || h.endsWith(".") || h.contains("..") || h.indexOf('_') >= 0) {
+            return true;
+        }
+        int dotCount = 0;
+        for (int i = 0; i < h.length(); i++) {
+            char c = h.charAt(i);
+            if (c == '.') {
+                dotCount++;
+            }
+            if (!(Character.isLetterOrDigit(c) || c == '.' || c == '-' || c == ':')) {
+                return true;
+            }
+        }
+        return dotCount > 127;
     }
 
     /** 判断主机名是否为回环目标（test-allow-loopback 仅对这类目标放行） */
